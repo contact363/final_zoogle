@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
@@ -12,10 +13,17 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
 
     # Database
-    # - Render production: uses internal hostname (dpg-xxx-a) via env var set in dashboard
-    # - Local dev: uses external hostname (.oregon-postgres.render.com) from .env file
+    # Render/Heroku platforms inject DATABASE_URL as plain "postgresql://" (psycopg2/sync).
+    # The validator below auto-upgrades it to "postgresql+asyncpg://" for SQLAlchemy async.
     DATABASE_URL: str = "postgresql+asyncpg://final_zoogle_db_user:A8D7GMXiIYmc20g6ZqhfGOfHW9ofXRAz@dpg-d6qjt7haae7s739hqia0-a.oregon-postgres.render.com/final_zoogle_db"
     DATABASE_SYNC_URL: str = "postgresql://final_zoogle_db_user:A8D7GMXiIYmc20g6ZqhfGOfHW9ofXRAz@dpg-d6qjt7haae7s739hqia0-a.oregon-postgres.render.com/final_zoogle_db"
+
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def fix_async_db_url(cls, v: str) -> str:
+        if isinstance(v, str) and v.startswith("postgresql://"):
+            return v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return v
 
     # Redis / Celery
     REDIS_URL: str = "redis://localhost:6379/0"
