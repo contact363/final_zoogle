@@ -459,6 +459,7 @@ async def list_crawl_logs(
                 "machines_updated": c.machines_updated,
                 "errors_count": c.errors_count,
                 "error_details": c.error_details,
+                "log_output": c.log_output,
                 "started_at": c.started_at,
                 "finished_at": c.finished_at,
             }

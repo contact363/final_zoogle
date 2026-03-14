@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import {
   getAdminStats, listWebsites, addWebsite, updateWebsite, deleteWebsite,
-  startCrawl, startAllCrawls, fixStuckCrawls, getCrawlLogs, diagnoseCrawl,
+  startCrawl, startAllCrawls, fixStuckCrawls, getCrawlLogs,
   getAdminMachines, updateMachine, deleteMachine,
   exportMachinesExcelUrl,
 } from "@/lib/api";
@@ -11,7 +11,7 @@ import { useAuthStore } from "@/lib/store";
 import { useRouter } from "next/navigation";
 import {
   Globe, Cpu, Users, Search, Play, Trash2, Download,
-  BarChart3, FileText, Pencil, X, Check, RefreshCw, Wrench, Bug, ChevronDown, ChevronRight,
+  BarChart3, FileText, Pencil, X, Check, RefreshCw, Wrench, ChevronDown, ChevronRight,
 } from "lucide-react";
 import toast from "react-hot-toast";
 
@@ -221,8 +221,6 @@ export default function AdminPage() {
   const [editWebsite, setEditWebsite] = useState<any | null>(null);
   const [editMachine, setEditMachine] = useState<any | null>(null);
   const [expandedLog, setExpandedLog] = useState<number | null>(null);
-  const [diagnoseResult, setDiagnoseResult] = useState<any | null>(null);
-  const [diagnosing, setDiagnosing] = useState<number | null>(null);
 
   useEffect(() => {
     if (!user?.is_admin) {
@@ -629,31 +627,13 @@ export default function AdminPage() {
                 </div>
               </div>
 
-              {/* Diagnose modal */}
-              {diagnoseResult && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-                  <div className="bg-white rounded-xl shadow-xl w-full max-w-3xl p-6 space-y-4 max-h-[90vh] overflow-y-auto">
-                    <div className="flex items-center justify-between">
-                      <h3 className="text-lg font-semibold">Crawl Diagnosis — {diagnoseResult.url}</h3>
-                      <button onClick={() => setDiagnoseResult(null)}><X className="w-5 h-5" /></button>
-                    </div>
-                    <div className="flex items-center gap-3 text-sm">
-                      <span className={diagnoseResult.returncode === 0 ? "badge-green" : "badge-red"}>
-                        Exit code: {diagnoseResult.returncode}
-                      </span>
-                      <span className="text-steel-500">Output: {diagnoseResult.output_length} chars</span>
-                    </div>
-                    <pre className="bg-steel-900 text-green-400 text-xs p-4 rounded-lg overflow-auto max-h-[60vh] whitespace-pre-wrap">
-                      {diagnoseResult.output || "No output"}
-                    </pre>
-                  </div>
-                </div>
-              )}
+              <p className="text-xs text-steel-400">Click any row to see full scrapy output / error details.</p>
 
               <div className="card overflow-hidden">
                 <table className="w-full text-sm">
                   <thead className="bg-steel-50 border-b border-steel-200">
                     <tr className="text-steel-500 text-left">
+                      <th className="px-4 py-3 w-8"></th>
                       <th className="px-4 py-3">Website</th>
                       <th className="px-4 py-3">Status</th>
                       <th className="px-4 py-3">Found</th>
@@ -661,7 +641,6 @@ export default function AdminPage() {
                       <th className="px-4 py-3">Errors</th>
                       <th className="px-4 py-3">Started</th>
                       <th className="px-4 py-3">Duration</th>
-                      <th className="px-4 py-3">Debug</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -671,53 +650,49 @@ export default function AdminPage() {
                           ? Math.round((new Date(log.finished_at).getTime() - new Date(log.started_at).getTime()) / 1000) + "s"
                           : "Running...";
                       const isExpanded = expandedLog === log.id;
+                      const hasDetail = log.error_details || log.log_output;
                       return (
                         <>
                           <tr
                             key={log.id}
-                            className="border-b border-steel-50 hover:bg-steel-50 cursor-pointer"
-                            onClick={() => setExpandedLog(isExpanded ? null : log.id)}
+                            className={`border-b border-steel-50 hover:bg-steel-50 ${hasDetail ? "cursor-pointer" : ""}`}
+                            onClick={() => hasDetail && setExpandedLog(isExpanded ? null : log.id)}
                           >
-                            <td className="px-4 py-3 flex items-center gap-1">
-                              {log.error_details
-                                ? (isExpanded ? <ChevronDown className="w-3 h-3 text-steel-400" /> : <ChevronRight className="w-3 h-3 text-steel-400" />)
-                                : <span className="w-3" />}
-                              {log.website_id}
+                            <td className="px-4 py-3 text-steel-400">
+                              {hasDetail
+                                ? (isExpanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />)
+                                : null}
                             </td>
+                            <td className="px-4 py-3">{log.website_id}</td>
                             <td className="px-4 py-3"><span className={statusColor(log.status)}>{log.status}</span></td>
                             <td className="px-4 py-3">{log.machines_found ?? 0}</td>
                             <td className="px-4 py-3 text-green-600 font-medium">{log.machines_new ?? 0}</td>
                             <td className="px-4 py-3 text-red-500">{log.errors_count ?? 0}</td>
                             <td className="px-4 py-3 text-steel-400">{new Date(log.started_at).toLocaleString()}</td>
                             <td className="px-4 py-3 text-steel-400">{duration}</td>
-                            <td className="px-4 py-3">
-                              <button
-                                onClick={async (e) => {
-                                  e.stopPropagation();
-                                  setDiagnosing(log.website_id);
-                                  try {
-                                    const r = await diagnoseCrawl(log.website_id);
-                                    setDiagnoseResult(r);
-                                  } catch { toast.error("Diagnose failed"); }
-                                  finally { setDiagnosing(null); }
-                                }}
-                                className="p-1.5 hover:bg-yellow-50 rounded text-yellow-600"
-                                title="Diagnose (test crawl)"
-                                disabled={diagnosing === log.website_id}
-                              >
-                                {diagnosing === log.website_id
-                                  ? <RefreshCw className="w-4 h-4 animate-spin" />
-                                  : <Bug className="w-4 h-4" />}
-                              </button>
-                            </td>
                           </tr>
-                          {isExpanded && log.error_details && (
-                            <tr key={`${log.id}-detail`} className="bg-red-50 border-b border-red-100">
-                              <td colSpan={8} className="px-6 py-3">
-                                <p className="text-xs font-semibold text-red-700 mb-1">Error Details:</p>
-                                <pre className="text-xs text-red-800 whitespace-pre-wrap font-mono bg-red-100 rounded p-2 max-h-40 overflow-auto">
-                                  {log.error_details}
-                                </pre>
+
+                          {isExpanded && (
+                            <tr key={`${log.id}-expanded`}>
+                              <td colSpan={8} className="px-0 py-0 bg-steel-900">
+                                {/* Error summary */}
+                                {log.error_details && (
+                                  <div className="px-6 pt-3 pb-1">
+                                    <p className="text-xs font-semibold text-red-400 mb-1">Error Summary</p>
+                                    <pre className="text-xs text-red-300 whitespace-pre-wrap font-mono bg-black/30 rounded p-2 max-h-32 overflow-auto">
+                                      {log.error_details}
+                                    </pre>
+                                  </div>
+                                )}
+                                {/* Full log output */}
+                                {log.log_output && (
+                                  <div className="px-6 pt-2 pb-3">
+                                    <p className="text-xs font-semibold text-green-400 mb-1">Full Scrapy Output (last 5000 chars)</p>
+                                    <pre className="text-xs text-green-300 whitespace-pre-wrap font-mono bg-black/30 rounded p-3 max-h-64 overflow-auto">
+                                      {log.log_output}
+                                    </pre>
+                                  </div>
+                                )}
                               </td>
                             </tr>
                           )}

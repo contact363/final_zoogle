@@ -1,6 +1,12 @@
 """
 Celery tasks that launch Scrapy crawls in a subprocess and record logs.
 run_crawl_direct() is a Redis-free fallback for when Celery is unavailable.
+
+Self-healing approach:
+  1. Pre-flight check: run 'scrapy list' to verify spider loads before crawling
+  2. Full scrapy output is stored in crawl_log.log_output on every run
+  3. Errors are parsed from output and stored in crawl_log.error_details
+  4. machine_count on Website is updated after every crawl
 """
 import subprocess
 import sys
@@ -25,24 +31,51 @@ def get_sync_db() -> Session:
     return SyncSession()
 
 
-# backend/ directory — needed as PYTHONPATH for the scrapy subprocess
 _BACKEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _CRAWLER_DIR = os.path.join(_BACKEND_DIR, "crawler")
 
 
 def _build_subprocess_env() -> dict:
-    """Put backend/ on PYTHONPATH so 'app' is importable inside the spider."""
     env = os.environ.copy()
     existing = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = _BACKEND_DIR + (os.pathsep + existing if existing else "")
     return env
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Pre-flight: verify spider loads before wasting time crawling
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _preflight_check() -> tuple[bool, str]:
+    """
+    Run 'scrapy list' to verify that the spider can be imported without errors.
+    Returns (ok: bool, output: str).
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "scrapy", "list"],
+            cwd=_CRAWLER_DIR,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_build_subprocess_env(),
+        )
+        combined = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0 or "generic" not in result.stdout:
+            return False, f"Spider pre-flight FAILED (returncode={result.returncode}):\n{combined}"
+        return True, "Spider loaded OK"
+    except Exception as e:
+        return False, f"Pre-flight exception: {e}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Run scrapy subprocess
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _run_scrapy(website_id: int, start_url: str, crawl_log_id: int) -> subprocess.CompletedProcess:
     """
-    Run scrapy in a subprocess.
-    NO --logfile: capture stdout+stderr directly so we can see real errors.
-    Scrapy writes its stats summary to stdout at the end.
+    Run scrapy — capture all output directly (no --logfile).
+    Full stdout+stderr captured so we can store it and parse stats from it.
     """
     return subprocess.run(
         [
@@ -51,7 +84,7 @@ def _run_scrapy(website_id: int, start_url: str, crawl_log_id: int) -> subproces
             "-a", f"start_url={start_url}",
             "-a", f"crawl_log_id={crawl_log_id}",
             "--set", "LOG_LEVEL=INFO",
-            "--set", f"CLOSESPIDER_ITEMCOUNT=5000",
+            "--set", "CLOSESPIDER_ITEMCOUNT=5000",
         ],
         cwd=_CRAWLER_DIR,
         capture_output=True,
@@ -61,232 +94,172 @@ def _run_scrapy(website_id: int, start_url: str, crawl_log_id: int) -> subproces
     )
 
 
-def _parse_scrapy_stats(output: str) -> dict:
-    """
-    Parse Scrapy's final stats block from combined stdout+stderr.
+# ─────────────────────────────────────────────────────────────────────────────
+# Output parsing
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Scrapy prints something like:
-      {'downloader/request_count': 42, 'item_scraped_count': 17, ...}
-    """
+def _parse_scrapy_stats(output: str) -> dict:
+    """Parse Scrapy's final stats block from combined stdout+stderr."""
     stats = {}
 
-    # Try to find the stats dict block (scrapy dumps it as a Python dict literal)
-    stats_block_match = re.search(
-        r"Dumping Scrapy stats.*?(\{.*?\})",
-        output,
-        re.DOTALL,
-    )
-    if stats_block_match:
-        block = stats_block_match.group(1)
-        # Extract individual key-value pairs
+    # Scrapy dumps: {'item_scraped_count': 42, 'downloader/request_count': 100, ...}
+    block_match = re.search(r"Dumping Scrapy stats.*?(\{.*?\})", output, re.DOTALL)
+    if block_match:
+        block = block_match.group(1)
         for m in re.finditer(r"'([\w/]+)':\s*(\d+)", block):
-            key, val = m.group(1), int(m.group(2))
-            stats[key] = val
+            stats[m.group(1)] = int(m.group(2))
 
-    # Fallback: scan line by line
+    # Fallback: scan lines
     if not stats:
         for line in output.split("\n"):
             for key in ("item_scraped_count", "spider_exceptions_count",
                         "downloader/response_count", "item_dropped_count"):
-                if key in line:
-                    m = re.search(rf"'{key}':\s*(\d+)", line)
-                    if m:
-                        stats[key] = int(m.group(1))
+                m = re.search(rf"'{key}':\s*(\d+)", line)
+                if m:
+                    stats[key] = int(m.group(1))
 
     return stats
 
 
-def _get_error_summary(result: subprocess.CompletedProcess) -> str | None:
-    """Extract the most useful error info from scrapy output."""
-    combined = (result.stdout or "") + (result.stderr or "")
-    if not combined:
-        return "No output captured from scrapy process"
+def _extract_error_summary(output: str) -> str | None:
+    """Pull the most useful error lines from scrapy output."""
+    if not output:
+        return "No output captured"
 
-    # Look for Python tracebacks
-    lines = combined.split("\n")
     error_lines = []
-    in_traceback = False
+    lines = output.split("\n")
 
-    for line in lines:
-        if "Traceback (most recent call last)" in line:
-            in_traceback = True
-        if in_traceback:
-            error_lines.append(line)
-            if len(error_lines) > 30:
-                break
-        elif any(marker in line for marker in ["ERROR", "CRITICAL", "Error:", "Exception:"]):
-            error_lines.append(line)
+    for i, line in enumerate(lines):
+        if any(m in line for m in ["Traceback", "ERROR", "CRITICAL", "Error:", "Exception:", "ImportError", "ModuleNotFoundError"]):
+            # Grab this line + next 5 lines for context
+            error_lines.extend(lines[i:i+6])
 
     if error_lines:
-        return "\n".join(error_lines)[-3000:]
+        return "\n".join(dict.fromkeys(error_lines))[:3000]  # deduplicate + cap
 
-    # Return last 2000 chars as fallback
-    return combined[-2000:] or None
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Direct crawl (no Celery — runs in background thread)
+# Core crawl runner (shared by direct and celery)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_crawl_direct(website_id: int):
+def _execute_crawl(website_id: int, db: Session) -> None:
     """
-    Run a crawl without Celery/Redis.
-    Called in a background thread from the admin endpoint.
-    Runs sequentially — one website at a time to avoid memory issues.
+    Full crawl lifecycle:
+      preflight → create log → run scrapy → parse output → update DB
     """
     from app.models.website import Website
     from app.models.crawl_log import CrawlLog
+    from app.models.machine import Machine
+    from sqlalchemy import func
 
-    db = get_sync_db()
-    crawl_log = None
-    try:
-        website = db.query(Website).filter(Website.id == website_id).first()
-        if not website:
-            logger.error(f"Website {website_id} not found")
-            return
+    website = db.query(Website).filter(Website.id == website_id).first()
+    if not website:
+        logger.error(f"Website {website_id} not found")
+        return
 
-        crawl_log = CrawlLog(
-            website_id=website_id,
-            task_id=f"direct-{website_id}-{int(datetime.now().timestamp())}",
-            status="running",
-        )
-        db.add(crawl_log)
-        db.commit()
+    # ── Pre-flight ────────────────────────────────────────────────────────────
+    ok, preflight_msg = _preflight_check()
+    logger.info(f"Pre-flight: {preflight_msg}")
 
-        website.crawl_status = "running"
-        db.commit()
+    crawl_log = CrawlLog(
+        website_id=website_id,
+        task_id=f"direct-{website_id}-{int(datetime.now().timestamp())}",
+        status="running",
+    )
+    db.add(crawl_log)
+    db.commit()
 
-        logger.info(f"Starting crawl: website={website_id} url={website.url}")
+    website.crawl_status = "running"
+    db.commit()
 
-        result = _run_scrapy(website_id, website.url, crawl_log.id)
-        combined_output = (result.stdout or "") + (result.stderr or "")
-
-        logger.info(
-            f"Scrapy finished: website={website_id} returncode={result.returncode} "
-            f"output_len={len(combined_output)}"
-        )
-        # Log first 500 chars of output for debugging
-        if combined_output:
-            logger.debug(f"Scrapy output preview:\n{combined_output[:500]}")
-
-        stats = _parse_scrapy_stats(combined_output)
-
-        crawl_log.status = "success" if result.returncode == 0 else "error"
-        crawl_log.machines_found = stats.get("item_scraped_count", 0)
-        crawl_log.machines_new = stats.get("item_scraped_count", 0)
-        crawl_log.errors_count = stats.get("spider_exceptions_count", 0)
+    if not ok:
+        # Spider can't even load — fail immediately with the real error
+        crawl_log.status = "error"
+        crawl_log.error_details = preflight_msg
+        crawl_log.log_output = preflight_msg
         crawl_log.finished_at = datetime.now(timezone.utc)
-
-        if result.returncode != 0:
-            crawl_log.error_details = _get_error_summary(result)
-        elif crawl_log.machines_found == 0:
-            # Success but 0 machines — store output snippet for debugging
-            crawl_log.error_details = f"[0 machines found]\n{combined_output[-1000:]}"
-
+        website.crawl_status = "error"
         db.commit()
+        logger.error(f"Pre-flight failed for website {website_id}: {preflight_msg}")
+        return
 
-        # Update website machine_count
-        from sqlalchemy import func
-        from app.models.machine import Machine
-        count = db.query(func.count(Machine.id)).filter(Machine.website_id == website_id).scalar()
-        website.machine_count = count or 0
-        website.crawl_status = crawl_log.status
-        website.last_crawled_at = crawl_log.finished_at
-        db.commit()
+    # ── Run scrapy ────────────────────────────────────────────────────────────
+    logger.info(f"Crawl start: website={website_id} url={website.url}")
 
-        logger.info(
-            f"Crawl complete: website={website_id} status={crawl_log.status} "
-            f"machines_found={crawl_log.machines_found} total_in_db={website.machine_count}"
-        )
+    result = _run_scrapy(website_id, website.url, crawl_log.id)
+    combined = (result.stdout or "") + (result.stderr or "")
 
-    except subprocess.TimeoutExpired:
-        logger.error(f"Crawl timed out: website={website_id}")
-        if crawl_log:
-            crawl_log.status = "error"
-            crawl_log.error_details = "Crawl timed out after 1 hour"
-            crawl_log.finished_at = datetime.now(timezone.utc)
-            db.commit()
+    logger.info(
+        f"Scrapy done: website={website_id} returncode={result.returncode} "
+        f"output={len(combined)} chars"
+    )
+
+    # ── Parse results ─────────────────────────────────────────────────────────
+    stats = _parse_scrapy_stats(combined)
+    machines_found = stats.get("item_scraped_count", 0)
+
+    # Determine status
+    if result.returncode == 0 and machines_found > 0:
+        status = "success"
+    elif result.returncode == 0 and machines_found == 0:
+        # Ran fine but found nothing — treat as warning, not hard error
+        status = "success"
+    else:
+        status = "error"
+
+    error_summary = _extract_error_summary(combined) if status == "error" else None
+
+    # Store 0-machine output for debugging even on "success"
+    if machines_found == 0 and not error_summary:
+        error_summary = f"[Crawl ran OK but found 0 machines]\n{combined[-1500:]}"
+
+    # ── Update crawl log ──────────────────────────────────────────────────────
+    crawl_log.status = status
+    crawl_log.machines_found = machines_found
+    crawl_log.machines_new = machines_found
+    crawl_log.errors_count = stats.get("spider_exceptions_count", 0)
+    crawl_log.error_details = error_summary
+    crawl_log.log_output = combined[-5000:]   # store last 5000 chars of full output
+    crawl_log.finished_at = datetime.now(timezone.utc)
+    db.commit()
+
+    # ── Update website ────────────────────────────────────────────────────────
+    count = db.query(func.count(Machine.id)).filter(Machine.website_id == website_id).scalar()
+    website.machine_count = count or 0
+    website.crawl_status = status
+    website.last_crawled_at = crawl_log.finished_at
+    db.commit()
+
+    logger.info(
+        f"Crawl complete: website={website_id} status={status} "
+        f"scraped={machines_found} total_in_db={website.machine_count}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_crawl_direct(website_id: int):
+    """Direct crawl without Celery — called in a background thread."""
+    db = get_sync_db()
+    try:
+        _execute_crawl(website_id, db)
     except Exception as exc:
-        logger.exception(f"Crawl error: website={website_id} error={exc}")
-        if crawl_log:
-            try:
-                crawl_log.status = "error"
-                crawl_log.error_details = str(exc)[:1000]
-                crawl_log.finished_at = datetime.now(timezone.utc)
-                db.commit()
-            except Exception:
-                pass
+        logger.exception(f"run_crawl_direct failed: website={website_id} error={exc}")
     finally:
         db.close()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Celery tasks
-# ─────────────────────────────────────────────────────────────────────────────
-
 @celery_app.task(bind=True, name="tasks.crawl_tasks.crawl_website_task")
 def crawl_website_task(self, website_id: int):
-    """Crawl a single website by ID (via Celery worker)."""
-    from app.models.website import Website
-    from app.models.crawl_log import CrawlLog
-
     db = get_sync_db()
-    crawl_log = None
     try:
-        website = db.query(Website).filter(Website.id == website_id).first()
-        if not website:
-            logger.error(f"Website {website_id} not found")
-            return
-
-        crawl_log = CrawlLog(
-            website_id=website_id,
-            task_id=self.request.id,
-            status="running",
-        )
-        db.add(crawl_log)
-        db.commit()
-
-        website.crawl_status = "running"
-        db.commit()
-
-        result = _run_scrapy(website_id, website.url, crawl_log.id)
-        combined_output = (result.stdout or "") + (result.stderr or "")
-        stats = _parse_scrapy_stats(combined_output)
-
-        crawl_log.status = "success" if result.returncode == 0 else "error"
-        crawl_log.machines_found = stats.get("item_scraped_count", 0)
-        crawl_log.machines_new = stats.get("item_scraped_count", 0)
-        crawl_log.errors_count = stats.get("spider_exceptions_count", 0)
-        crawl_log.finished_at = datetime.now(timezone.utc)
-
-        if result.returncode != 0:
-            crawl_log.error_details = _get_error_summary(result)
-        elif crawl_log.machines_found == 0:
-            crawl_log.error_details = f"[0 machines found]\n{combined_output[-1000:]}"
-
-        db.commit()
-
-        from sqlalchemy import func
-        from app.models.machine import Machine
-        count = db.query(func.count(Machine.id)).filter(Machine.website_id == website_id).scalar()
-        website.machine_count = count or 0
-        website.crawl_status = crawl_log.status
-        website.last_crawled_at = crawl_log.finished_at
-        db.commit()
-
-        logger.info(
-            f"Crawl finished: website={website_id} status={crawl_log.status} "
-            f"machines={crawl_log.machines_found}"
-        )
-
-    except subprocess.TimeoutExpired:
-        if crawl_log:
-            crawl_log.status = "error"
-            crawl_log.error_details = "Crawl timed out after 1 hour"
-            crawl_log.finished_at = datetime.now(timezone.utc)
-            db.commit()
+        _execute_crawl(website_id, db)
     except Exception as exc:
-        logger.exception(f"Crawl task error: {exc}")
+        logger.exception(f"Celery crawl failed: website={website_id} error={exc}")
         raise
     finally:
         db.close()
@@ -294,9 +267,7 @@ def crawl_website_task(self, website_id: int):
 
 @celery_app.task(name="tasks.crawl_tasks.crawl_all_websites_task")
 def crawl_all_websites_task():
-    """Queue crawl tasks for all active websites (sequential via Celery)."""
     from app.models.website import Website
-
     db = get_sync_db()
     try:
         websites = (
@@ -306,7 +277,6 @@ def crawl_all_websites_task():
         )
         for site in websites:
             crawl_website_task.delay(site.id)
-            logger.info(f"Queued crawl for website: {site.id} ({site.url})")
         return {"queued": len(websites)}
     finally:
         db.close()
