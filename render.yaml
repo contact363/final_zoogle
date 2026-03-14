@@ -1,14 +1,11 @@
 services:
   # ── Backend (FastAPI) ────────────────────────────────────────────────────────
-  # NOTE: No rootDir — paths are relative to repo root so they work whether
-  # the Render service Root Directory is set to "." or left as default.
   - type: web
     name: final-zoogle-backend
     runtime: python
     buildCommand: pip install -r backend/requirements.txt
     startCommand: cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
-      # Internal hostname — only resolves inside Render's network (correct for production)
       - key: DATABASE_URL
         value: postgresql+asyncpg://final_zoogle_db_user:A8D7GMXiIYmc20g6ZqhfGOfHW9ofXRAz@dpg-d6qjt7haae7s739hqia0-a/final_zoogle_db
       - key: DATABASE_SYNC_URL
@@ -27,8 +24,7 @@ services:
         value: "false"
     healthCheckPath: /health
 
-  # ── Frontend (Next.js) ───────────────────────────────────────────────────────
-  # NOTE: No rootDir — build command uses full path from repo root
+  # ── Frontend (Next.js Web Service) ───────────────────────────────────────────
   - type: web
     name: final-zoogle-frontend
     runtime: node
