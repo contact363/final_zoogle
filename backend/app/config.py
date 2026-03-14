@@ -11,9 +11,11 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
 
-    # Database — defaults point to Render PostgreSQL; override via env var locally
-    DATABASE_URL: str = "postgresql+asyncpg://final_zoogle_db_user:A8D7GMXiIYmc20g6ZqhfGOfHW9ofXRAz@dpg-d6qjt7haae7s739hqia0-a/final_zoogle_db"
-    DATABASE_SYNC_URL: str = "postgresql://final_zoogle_db_user:A8D7GMXiIYmc20g6ZqhfGOfHW9ofXRAz@dpg-d6qjt7haae7s739hqia0-a/final_zoogle_db"
+    # Database
+    # - Render production: uses internal hostname (dpg-xxx-a) via env var set in dashboard
+    # - Local dev: uses external hostname (.oregon-postgres.render.com) from .env file
+    DATABASE_URL: str = "postgresql+asyncpg://final_zoogle_db_user:A8D7GMXiIYmc20g6ZqhfGOfHW9ofXRAz@dpg-d6qjt7haae7s739hqia0-a.oregon-postgres.render.com/final_zoogle_db"
+    DATABASE_SYNC_URL: str = "postgresql://final_zoogle_db_user:A8D7GMXiIYmc20g6ZqhfGOfHW9ofXRAz@dpg-d6qjt7haae7s739hqia0-a.oregon-postgres.render.com/final_zoogle_db"
 
     # Redis / Celery
     REDIS_URL: str = "redis://localhost:6379/0"
