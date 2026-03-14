@@ -6,7 +6,7 @@ import {
   recalculateMachineCounts, fixWebsiteNames,
   startCrawl, startAllCrawls, fixStuckCrawls, getCrawlLogs,
   getAdminMachines, updateMachine, deleteMachine,
-  exportMachinesExcelUrl,
+  exportMachinesExcelUrl, fillMachineTypes,
 } from "@/lib/api";
 import { useAuthStore } from "@/lib/store";
 import { useRouter } from "next/navigation";
@@ -570,6 +570,20 @@ export default function AdminPage() {
                 <div className="flex gap-2">
                   <button onClick={loadData} className="btn-secondary flex items-center gap-2 text-sm">
                     <RefreshCw className="w-4 h-4" />
+                  </button>
+                  <button
+                    onClick={async () => {
+                      try {
+                        const r = await fillMachineTypes();
+                        toast.success(`Filled types for ${r.updated} machines`);
+                        loadData();
+                      } catch {
+                        toast.error("Failed to fill types");
+                      }
+                    }}
+                    className="btn-secondary flex items-center gap-2 text-sm"
+                  >
+                    <Wrench className="w-4 h-4" /> Fill Types
                   </button>
                   <a
                     href={exportMachinesExcelUrl()}

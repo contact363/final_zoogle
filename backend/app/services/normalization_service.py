@@ -5,6 +5,101 @@ to the same canonical entry regardless of how they were scraped.
 import re
 from unidecode import unidecode
 
+# ── Brand → machine type hints ───────────────────────────────────────────────
+# When we know the brand, we can infer the machine type even if the title
+# doesn't contain type keywords.
+BRAND_TYPE_HINTS: dict[str, str] = {
+    # Injection molding
+    "krauss-maffei": "Injection Molding Machine",
+    "krauss maffei": "Injection Molding Machine",
+    "kraussmaffei": "Injection Molding Machine",
+    "arburg": "Injection Molding Machine",
+    "engel": "Injection Molding Machine",
+    "milacron": "Injection Molding Machine",
+    "husky": "Injection Molding Machine",
+    "battenfeld": "Injection Molding Machine",
+    "demag": "Injection Molding Machine",
+    "netstal": "Injection Molding Machine",
+    "sumitomo": "Injection Molding Machine",
+    "toshiba machine": "Injection Molding Machine",
+    # Laser cutting
+    "trumpf": "Laser Cutting Machine",
+    "bystronic": "Laser Cutting Machine",
+    "prima power": "Laser Cutting Machine",
+    "mazak optonics": "Laser Cutting Machine",
+    "salvagnini": "Press Brake",
+    # Press brakes / sheet metal
+    "amada": "Press Brake",
+    "safan": "Press Brake",
+    "darley": "Press Brake",
+    "haco": "Press Brake",
+    "ermaksan": "Press Brake",
+    "durma": "Press Brake",
+    # CNC lathes / machining
+    "haas": "CNC Machining Center",
+    "dmg mori": "CNC Machining Center",
+    "mazak": "CNC Lathe",
+    "okuma": "CNC Lathe",
+    "doosan": "CNC Lathe",
+    "hurco": "CNC Machining Center",
+    "makino": "CNC Machining Center",
+    "mori seiki": "CNC Machining Center",
+    "fanuc": "CNC Machining Center",
+    "schaublin": "CNC Lathe",
+    "citizen": "CNC Lathe",
+    "star micronics": "CNC Lathe",
+    "miyano": "CNC Lathe",
+    "index": "CNC Lathe",
+    "traub": "CNC Lathe",
+    "nakamura": "CNC Lathe",
+    # Grinding
+    "studer": "Cylindrical Grinder",
+    "schaudt": "Cylindrical Grinder",
+    "cylindrical": "Cylindrical Grinder",
+    "jones shipman": "Surface Grinder",
+    "blohm": "Surface Grinder",
+    "kellenberger": "Cylindrical Grinder",
+    # EDM
+    "charmilles": "Wire EDM",
+    "sodick": "Wire EDM",
+    "mitsubishi electric": "Wire EDM",
+    "agie": "Wire EDM",
+    "gf machining": "Wire EDM",
+    # Woodworking
+    "biesse": "Woodworking Machine",
+    "homag": "Woodworking Machine",
+    "scm": "Woodworking Machine",
+    "weinig": "Woodworking Machine",
+    "brückner": "Industrial Equipment",
+    "bruckner": "Industrial Equipment",
+    # Welding
+    "igm": "Welding Robot",
+    "kuka": "Industrial Robot",
+    "abb": "Industrial Robot",
+    "yaskawa": "Industrial Robot",
+    "fanuc robotics": "Industrial Robot",
+    # Filling / packaging
+    "kosme": "Filling Machine",
+    "krones": "Filling Machine",
+    "tetra pak": "Filling Machine",
+    "bosch packaging": "Packaging Machine",
+    "multivac": "Packaging Machine",
+    "ishida": "Packaging Machine",
+    # Compressors / pumps
+    "atlas copco": "Air Compressor",
+    "kaeser": "Air Compressor",
+    "ingersoll rand": "Air Compressor",
+    # Printing
+    "heidelberg": "Printing Machine",
+    "roland": "Printing Machine",
+    "komori": "Printing Machine",
+    "manroland": "Printing Machine",
+    # Textile
+    "toyota industries": "Textile Machine",
+    "picanol": "Textile Machine",
+    "sulzer": "Textile Machine",
+}
+
 # ── Brand aliases ────────────────────────────────────────────────────────────
 BRAND_ALIASES: dict[str, str] = {
     "haas automation": "Haas",
@@ -136,6 +231,30 @@ def normalize_machine_type(machine_type: str | None) -> str | None:
         if synonym in key:
             return canonical
     return machine_type.strip().title()
+
+
+def infer_type_from_brand(brand: str | None, title: str | None = None) -> str | None:
+    """
+    Infer machine type from brand name using BRAND_TYPE_HINTS.
+    Falls back to TYPE_SYNONYMS keyword scan on the title.
+    """
+    if brand:
+        key = _clean(brand)
+        # Exact brand hint
+        if key in BRAND_TYPE_HINTS:
+            return BRAND_TYPE_HINTS[key]
+        # Partial brand match (e.g. "KraussMaffei" matches "krauss maffei")
+        for hint_brand, machine_type in BRAND_TYPE_HINTS.items():
+            if hint_brand in key or key in hint_brand:
+                return machine_type
+
+    # Fall back: scan title via TYPE_SYNONYMS
+    if title:
+        result = normalize_machine_type(title)
+        if result and result != title.strip().title():
+            return result
+
+    return None
 
 
 def build_content_hash(brand: str | None, model: str | None, url: str) -> str:

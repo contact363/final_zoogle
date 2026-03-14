@@ -126,6 +126,11 @@ export async function fixWebsiteNames(): Promise<{ fixed: number }> {
   return data;
 }
 
+export async function fillMachineTypes(): Promise<{ updated: number; total_checked: number }> {
+  const { data } = await api.post("/api/admin/machines/fill-types");
+  return data;
+}
+
 export async function startCrawl(websiteId: number) {
   const { data } = await api.post(`/api/admin/crawl/start/${websiteId}`);
   return data;

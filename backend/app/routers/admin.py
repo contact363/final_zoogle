@@ -306,6 +306,38 @@ async def fix_website_names(
     return {"fixed": fixed}
 
 
+@router.post("/machines/fill-types")
+async def fill_machine_types(
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """
+    Auto-fill machine_type for all machines where it is NULL.
+    Uses brand name → type hints mapping, then title keyword scan.
+    Returns count of machines updated.
+    """
+    from app.services.normalization_service import infer_type_from_brand
+
+    result = await db.execute(
+        select(Machine).where(Machine.machine_type == None)
+    )
+    machines = result.scalars().all()
+
+    updated = 0
+    for m in machines:
+        inferred = infer_type_from_brand(
+            m.brand,
+            f"{m.brand or ''} {m.model or ''} {m.machine_url or ''}"
+        )
+        if inferred:
+            m.machine_type = inferred
+            m.type_normalized = inferred
+            updated += 1
+
+    await db.commit()
+    return {"updated": updated, "total_checked": len(machines)}
+
+
 @router.post("/crawl/fix-stuck")
 async def fix_stuck_crawls(
     db: AsyncSession = Depends(get_db),
