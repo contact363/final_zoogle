@@ -1,7 +1,11 @@
 import sys, os
 
-# Make app importable from crawler
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
+# Make app importable from crawler.
+# __file__ = backend/crawler/zoogle_crawler/settings.py
+# ../.. from there = backend/   (where app/ lives)
+_backend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
 
 BOT_NAME = "zoogle_crawler"
 SPIDER_MODULES = ["zoogle_crawler.spiders"]

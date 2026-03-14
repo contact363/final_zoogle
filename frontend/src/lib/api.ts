@@ -6,15 +6,20 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 export const api = axios.create({
   baseURL: API_BASE,
   headers: { "Content-Type": "application/json" },
+  timeout: 60000, // 60s — free Render tier cold-start can take 30-50s
 });
 
-// Surface backend error messages
+// Surface backend error messages; detect cold-start network errors
 api.interceptors.response.use(
   (res) => res,
   (err) => {
     const detail = err?.response?.data?.detail;
     if (detail) {
       err.message = Array.isArray(detail) ? detail[0]?.msg || "Request failed." : detail;
+    } else if (err.code === "ERR_NETWORK" || err.message === "Network Error") {
+      err.message = "Cannot reach server. If this is your first visit, the backend may be waking up — please wait 30 seconds and try again.";
+    } else if (err.code === "ECONNABORTED") {
+      err.message = "Request timed out. The server may be starting up — please try again.";
     }
     return Promise.reject(err);
   }

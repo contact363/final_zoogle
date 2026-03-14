@@ -150,12 +150,12 @@ async def start_crawl(
         task = crawl_website_task.delay(website_id)
         return {"task_id": task.id, "status": "started", "mode": "celery"}
     except Exception:
-        # Redis not available (local dev) — run in background thread
+        # Redis/Celery not available — run scrapy subprocess directly in background thread
         import threading
-        from tasks.crawl_tasks import crawl_website_task as _task
-        t = threading.Thread(target=_task, args=(website_id,), daemon=True)
+        from tasks.crawl_tasks import run_crawl_direct
+        t = threading.Thread(target=run_crawl_direct, args=(website_id,), daemon=True)
         t.start()
-        return {"task_id": f"local-{website_id}", "status": "started", "mode": "direct"}
+        return {"task_id": f"direct-{website_id}", "status": "started", "mode": "direct"}
 
 
 @router.post("/crawl/start-all")
@@ -169,10 +169,16 @@ async def start_all_crawls(
         return {"task_id": task.id, "status": "started", "mode": "celery"}
     except Exception:
         import threading
-        from tasks.crawl_tasks import crawl_all_websites_task as _task
-        t = threading.Thread(target=_task, daemon=True)
-        t.start()
-        return {"task_id": "local-all", "status": "started", "mode": "direct"}
+        from tasks.crawl_tasks import run_crawl_direct
+        from app.models.website import Website as _W
+        result = await db.execute(
+            select(_W).where(_W.is_active == True, _W.crawl_enabled == True)
+        )
+        sites = result.scalars().all()
+        for site in sites:
+            t = threading.Thread(target=run_crawl_direct, args=(site.id,), daemon=True)
+            t.start()
+        return {"task_id": "direct-all", "status": "started", "mode": "direct", "count": len(sites)}
 
 
 @router.post("/crawl/stop/{task_id}")
