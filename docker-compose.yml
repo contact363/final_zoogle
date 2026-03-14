@@ -1,0 +1,119 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: zoogle_pass
+      POSTGRES_DB: zoogle
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── FastAPI Backend ─────────────────────────────────────────────────────────
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:zoogle_pass@postgres:5432/zoogle
+      DATABASE_SYNC_URL: postgresql://postgres:zoogle_pass@postgres:5432/zoogle
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      SECRET_KEY: super-secret-key-change-in-production
+      DEBUG: "false"
+      MEDIA_DIR: media/machines
+      BASE_URL: http://localhost:8000
+    volumes:
+      - media_data:/app/media
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Celery Worker ───────────────────────────────────────────────────────────
+  celery_worker:
+    build: ./backend
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=4
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:zoogle_pass@postgres:5432/zoogle
+      DATABASE_SYNC_URL: postgresql://postgres:zoogle_pass@postgres:5432/zoogle
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      SECRET_KEY: super-secret-key-change-in-production
+      MEDIA_DIR: media/machines
+    volumes:
+      - media_data:/app/media
+    depends_on:
+      - backend
+      - redis
+
+  # ── Celery Beat (scheduler) ─────────────────────────────────────────────────
+  celery_beat:
+    build: ./backend
+    command: celery -A tasks.celery_app beat --loglevel=info
+    environment:
+      DATABASE_SYNC_URL: postgresql://postgres:zoogle_pass@postgres:5432/zoogle
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    depends_on:
+      - celery_worker
+
+  # ── Flower (Celery monitor) ─────────────────────────────────────────────────
+  flower:
+    build: ./backend
+    command: celery -A tasks.celery_app flower --port=5555
+    ports:
+      - "5555:5555"
+    depends_on:
+      - celery_worker
+
+  # ── Next.js Frontend ────────────────────────────────────────────────────────
+  frontend:
+    build: ./frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  # ── Nginx Reverse Proxy ─────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - media_data:/app/media:ro
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  postgres_data:
+  media_data:
