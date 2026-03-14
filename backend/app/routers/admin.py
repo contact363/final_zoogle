@@ -136,21 +136,26 @@ async def start_crawl(
     db: AsyncSession = Depends(get_db),
     _=Depends(require_admin),
 ):
-    from app.tasks.crawl_tasks import crawl_website_task
-
     result = await db.execute(select(Website).where(Website.id == website_id))
     website = result.scalar_one_or_none()
     if not website:
         raise HTTPException(status_code=404, detail="Website not found")
 
-    task = crawl_website_task.delay(website_id)
-
-    # Update crawl status
     await db.execute(
         update(Website).where(Website.id == website_id).values(crawl_status="running")
     )
 
-    return {"task_id": task.id, "status": "started"}
+    try:
+        from tasks.crawl_tasks import crawl_website_task
+        task = crawl_website_task.delay(website_id)
+        return {"task_id": task.id, "status": "started", "mode": "celery"}
+    except Exception:
+        # Redis not available (local dev) — run in background thread
+        import threading
+        from tasks.crawl_tasks import crawl_website_task as _task
+        t = threading.Thread(target=_task, args=(website_id,), daemon=True)
+        t.start()
+        return {"task_id": f"local-{website_id}", "status": "started", "mode": "direct"}
 
 
 @router.post("/crawl/start-all")
@@ -158,10 +163,16 @@ async def start_all_crawls(
     db: AsyncSession = Depends(get_db),
     _=Depends(require_admin),
 ):
-    from app.tasks.crawl_tasks import crawl_all_websites_task
-
-    task = crawl_all_websites_task.delay()
-    return {"task_id": task.id, "status": "started"}
+    try:
+        from tasks.crawl_tasks import crawl_all_websites_task
+        task = crawl_all_websites_task.delay()
+        return {"task_id": task.id, "status": "started", "mode": "celery"}
+    except Exception:
+        import threading
+        from tasks.crawl_tasks import crawl_all_websites_task as _task
+        t = threading.Thread(target=_task, daemon=True)
+        t.start()
+        return {"task_id": "local-all", "status": "started", "mode": "direct"}
 
 
 @router.post("/crawl/stop/{task_id}")
@@ -169,7 +180,7 @@ async def stop_crawl(
     task_id: str,
     _=Depends(require_admin),
 ):
-    from app.tasks.celery_app import celery_app
+    from tasks.celery_app import celery_app
 
     celery_app.control.revoke(task_id, terminate=True)
     return {"task_id": task_id, "status": "stopped"}

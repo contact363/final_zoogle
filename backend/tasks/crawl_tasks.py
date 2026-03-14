@@ -5,6 +5,7 @@ import subprocess
 import json
 import sys
 import os
+import tempfile
 from datetime import datetime, timezone
 
 from celery import shared_task
@@ -54,13 +55,14 @@ def crawl_website_task(self, website_id: int):
 
         # Launch Scrapy in subprocess
         crawler_dir = os.path.join(os.path.dirname(__file__), "..", "crawler")
+        log_file = os.path.join(tempfile.gettempdir(), f"scrapy_{website_id}.log")
         result = subprocess.run(
             [
                 sys.executable, "-m", "scrapy", "crawl", "generic",
                 "-a", f"website_id={website_id}",
                 "-a", f"start_url={website.url}",
                 "-a", f"crawl_log_id={crawl_log.id}",
-                "--logfile", f"/tmp/scrapy_{website_id}.log",
+                "--logfile", log_file,
             ],
             cwd=crawler_dir,
             capture_output=True,
