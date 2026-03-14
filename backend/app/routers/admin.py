@@ -65,7 +65,8 @@ async def dashboard_stats(
                 "website_id": c.website_id,
                 "website_name": name or f"Website #{c.website_id}",
                 "status": c.status,
-                "machines_new": c.machines_new,
+                "machines_found": c.machines_found or 0,
+                "machines_new": c.machines_new or 0,
                 "started_at": c.started_at,
                 "finished_at": c.finished_at,
             }

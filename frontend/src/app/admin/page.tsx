@@ -386,18 +386,20 @@ export default function AdminPage() {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-steel-500 text-left border-b border-steel-100">
-                      <th className="pb-2">Website</th>
+                      <th className="pb-2">Website Name</th>
                       <th className="pb-2">Status</th>
-                      <th className="pb-2">New Machines</th>
+                      <th className="pb-2">Found</th>
+                      <th className="pb-2">New</th>
                       <th className="pb-2">Started</th>
                     </tr>
                   </thead>
                   <tbody>
                     {stats.recent_crawls?.map((c: any) => (
                       <tr key={c.id} className="border-b border-steel-50">
-                        <td className="py-2 font-medium">{c.website_name}</td>
+                        <td className="py-2 font-medium text-steel-900">{c.website_name}</td>
                         <td className="py-2"><span className={statusColor(c.status)}>{c.status}</span></td>
-                        <td className="py-2">{c.machines_new}</td>
+                        <td className="py-2 text-steel-700">{c.machines_found ?? 0}</td>
+                        <td className="py-2 text-green-600 font-medium">{c.machines_new ?? 0}</td>
                         <td className="py-2 text-steel-400">{c.started_at ? new Date(c.started_at).toLocaleString() : "—"}</td>
                       </tr>
                     ))}
