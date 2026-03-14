@@ -28,9 +28,37 @@ async def lifespan(app: FastAPI):
     # Seed admin user
     await seed_admin()
 
+    # Reset any crawl logs stuck in 'running' from a previous crash
+    await reset_stuck_crawls()
+
     logger.info(f"Zoogle API started — {settings.APP_NAME} v{settings.APP_VERSION}")
     yield
     await engine.dispose()
+
+
+async def reset_stuck_crawls():
+    """On startup, reset any crawls stuck in 'running' (server was restarted mid-crawl)."""
+    from datetime import datetime, timezone
+    from sqlalchemy import update as sql_update
+    from app.database import AsyncSessionLocal
+    from app.models.crawl_log import CrawlLog
+    from app.models.website import Website
+
+    async with AsyncSessionLocal() as db:
+        await db.execute(
+            sql_update(CrawlLog)
+            .where(CrawlLog.status == "running", CrawlLog.finished_at == None)
+            .values(
+                status="error",
+                error_details="Server restarted while crawl was in progress",
+                finished_at=datetime.now(timezone.utc),
+            )
+        )
+        await db.execute(
+            sql_update(Website).where(Website.crawl_status == "running").values(crawl_status="error")
+        )
+        await db.commit()
+    logger.info("Stuck crawls cleaned up on startup")
 
 
 async def seed_admin():

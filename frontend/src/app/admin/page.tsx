@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import {
   getAdminStats, listWebsites, addWebsite, updateWebsite, deleteWebsite,
-  startCrawl, startAllCrawls, getCrawlLogs,
+  startCrawl, startAllCrawls, fixStuckCrawls, getCrawlLogs,
   getAdminMachines, updateMachine, deleteMachine,
   exportMachinesExcelUrl,
 } from "@/lib/api";
@@ -11,7 +11,7 @@ import { useAuthStore } from "@/lib/store";
 import { useRouter } from "next/navigation";
 import {
   Globe, Cpu, Users, Search, Play, Trash2, Download,
-  BarChart3, FileText, Pencil, X, Check, RefreshCw,
+  BarChart3, FileText, Pencil, X, Check, RefreshCw, Wrench,
 } from "lucide-react";
 import toast from "react-hot-toast";
 
@@ -607,9 +607,23 @@ export default function AdminPage() {
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-bold text-steel-900">Crawl Logs ({logs.total})</h2>
-                <button onClick={loadData} className="btn-secondary flex items-center gap-2 text-sm">
-                  <RefreshCw className="w-4 h-4" /> Refresh
-                </button>
+                <div className="flex gap-2">
+                  <button
+                    onClick={async () => {
+                      try {
+                        const r = await fixStuckCrawls();
+                        toast.success(`Fixed ${r.fixed_crawl_logs} stuck crawl(s)`);
+                        loadData();
+                      } catch { toast.error("Failed to fix stuck crawls"); }
+                    }}
+                    className="btn-secondary flex items-center gap-2 text-sm"
+                  >
+                    <Wrench className="w-4 h-4" /> Fix Stuck
+                  </button>
+                  <button onClick={loadData} className="btn-secondary flex items-center gap-2 text-sm">
+                    <RefreshCw className="w-4 h-4" /> Refresh
+                  </button>
+                </div>
               </div>
               <div className="card overflow-hidden">
                 <table className="w-full text-sm">

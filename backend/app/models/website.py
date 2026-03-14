@@ -21,5 +21,5 @@ class Website(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
-    machines = relationship("Machine", back_populates="website", lazy="dynamic")
-    crawl_logs = relationship("CrawlLog", back_populates="website", lazy="dynamic")
+    machines = relationship("Machine", back_populates="website", passive_deletes=True)
+    crawl_logs = relationship("CrawlLog", back_populates="website", passive_deletes=True)

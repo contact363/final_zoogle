@@ -6,6 +6,7 @@ Covers:
   - Machine table view + export
   - Crawl log viewer
   - Dashboard stats
+  - Stuck crawl cleanup
 """
 import io
 import csv
@@ -17,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, desc, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.models.machine import Machine
@@ -29,6 +31,7 @@ from app.schemas.machine import MachineRead, MachineUpdate
 from app.utils.security import require_admin
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 
@@ -112,6 +115,7 @@ async def update_website(
 
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(website, field, value)
+    await db.flush()
     return website
 
 
@@ -125,6 +129,12 @@ async def delete_website(
     website = result.scalar_one_or_none()
     if not website:
         raise HTTPException(status_code=404, detail="Website not found")
+
+    # Use raw DELETE so DB-level CASCADE handles child rows (machines, crawl_logs)
+    # without SQLAlchemy trying to lazy-load them first
+    from sqlalchemy import delete as sql_delete
+    await db.execute(sql_delete(Machine).where(Machine.website_id == website_id))
+    await db.execute(sql_delete(CrawlLog).where(CrawlLog.website_id == website_id))
     await db.delete(website)
 
 
@@ -150,7 +160,6 @@ async def start_crawl(
         task = crawl_website_task.delay(website_id)
         return {"task_id": task.id, "status": "started", "mode": "celery"}
     except Exception:
-        # Redis/Celery not available — run scrapy subprocess directly in background thread
         import threading
         from tasks.crawl_tasks import run_crawl_direct
         t = threading.Thread(target=run_crawl_direct, args=(website_id,), daemon=True)
@@ -170,9 +179,8 @@ async def start_all_crawls(
     except Exception:
         import threading
         from tasks.crawl_tasks import run_crawl_direct
-        from app.models.website import Website as _W
         result = await db.execute(
-            select(_W).where(_W.is_active == True, _W.crawl_enabled == True)
+            select(Website).where(Website.is_active == True, Website.crawl_enabled == True)
         )
         sites = result.scalars().all()
         for site in sites:
@@ -187,9 +195,42 @@ async def stop_crawl(
     _=Depends(require_admin),
 ):
     from tasks.celery_app import celery_app
-
     celery_app.control.revoke(task_id, terminate=True)
     return {"task_id": task_id, "status": "stopped"}
+
+
+@router.post("/crawl/fix-stuck")
+async def fix_stuck_crawls(
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """
+    Reset crawl logs and website statuses that are stuck in 'running'
+    state (e.g. after a server restart or crash).
+    """
+    from sqlalchemy import update as sql_update
+
+    # Fix stuck crawl logs
+    result = await db.execute(
+        sql_update(CrawlLog)
+        .where(CrawlLog.status == "running", CrawlLog.finished_at == None)
+        .values(
+            status="error",
+            error_details="Reset: server restarted while crawl was running",
+            finished_at=datetime.now(timezone.utc),
+        )
+        .returning(CrawlLog.id)
+    )
+    fixed_logs = result.scalars().all()
+
+    # Fix stuck website statuses
+    await db.execute(
+        sql_update(Website)
+        .where(Website.crawl_status == "running")
+        .values(crawl_status="error")
+    )
+
+    return {"fixed_crawl_logs": len(fixed_logs), "message": "Stuck crawls reset to error"}
 
 
 # ── Machine Table ─────────────────────────────────────────────────────────────
@@ -215,10 +256,32 @@ async def list_machines(
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
     rows = (await db.execute(stmt.offset(skip).limit(limit))).scalars().all()
 
-    return {"total": total, "items": [MachineRead.model_validate(m) for m in rows]}
+    # Return plain dicts — avoids async lazy-load on images/specs
+    items = [
+        {
+            "id": m.id,
+            "website_id": m.website_id,
+            "machine_type": m.machine_type,
+            "brand": m.brand,
+            "model": m.model,
+            "price": float(m.price) if m.price else None,
+            "currency": m.currency,
+            "location": m.location,
+            "description": m.description,
+            "machine_url": m.machine_url,
+            "website_source": m.website_source,
+            "thumbnail_url": m.thumbnail_url,
+            "is_active": m.is_active,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "updated_at": m.updated_at.isoformat() if m.updated_at else None,
+        }
+        for m in rows
+    ]
+
+    return {"total": total, "items": items}
 
 
-@router.patch("/machines/{machine_id}", response_model=MachineRead)
+@router.patch("/machines/{machine_id}")
 async def admin_update_machine(
     machine_id: int,
     payload: MachineUpdate,
@@ -229,9 +292,24 @@ async def admin_update_machine(
     machine = result.scalar_one_or_none()
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
+
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(machine, field, value)
-    return machine
+    await db.flush()
+
+    return {
+        "id": machine.id,
+        "machine_type": machine.machine_type,
+        "brand": machine.brand,
+        "model": machine.model,
+        "price": float(machine.price) if machine.price else None,
+        "currency": machine.currency,
+        "location": machine.location,
+        "description": machine.description,
+        "machine_url": machine.machine_url,
+        "website_source": machine.website_source,
+        "is_active": machine.is_active,
+    }
 
 
 @router.delete("/machines/{machine_id}", status_code=204)

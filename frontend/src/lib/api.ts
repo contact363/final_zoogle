@@ -127,6 +127,11 @@ export async function startAllCrawls() {
   return data;
 }
 
+export async function fixStuckCrawls() {
+  const { data } = await api.post("/api/admin/crawl/fix-stuck");
+  return data;
+}
+
 export async function getAdminMachines(params?: {
   skip?: number;
   limit?: number;
