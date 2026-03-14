@@ -183,9 +183,19 @@ async def start_all_crawls(
             select(Website).where(Website.is_active == True, Website.crawl_enabled == True)
         )
         sites = result.scalars().all()
-        for site in sites:
-            t = threading.Thread(target=run_crawl_direct, args=(site.id,), daemon=True)
-            t.start()
+        site_ids = [s.id for s in sites]
+
+        # Run sequentially in ONE background thread to avoid OOM on limited RAM
+        def run_all_sequential(ids):
+            for sid in ids:
+                try:
+                    run_crawl_direct(sid)
+                except Exception as e:
+                    import logging
+                    logging.error(f"Sequential crawl error site={sid}: {e}")
+
+        t = threading.Thread(target=run_all_sequential, args=(site_ids,), daemon=True)
+        t.start()
         return {"task_id": "direct-all", "status": "started", "mode": "direct", "count": len(sites)}
 
 
@@ -197,6 +207,55 @@ async def stop_crawl(
     from tasks.celery_app import celery_app
     celery_app.control.revoke(task_id, terminate=True)
     return {"task_id": task_id, "status": "stopped"}
+
+
+@router.get("/crawl/diagnose/{website_id}")
+async def diagnose_crawl(
+    website_id: int,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """
+    Run a quick 30-second test crawl and return the raw scrapy output.
+    Use this to debug why a website is returning 0 machines or errors.
+    """
+    import subprocess, sys, os
+    from tasks.crawl_tasks import _CRAWLER_DIR, _build_subprocess_env
+
+    result = await db.execute(select(Website).where(Website.id == website_id))
+    website = result.scalar_one_or_none()
+    if not website:
+        raise HTTPException(status_code=404, detail="Website not found")
+
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable, "-m", "scrapy", "crawl", "generic",
+                "-a", f"website_id={website_id}",
+                "-a", f"start_url={website.url}",
+                "-a", "crawl_log_id=0",
+                "--set", "CLOSESPIDER_ITEMCOUNT=5",
+                "--set", "DEPTH_LIMIT=2",
+                "--set", "LOG_LEVEL=DEBUG",
+            ],
+            cwd=_CRAWLER_DIR,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=_build_subprocess_env(),
+        )
+        combined = (proc.stdout or "") + (proc.stderr or "")
+        return {
+            "website_id": website_id,
+            "url": website.url,
+            "returncode": proc.returncode,
+            "output": combined[-5000:],  # last 5000 chars
+            "output_length": len(combined),
+        }
+    except subprocess.TimeoutExpired:
+        return {"website_id": website_id, "url": website.url, "returncode": -1, "output": "Timed out after 60s"}
+    except Exception as e:
+        return {"website_id": website_id, "url": website.url, "returncode": -1, "output": str(e)}
 
 
 @router.post("/crawl/fix-stuck")

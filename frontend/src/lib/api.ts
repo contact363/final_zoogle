@@ -163,6 +163,11 @@ export async function getCrawlLogs(params?: { skip?: number; limit?: number }) {
   return data;
 }
 
+export async function diagnoseCrawl(websiteId: number) {
+  const { data } = await api.get(`/api/admin/crawl/diagnose/${websiteId}`);
+  return data;
+}
+
 export function exportMachinesExcelUrl() {
   return `${API_BASE}/api/admin/machines/export/excel`;
 }
