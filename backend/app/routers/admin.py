@@ -12,6 +12,7 @@ import io
 import csv
 from typing import List, Optional
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -261,6 +262,48 @@ async def diagnose_crawl(
         return {"website_id": website_id, "url": website.url, "returncode": -1, "output": "Timed out after 60s"}
     except Exception as e:
         return {"website_id": website_id, "url": website.url, "returncode": -1, "output": str(e)}
+
+
+@router.post("/websites/recalculate-counts")
+async def recalculate_machine_counts(
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Recalculate machine_count for every website from actual DB rows."""
+    from sqlalchemy import text
+    await db.execute(text("""
+        UPDATE websites w
+        SET machine_count = (
+            SELECT COUNT(*) FROM machines m WHERE m.website_id = w.id
+        )
+    """))
+    return {"status": "ok", "message": "Machine counts recalculated"}
+
+
+@router.post("/websites/fix-names")
+async def fix_website_names(
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """
+    Auto-fix website names that were accidentally set to the full URL.
+    Extracts a clean domain name (e.g. https://reble-machinery.de/ → Reble Machinery).
+    """
+    import re as _re
+    result = await db.execute(select(Website))
+    websites = result.scalars().all()
+    fixed = 0
+    for w in websites:
+        # Fix if name looks like a URL
+        if w.name.startswith("http") or w.name.startswith("www."):
+            domain = urlparse(w.name if w.name.startswith("http") else f"https://{w.name}").netloc
+            domain = domain.lstrip("www.")
+            # "reble-machinery.de" → "Reble Machinery"
+            clean = domain.split(".")[0]
+            clean = _re.sub(r"[-_]", " ", clean).title()
+            w.name = clean or domain
+            fixed += 1
+    return {"fixed": fixed}
 
 
 @router.post("/crawl/fix-stuck")

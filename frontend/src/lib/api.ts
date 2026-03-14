@@ -117,6 +117,15 @@ export async function deleteWebsite(id: number): Promise<void> {
   await api.delete(`/api/admin/websites/${id}`);
 }
 
+export async function recalculateMachineCounts(): Promise<void> {
+  await api.post("/api/admin/websites/recalculate-counts");
+}
+
+export async function fixWebsiteNames(): Promise<{ fixed: number }> {
+  const { data } = await api.post("/api/admin/websites/fix-names");
+  return data;
+}
+
 export async function startCrawl(websiteId: number) {
   const { data } = await api.post(`/api/admin/crawl/start/${websiteId}`);
   return data;

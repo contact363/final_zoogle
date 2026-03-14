@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import {
   getAdminStats, listWebsites, addWebsite, updateWebsite, deleteWebsite,
+  recalculateMachineCounts, fixWebsiteNames,
   startCrawl, startAllCrawls, fixStuckCrawls, getCrawlLogs,
   getAdminMachines, updateMachine, deleteMachine,
   exportMachinesExcelUrl,
@@ -418,6 +419,32 @@ export default function AdminPage() {
                   <button onClick={loadData} className="btn-secondary flex items-center gap-2 text-sm">
                     <RefreshCw className="w-4 h-4" />
                   </button>
+                  <button
+                    onClick={async () => {
+                      try {
+                        const r = await fixWebsiteNames();
+                        toast.success(`Fixed ${r.fixed} website name(s)`);
+                        setWebsites(await listWebsites());
+                      } catch { toast.error("Failed to fix names"); }
+                    }}
+                    className="btn-secondary flex items-center gap-2 text-sm"
+                    title="Auto-fix names that were set to the URL"
+                  >
+                    <Wrench className="w-4 h-4" /> Fix Names
+                  </button>
+                  <button
+                    onClick={async () => {
+                      try {
+                        await recalculateMachineCounts();
+                        toast.success("Machine counts updated");
+                        setWebsites(await listWebsites());
+                      } catch { toast.error("Failed to recalculate"); }
+                    }}
+                    className="btn-secondary flex items-center gap-2 text-sm"
+                    title="Recalculate machine count from database"
+                  >
+                    <RefreshCw className="w-4 h-4" /> Fix Counts
+                  </button>
                   <button onClick={handleStartAll} className="btn-primary flex items-center gap-2 text-sm">
                     <Play className="w-4 h-4" /> Crawl All
                   </button>
@@ -439,7 +466,20 @@ export default function AdminPage() {
                     required
                     placeholder="URL (e.g. https://machinio.com)"
                     value={newSite.url}
-                    onChange={(e) => setNewSite({ ...newSite, url: e.target.value })}
+                    onChange={(e) => {
+                      const url = e.target.value;
+                      // Auto-fill name from URL if name is still empty
+                      let autoName = newSite.name;
+                      if (!newSite.name && url.includes(".")) {
+                        try {
+                          const domain = new URL(url.startsWith("http") ? url : `https://${url}`).hostname;
+                          autoName = domain.replace(/^www\./, "").split(".")[0]
+                            .replace(/[-_]/g, " ")
+                            .replace(/\b\w/g, c => c.toUpperCase());
+                        } catch {}
+                      }
+                      setNewSite({ ...newSite, url, name: autoName });
+                    }}
                     className="input flex-1 min-w-60"
                   />
                   <input
