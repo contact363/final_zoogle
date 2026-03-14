@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
-import { Search, Filter, SortAsc, X, Zap } from "lucide-react";
+import { Search, Filter, Zap } from "lucide-react";
 import { searchMachines } from "@/lib/api";
 import type { SearchResponse, SearchFilters } from "@/types";
 import MachineCard from "@/components/search/MachineCard";
@@ -10,7 +10,8 @@ import FilterPanel from "@/components/search/FilterPanel";
 import Pagination from "@/components/ui/Pagination";
 import SearchBar from "@/components/search/SearchBar";
 
-export default function SearchPage() {
+// Next.js 14: useSearchParams() must be inside a Suspense boundary
+function SearchPageInner() {
   const searchParams = useSearchParams();
   const router = useRouter();
 
@@ -175,5 +176,20 @@ export default function SearchPage() {
         </main>
       </div>
     </div>
+  );
+}
+
+// Wrap with Suspense — required by Next.js 14 when using useSearchParams()
+export default function SearchPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-steel-50 flex items-center justify-center text-steel-400">
+          Loading search...
+        </div>
+      }
+    >
+      <SearchPageInner />
+    </Suspense>
   );
 }

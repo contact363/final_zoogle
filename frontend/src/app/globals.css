@@ -37,7 +37,11 @@
   .input {
     @apply w-full border border-steel-200 rounded-lg px-4 py-2.5 text-sm
            focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent
-           bg-white placeholder-steel-400;
+           bg-white;
+  }
+
+  .input::placeholder {
+    color: #94a3b8; /* steel-400 — @apply can't use custom placeholder- variants */
   }
 
   .card {
