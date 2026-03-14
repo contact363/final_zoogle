@@ -386,7 +386,7 @@ export default function AdminPage() {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-steel-500 text-left border-b border-steel-100">
-                      <th className="pb-2">Website ID</th>
+                      <th className="pb-2">Website</th>
                       <th className="pb-2">Status</th>
                       <th className="pb-2">New Machines</th>
                       <th className="pb-2">Started</th>
@@ -395,7 +395,7 @@ export default function AdminPage() {
                   <tbody>
                     {stats.recent_crawls?.map((c: any) => (
                       <tr key={c.id} className="border-b border-steel-50">
-                        <td className="py-2">{c.website_id}</td>
+                        <td className="py-2 font-medium">{c.website_name}</td>
                         <td className="py-2"><span className={statusColor(c.status)}>{c.status}</span></td>
                         <td className="py-2">{c.machines_new}</td>
                         <td className="py-2 text-steel-400">{c.started_at ? new Date(c.started_at).toLocaleString() : "—"}</td>
@@ -634,7 +634,7 @@ export default function AdminPage() {
                   <thead className="bg-steel-50 border-b border-steel-200">
                     <tr className="text-steel-500 text-left">
                       <th className="px-4 py-3 w-8"></th>
-                      <th className="px-4 py-3">Website</th>
+                      <th className="px-4 py-3">Website Name</th>
                       <th className="px-4 py-3">Status</th>
                       <th className="px-4 py-3">Found</th>
                       <th className="px-4 py-3">New</th>
@@ -663,7 +663,12 @@ export default function AdminPage() {
                                 ? (isExpanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />)
                                 : null}
                             </td>
-                            <td className="px-4 py-3">{log.website_id}</td>
+                            <td className="px-4 py-3">
+                              <div className="font-medium text-steel-900">{log.website_name}</div>
+                              {log.website_url && (
+                                <div className="text-xs text-steel-400 truncate max-w-[180px]">{log.website_url}</div>
+                              )}
+                            </td>
                             <td className="px-4 py-3"><span className={statusColor(log.status)}>{log.status}</span></td>
                             <td className="px-4 py-3">{log.machines_found ?? 0}</td>
                             <td className="px-4 py-3 text-green-600 font-medium">{log.machines_new ?? 0}</td>

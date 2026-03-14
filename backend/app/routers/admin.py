@@ -47,9 +47,12 @@ async def dashboard_stats(
 
     recent_crawls = (
         await db.execute(
-            select(CrawlLog).order_by(desc(CrawlLog.started_at)).limit(5)
+            select(CrawlLog, Website.name)
+            .outerjoin(Website, CrawlLog.website_id == Website.id)
+            .order_by(desc(CrawlLog.started_at))
+            .limit(5)
         )
-    ).scalars().all()
+    ).all()
 
     return {
         "total_machines": total_machines,
@@ -60,12 +63,13 @@ async def dashboard_stats(
             {
                 "id": c.id,
                 "website_id": c.website_id,
+                "website_name": name or f"Website #{c.website_id}",
                 "status": c.status,
                 "machines_new": c.machines_new,
                 "started_at": c.started_at,
                 "finished_at": c.finished_at,
             }
-            for c in recent_crawls
+            for c, name in recent_crawls
         ],
     }
 
@@ -439,12 +443,20 @@ async def list_crawl_logs(
     db: AsyncSession = Depends(get_db),
     _=Depends(require_admin),
 ):
-    stmt = select(CrawlLog).order_by(CrawlLog.started_at.desc())
+    stmt = (
+        select(CrawlLog, Website.name, Website.url)
+        .outerjoin(Website, CrawlLog.website_id == Website.id)
+        .order_by(CrawlLog.started_at.desc())
+    )
     if website_id:
         stmt = stmt.where(CrawlLog.website_id == website_id)
 
-    total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
-    rows = (await db.execute(stmt.offset(skip).limit(limit))).scalars().all()
+    total = (await db.execute(
+        select(func.count()).select_from(CrawlLog)
+        .where(CrawlLog.website_id == website_id if website_id else True)
+    )).scalar()
+
+    rows = (await db.execute(stmt.offset(skip).limit(limit))).all()
 
     return {
         "total": total,
@@ -452,6 +464,8 @@ async def list_crawl_logs(
             {
                 "id": c.id,
                 "website_id": c.website_id,
+                "website_name": name or f"Website #{c.website_id}",
+                "website_url": url,
                 "task_id": c.task_id,
                 "status": c.status,
                 "machines_found": c.machines_found,
@@ -463,6 +477,6 @@ async def list_crawl_logs(
                 "started_at": c.started_at,
                 "finished_at": c.finished_at,
             }
-            for c in rows
+            for c, name, url in rows
         ],
     }
