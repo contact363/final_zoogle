@@ -8,6 +8,18 @@ export const api = axios.create({
   headers: { "Content-Type": "application/json" },
 });
 
+// Surface backend error messages
+api.interceptors.response.use(
+  (res) => res,
+  (err) => {
+    const detail = err?.response?.data?.detail;
+    if (detail) {
+      err.message = Array.isArray(detail) ? detail[0]?.msg || "Request failed." : detail;
+    }
+    return Promise.reject(err);
+  }
+);
+
 // Auto-attach auth token
 api.interceptors.request.use((config) => {
   if (typeof window !== "undefined") {

@@ -22,8 +22,12 @@ export default function LoginPage() {
       setAuth(data.user, data.access_token);
       toast.success("Welcome back!");
       router.push(data.user.is_admin ? "/admin" : "/");
-    } catch {
-      toast.error("Invalid email or password");
+    } catch (err: any) {
+      const msg =
+        err?.response?.data?.detail ||
+        err?.message ||
+        "Login failed. Check your connection.";
+      toast.error(Array.isArray(msg) ? msg[0]?.msg || "Login failed." : msg);
     } finally {
       setLoading(false);
     }

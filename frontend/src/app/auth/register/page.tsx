@@ -18,8 +18,12 @@ export default function RegisterPage() {
       await register(form.email, form.password, form.full_name);
       toast.success("Account created! Please sign in.");
       router.push("/auth/login");
-    } catch {
-      toast.error("Registration failed. Email may be taken.");
+    } catch (err: any) {
+      const msg =
+        err?.response?.data?.detail ||
+        err?.message ||
+        "Registration failed.";
+      toast.error(Array.isArray(msg) ? msg[0]?.msg || "Registration failed." : msg);
     } finally {
       setLoading(false);
     }
