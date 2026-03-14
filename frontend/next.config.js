@@ -10,19 +10,8 @@ const nextConfig = {
     ],
   },
 
-  async rewrites() {
-    // Evaluated at Next.js server STARTUP (runtime), not baked into client bundle.
-    // Hardcoded production URL as fallback so this works even if env var is missing.
-    const backendUrl =
-      process.env.NEXT_PUBLIC_API_URL ||
-      "https://final-zoogle-backend.onrender.com";
-    return [
-      {
-        source: "/api/:path*",
-        destination: `${backendUrl}/api/:path*`,
-      },
-    ];
-  },
+  // No rewrites needed — axios calls backend directly from browser.
+  // CORS is configured on the backend to allow the frontend origin.
 };
 
 module.exports = nextConfig;
