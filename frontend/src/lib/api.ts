@@ -1,7 +1,11 @@
 import axios from "axios";
 import type { SearchFilters, SearchResponse, Machine, Website, AuthToken } from "@/types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Use relative base URL so all requests go through Next.js server-side rewrites
+// (/api/* → backend).  This avoids baking the backend URL into the client bundle
+// at build time (NEXT_PUBLIC_API_URL is unreliable at Render build time).
+// The actual backend URL lives only in next.config.js rewrites (server-side).
+const API_BASE = "";
 
 export const api = axios.create({
   baseURL: API_BASE,
@@ -132,5 +136,5 @@ export async function getCrawlLogs(params?: { skip?: number; limit?: number }) {
 }
 
 export function exportMachinesExcelUrl() {
-  return `${API_BASE}/api/admin/machines/export/excel`;
+  return `/api/admin/machines/export/excel`;
 }
