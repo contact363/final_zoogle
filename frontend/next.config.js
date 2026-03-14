@@ -1,11 +1,15 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // Required for Render Web Service deployment
+  output: "standalone",
+
   images: {
     remotePatterns: [
       { protocol: "http", hostname: "**" },
       { protocol: "https", hostname: "**" },
     ],
   },
+
   async rewrites() {
     return [
       {

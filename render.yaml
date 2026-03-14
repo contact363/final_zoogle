@@ -1,0 +1,46 @@
+services:
+  # ── Backend (FastAPI) ────────────────────────────────────────────────────────
+  - type: web
+    name: final-zoogle-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        value: postgresql+asyncpg://final_zoogle_db_user:A8D7GMXiIYmc20g6ZqhfGOfHW9ofXRAz@dpg-d6qjt7haae7s739hqia0-a/final_zoogle_db
+      - key: DATABASE_SYNC_URL
+        value: postgresql://final_zoogle_db_user:A8D7GMXiIYmc20g6ZqhfGOfHW9ofXRAz@dpg-d6qjt7haae7s739hqia0-a/final_zoogle_db
+      - key: SECRET_KEY
+        generateValue: true
+      - key: REDIS_URL
+        value: redis://localhost:6379/0
+      - key: CELERY_BROKER_URL
+        value: redis://localhost:6379/0
+      - key: CELERY_RESULT_BACKEND
+        value: redis://localhost:6379/1
+      - key: MEDIA_DIR
+        value: media/machines
+      - key: BASE_URL
+        value: https://final-zoogle-backend.onrender.com
+      - key: ADMIN_EMAIL
+        value: admin@zoogle.com
+      - key: ADMIN_PASSWORD
+        generateValue: true
+      - key: DEBUG
+        value: "false"
+    healthCheckPath: /health
+
+  # ── Frontend (Next.js) ───────────────────────────────────────────────────────
+  - type: web
+    name: final-zoogle-frontend
+    runtime: node
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NEXT_PUBLIC_API_URL
+        value: https://final-zoogle-backend.onrender.com
+      - key: NODE_ENV
+        value: production
+    healthCheckPath: /
