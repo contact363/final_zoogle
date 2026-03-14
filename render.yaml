@@ -3,9 +3,11 @@ services:
   - type: web
     name: final-zoogle-backend
     runtime: python
-    buildCommand: pip install --prefer-binary -r backend/requirements.txt
+    buildCommand: pip install --only-binary=pydantic-core,numpy,pandas,Pillow,cryptography -r backend/requirements.txt
     startCommand: cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
       - key: DATABASE_URL
         value: postgresql+asyncpg://final_zoogle_db_user:A8D7GMXiIYmc20g6ZqhfGOfHW9ofXRAz@dpg-d6qjt7haae7s739hqia0-a/final_zoogle_db
       - key: DATABASE_SYNC_URL

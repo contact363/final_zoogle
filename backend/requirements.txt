@@ -1,4 +1,5 @@
 # ── Core API ──────────────────────────────────────────────────────────────────
+# All versions pinned to have pre-built cp311 wheels — no Rust/C source builds
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
@@ -6,9 +7,13 @@ python-multipart==0.0.9
 # ── Auth / Security ───────────────────────────────────────────────────────────
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+# cryptography pinned to a version with cp311 manylinux wheel
+cryptography==42.0.8
 
 # ── Pydantic / Settings ───────────────────────────────────────────────────────
+# pydantic-core is Rust-compiled; 2.18.x has cp311-manylinux wheels
 pydantic[email]==2.7.1
+pydantic-core==2.18.4
 pydantic-settings==2.2.1
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -26,7 +31,7 @@ scrapy==2.11.2
 itemadapter==0.9.0
 w3lib==2.2.1
 
-# ── Image handling — pre-built wheel available for Python 3.11 ────────────────
+# ── Image handling ────────────────────────────────────────────────────────────
 Pillow==10.4.0
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -38,9 +43,9 @@ rapidfuzz==3.9.3
 unidecode==1.3.8
 
 # ── Data / Export ─────────────────────────────────────────────────────────────
-# numpy must be listed before pandas — pip 26 requires it for pandas metadata generation
-numpy>=1.26.4,<2
-pandas>=2.2.3,<3
+# numpy before pandas — required for pandas metadata resolution
+numpy==1.26.4
+pandas==2.2.2
 openpyxl==3.1.2
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
