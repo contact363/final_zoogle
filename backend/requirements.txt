@@ -7,6 +7,9 @@ python-multipart==0.0.9
 # ── Auth / Security ───────────────────────────────────────────────────────────
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+# bcrypt 4.x broke passlib 1.7.4's verify() in certain code paths.
+# Pin to last fully-compatible version.
+bcrypt==4.0.1
 # cryptography pinned to a version with cp311 manylinux wheel
 cryptography==42.0.8
 

@@ -15,4 +15,4 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
-    saved_machines = relationship("SavedMachine", back_populates="user", lazy="dynamic")
+    saved_machines = relationship("SavedMachine", back_populates="user", lazy="noload")
