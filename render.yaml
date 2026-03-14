@@ -3,7 +3,7 @@ services:
   - type: web
     name: final-zoogle-backend
     runtime: python
-    buildCommand: pip install -r backend/requirements.txt
+    buildCommand: pip install --prefer-binary -r backend/requirements.txt
     startCommand: cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
