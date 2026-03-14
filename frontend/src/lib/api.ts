@@ -103,6 +103,16 @@ export async function addWebsite(payload: {
   return data;
 }
 
+export async function updateWebsite(id: number, payload: {
+  name?: string;
+  description?: string;
+  is_active?: boolean;
+  crawl_enabled?: boolean;
+}): Promise<Website> {
+  const { data } = await api.patch(`/api/admin/websites/${id}`, payload);
+  return data;
+}
+
 export async function deleteWebsite(id: number): Promise<void> {
   await api.delete(`/api/admin/websites/${id}`);
 }
@@ -123,6 +133,19 @@ export async function getAdminMachines(params?: {
   website_id?: number;
 }) {
   const { data } = await api.get("/api/admin/machines", { params });
+  return data;
+}
+
+export async function updateMachine(id: number, payload: {
+  machine_type?: string;
+  brand?: string;
+  model?: string;
+  price?: number | null;
+  location?: string;
+  description?: string;
+  is_active?: boolean;
+}): Promise<any> {
+  const { data } = await api.patch(`/api/admin/machines/${id}`, payload);
   return data;
 }
 

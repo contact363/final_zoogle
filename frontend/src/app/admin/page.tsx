@@ -1,14 +1,211 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { getAdminStats, listWebsites, addWebsite, startCrawl, startAllCrawls, getCrawlLogs, getAdminMachines, deleteMachine, deleteWebsite, exportMachinesExcelUrl } from "@/lib/api";
+import {
+  getAdminStats, listWebsites, addWebsite, updateWebsite, deleteWebsite,
+  startCrawl, startAllCrawls, getCrawlLogs,
+  getAdminMachines, updateMachine, deleteMachine,
+  exportMachinesExcelUrl,
+} from "@/lib/api";
 import { useAuthStore } from "@/lib/store";
 import { useRouter } from "next/navigation";
-import { Globe, Cpu, Users, Search, Play, RefreshCw, Trash2, Download, BarChart3, FileText } from "lucide-react";
+import {
+  Globe, Cpu, Users, Search, Play, Trash2, Download,
+  BarChart3, FileText, Pencil, X, Check, RefreshCw,
+} from "lucide-react";
 import toast from "react-hot-toast";
 
 type Tab = "dashboard" | "websites" | "machines" | "logs";
 
+// ── Edit modal for Website ────────────────────────────────────────────────────
+function EditWebsiteModal({
+  site,
+  onClose,
+  onSaved,
+}: {
+  site: any;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [form, setForm] = useState({
+    name: site.name ?? "",
+    description: site.description ?? "",
+    crawl_enabled: site.crawl_enabled ?? true,
+    is_active: site.is_active ?? true,
+  });
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await updateWebsite(site.id, form);
+      toast.success("Website updated");
+      onSaved();
+      onClose();
+    } catch {
+      toast.error("Failed to update website");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-md p-6 space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-semibold text-steel-900">Edit Website</h3>
+          <button onClick={onClose} className="text-steel-400 hover:text-steel-700"><X className="w-5 h-5" /></button>
+        </div>
+
+        <div className="space-y-3">
+          <div>
+            <label className="text-sm font-medium text-steel-700">Name</label>
+            <input
+              className="input w-full mt-1"
+              value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })}
+            />
+          </div>
+          <div>
+            <label className="text-sm font-medium text-steel-700">Description</label>
+            <textarea
+              className="input w-full mt-1 h-20 resize-none"
+              value={form.description}
+              onChange={(e) => setForm({ ...form, description: e.target.value })}
+            />
+          </div>
+          <div className="flex items-center gap-6">
+            <label className="flex items-center gap-2 text-sm text-steel-700 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.is_active}
+                onChange={(e) => setForm({ ...form, is_active: e.target.checked })}
+              />
+              Active
+            </label>
+            <label className="flex items-center gap-2 text-sm text-steel-700 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={form.crawl_enabled}
+                onChange={(e) => setForm({ ...form, crawl_enabled: e.target.checked })}
+              />
+              Crawl Enabled
+            </label>
+          </div>
+        </div>
+
+        <div className="flex justify-end gap-3 pt-2">
+          <button onClick={onClose} className="btn-secondary">Cancel</button>
+          <button onClick={handleSave} disabled={saving} className="btn-primary flex items-center gap-2">
+            <Check className="w-4 h-4" />{saving ? "Saving..." : "Save"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Edit modal for Machine ────────────────────────────────────────────────────
+function EditMachineModal({
+  machine,
+  onClose,
+  onSaved,
+}: {
+  machine: any;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [form, setForm] = useState({
+    machine_type: machine.machine_type ?? "",
+    brand: machine.brand ?? "",
+    model: machine.model ?? "",
+    price: machine.price != null ? String(machine.price) : "",
+    location: machine.location ?? "",
+    description: machine.description ?? "",
+    is_active: machine.is_active ?? true,
+  });
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      const payload: any = {
+        machine_type: form.machine_type || null,
+        brand: form.brand || null,
+        model: form.model || null,
+        price: form.price !== "" ? parseFloat(form.price) : null,
+        location: form.location || null,
+        description: form.description || null,
+        is_active: form.is_active,
+      };
+      await updateMachine(machine.id, payload);
+      toast.success("Machine updated");
+      onSaved();
+      onClose();
+    } catch {
+      toast.error("Failed to update machine");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const Field = ({ label, field, type = "text" }: { label: string; field: keyof typeof form; type?: string }) => (
+    <div>
+      <label className="text-sm font-medium text-steel-700">{label}</label>
+      <input
+        type={type}
+        className="input w-full mt-1"
+        value={String(form[field])}
+        onChange={(e) => setForm({ ...form, [field]: e.target.value })}
+      />
+    </div>
+  );
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-lg p-6 space-y-4 max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-semibold text-steel-900">Edit Machine</h3>
+          <button onClick={onClose} className="text-steel-400 hover:text-steel-700"><X className="w-5 h-5" /></button>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Brand" field="brand" />
+          <Field label="Model" field="model" />
+          <Field label="Machine Type" field="machine_type" />
+          <Field label="Price (USD)" field="price" type="number" />
+          <Field label="Location" field="location" />
+          <div className="flex items-center gap-2 pt-5">
+            <input
+              type="checkbox"
+              id="is_active"
+              checked={form.is_active}
+              onChange={(e) => setForm({ ...form, is_active: e.target.checked })}
+            />
+            <label htmlFor="is_active" className="text-sm text-steel-700 cursor-pointer">Active</label>
+          </div>
+        </div>
+        <div>
+          <label className="text-sm font-medium text-steel-700">Description</label>
+          <textarea
+            className="input w-full mt-1 h-24 resize-none"
+            value={form.description}
+            onChange={(e) => setForm({ ...form, description: e.target.value })}
+          />
+        </div>
+
+        <div className="flex justify-end gap-3 pt-2">
+          <button onClick={onClose} className="btn-secondary">Cancel</button>
+          <button onClick={handleSave} disabled={saving} className="btn-primary flex items-center gap-2">
+            <Check className="w-4 h-4" />{saving ? "Saving..." : "Save"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main Admin Page ────────────────────────────────────────────────────────────
 export default function AdminPage() {
   const { user } = useAuthStore();
   const router = useRouter();
@@ -19,6 +216,10 @@ export default function AdminPage() {
   const [logs, setLogs] = useState<any>({ total: 0, items: [] });
   const [loading, setLoading] = useState(false);
   const [newSite, setNewSite] = useState({ name: "", url: "", description: "" });
+
+  // Edit modal state
+  const [editWebsite, setEditWebsite] = useState<any | null>(null);
+  const [editMachine, setEditMachine] = useState<any | null>(null);
 
   useEffect(() => {
     if (!user?.is_admin) {
@@ -33,9 +234,9 @@ export default function AdminPage() {
     try {
       if (tab === "dashboard") setStats(await getAdminStats());
       if (tab === "websites") setWebsites(await listWebsites());
-      if (tab === "machines") setMachines(await getAdminMachines());
+      if (tab === "machines") setMachines(await getAdminMachines({ limit: 100 }));
       if (tab === "logs") setLogs(await getCrawlLogs());
-    } catch (e) {
+    } catch {
       toast.error("Failed to load data");
     } finally {
       setLoading(false);
@@ -57,15 +258,15 @@ export default function AdminPage() {
   const handleStartCrawl = async (id: number) => {
     try {
       const res = await startCrawl(id);
-      toast.success(`Crawl started (task: ${res.task_id?.slice(0, 8)}...)`);
+      toast.success(`Crawl started (${res.task_id?.slice(0, 8)}...)`);
       setWebsites(await listWebsites());
     } catch { toast.error("Failed to start crawl"); }
   };
 
   const handleStartAll = async () => {
     try {
-      const res = await startAllCrawls();
-      toast.success(`All crawls queued`);
+      await startAllCrawls();
+      toast.success("All crawls queued");
     } catch { toast.error("Failed"); }
   };
 
@@ -73,9 +274,9 @@ export default function AdminPage() {
     if (!confirm("Delete this machine?")) return;
     try {
       await deleteMachine(id);
-      toast.success("Deleted");
-      setMachines(await getAdminMachines());
-    } catch { toast.error("Failed"); }
+      toast.success("Machine deleted");
+      setMachines(await getAdminMachines({ limit: 100 }));
+    } catch { toast.error("Failed to delete"); }
   };
 
   const handleDeleteWebsite = async (id: number) => {
@@ -84,7 +285,7 @@ export default function AdminPage() {
       await deleteWebsite(id);
       toast.success("Website deleted");
       setWebsites(await listWebsites());
-    } catch { toast.error("Failed"); }
+    } catch { toast.error("Failed to delete"); }
   };
 
   const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
@@ -103,6 +304,22 @@ export default function AdminPage() {
 
   return (
     <div className="min-h-screen bg-steel-50">
+      {/* Edit Modals */}
+      {editWebsite && (
+        <EditWebsiteModal
+          site={editWebsite}
+          onClose={() => setEditWebsite(null)}
+          onSaved={() => listWebsites().then(setWebsites)}
+        />
+      )}
+      {editMachine && (
+        <EditMachineModal
+          machine={editMachine}
+          onClose={() => setEditMachine(null)}
+          onSaved={() => getAdminMachines({ limit: 100 }).then(setMachines)}
+        />
+      )}
+
       {/* Admin Header */}
       <header className="bg-steel-900 text-white px-6 py-4 flex items-center justify-between">
         <div>
@@ -124,9 +341,7 @@ export default function AdminPage() {
                 key={t.key}
                 onClick={() => setTab(t.key)}
                 className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
-                  tab === t.key
-                    ? "bg-brand-600 text-white"
-                    : "text-steel-700 hover:bg-steel-100"
+                  tab === t.key ? "bg-brand-600 text-white" : "text-steel-700 hover:bg-steel-100"
                 }`}
               >
                 {t.icon}
@@ -138,14 +353,17 @@ export default function AdminPage() {
 
         {/* Main content */}
         <main className="flex-1 min-w-0">
-          {loading && (
-            <div className="text-center py-12 text-steel-400">Loading...</div>
-          )}
+          {loading && <div className="text-center py-12 text-steel-400">Loading...</div>}
 
           {/* ── Dashboard ── */}
           {!loading && tab === "dashboard" && stats && (
             <div className="space-y-6">
-              <h2 className="text-xl font-bold text-steel-900">Dashboard</h2>
+              <div className="flex items-center justify-between">
+                <h2 className="text-xl font-bold text-steel-900">Dashboard</h2>
+                <button onClick={loadData} className="btn-secondary flex items-center gap-2 text-sm">
+                  <RefreshCw className="w-4 h-4" /> Refresh
+                </button>
+              </div>
 
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
                 {[
@@ -177,13 +395,9 @@ export default function AdminPage() {
                     {stats.recent_crawls?.map((c: any) => (
                       <tr key={c.id} className="border-b border-steel-50">
                         <td className="py-2">{c.website_id}</td>
-                        <td className="py-2">
-                          <span className={statusColor(c.status)}>{c.status}</span>
-                        </td>
+                        <td className="py-2"><span className={statusColor(c.status)}>{c.status}</span></td>
                         <td className="py-2">{c.machines_new}</td>
-                        <td className="py-2 text-steel-400">
-                          {c.started_at ? new Date(c.started_at).toLocaleString() : "—"}
-                        </td>
+                        <td className="py-2 text-steel-400">{c.started_at ? new Date(c.started_at).toLocaleString() : "—"}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -197,9 +411,14 @@ export default function AdminPage() {
             <div className="space-y-6">
               <div className="flex items-center justify-between">
                 <h2 className="text-xl font-bold text-steel-900">Websites ({websites.length})</h2>
-                <button onClick={handleStartAll} className="btn-primary flex items-center gap-2 text-sm">
-                  <Play className="w-4 h-4" /> Crawl All
-                </button>
+                <div className="flex gap-2">
+                  <button onClick={loadData} className="btn-secondary flex items-center gap-2 text-sm">
+                    <RefreshCw className="w-4 h-4" />
+                  </button>
+                  <button onClick={handleStartAll} className="btn-primary flex items-center gap-2 text-sm">
+                    <Play className="w-4 h-4" /> Crawl All
+                  </button>
+                </div>
               </div>
 
               {/* Add website form */}
@@ -220,6 +439,12 @@ export default function AdminPage() {
                     onChange={(e) => setNewSite({ ...newSite, url: e.target.value })}
                     className="input flex-1 min-w-60"
                   />
+                  <input
+                    placeholder="Description (optional)"
+                    value={newSite.description}
+                    onChange={(e) => setNewSite({ ...newSite, description: e.target.value })}
+                    className="input flex-1 min-w-40"
+                  />
                   <button type="submit" className="btn-primary">Add Website</button>
                 </form>
               </div>
@@ -233,6 +458,7 @@ export default function AdminPage() {
                       <th className="px-4 py-3">Status</th>
                       <th className="px-4 py-3">Machines</th>
                       <th className="px-4 py-3">Last Crawl</th>
+                      <th className="px-4 py-3">Crawl</th>
                       <th className="px-4 py-3">Actions</th>
                     </tr>
                   </thead>
@@ -245,21 +471,29 @@ export default function AdminPage() {
                         </td>
                         <td className="px-4 py-3">
                           <span className={statusColor(site.crawl_status)}>{site.crawl_status}</span>
+                          {!site.is_active && <span className="ml-1 text-xs text-red-400">(inactive)</span>}
                         </td>
                         <td className="px-4 py-3">{site.machine_count}</td>
                         <td className="px-4 py-3 text-steel-400">
-                          {site.last_crawled_at
-                            ? new Date(site.last_crawled_at).toLocaleDateString()
-                            : "Never"}
+                          {site.last_crawled_at ? new Date(site.last_crawled_at).toLocaleDateString() : "Never"}
                         </td>
                         <td className="px-4 py-3">
-                          <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => handleStartCrawl(site.id)}
+                            className="p-1.5 hover:bg-green-50 rounded text-green-600"
+                            title="Start crawl"
+                          >
+                            <Play className="w-4 h-4" />
+                          </button>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-1">
                             <button
-                              onClick={() => handleStartCrawl(site.id)}
-                              className="p-1.5 hover:bg-green-50 rounded text-green-600"
-                              title="Start crawl"
+                              onClick={() => setEditWebsite(site)}
+                              className="p-1.5 hover:bg-blue-50 rounded text-blue-500"
+                              title="Edit"
                             >
-                              <Play className="w-4 h-4" />
+                              <Pencil className="w-4 h-4" />
                             </button>
                             <button
                               onClick={() => handleDeleteWebsite(site.id)}
@@ -272,6 +506,11 @@ export default function AdminPage() {
                         </td>
                       </tr>
                     ))}
+                    {websites.length === 0 && (
+                      <tr>
+                        <td colSpan={6} className="px-4 py-8 text-center text-steel-400">No websites added yet.</td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -285,14 +524,19 @@ export default function AdminPage() {
                 <h2 className="text-xl font-bold text-steel-900">
                   Machines ({machines.total?.toLocaleString()})
                 </h2>
-                <a
-                  href={exportMachinesExcelUrl()}
-                  className="btn-secondary flex items-center gap-2 text-sm"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  <Download className="w-4 h-4" /> Export Excel
-                </a>
+                <div className="flex gap-2">
+                  <button onClick={loadData} className="btn-secondary flex items-center gap-2 text-sm">
+                    <RefreshCw className="w-4 h-4" />
+                  </button>
+                  <a
+                    href={exportMachinesExcelUrl()}
+                    className="btn-secondary flex items-center gap-2 text-sm"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <Download className="w-4 h-4" /> Export Excel
+                  </a>
+                </div>
               </div>
 
               <div className="card overflow-hidden">
@@ -309,11 +553,9 @@ export default function AdminPage() {
                   </thead>
                   <tbody>
                     {machines.items?.map((m: any) => (
-                      <tr key={m.id} className="border-b border-steel-50 hover:bg-steel-50">
+                      <tr key={m.id} className={`border-b border-steel-50 hover:bg-steel-50 ${!m.is_active ? "opacity-50" : ""}`}>
                         <td className="px-4 py-3">
-                          <div className="font-medium text-steel-900">
-                            {m.brand} {m.model}
-                          </div>
+                          <div className="font-medium text-steel-900">{m.brand} {m.model}</div>
                           <a
                             href={m.machine_url}
                             target="_blank"
@@ -330,15 +572,30 @@ export default function AdminPage() {
                         <td className="px-4 py-3 text-steel-500">{m.location || "—"}</td>
                         <td className="px-4 py-3 text-steel-400 text-xs">{m.website_source}</td>
                         <td className="px-4 py-3">
-                          <button
-                            onClick={() => handleDeleteMachine(m.id)}
-                            className="p-1.5 hover:bg-red-50 rounded text-red-500"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
+                          <div className="flex items-center gap-1">
+                            <button
+                              onClick={() => setEditMachine(m)}
+                              className="p-1.5 hover:bg-blue-50 rounded text-blue-500"
+                              title="Edit"
+                            >
+                              <Pencil className="w-4 h-4" />
+                            </button>
+                            <button
+                              onClick={() => handleDeleteMachine(m.id)}
+                              className="p-1.5 hover:bg-red-50 rounded text-red-500"
+                              title="Delete"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     ))}
+                    {machines.items?.length === 0 && (
+                      <tr>
+                        <td colSpan={6} className="px-4 py-8 text-center text-steel-400">No machines found.</td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -348,9 +605,12 @@ export default function AdminPage() {
           {/* ── Crawl Logs ── */}
           {!loading && tab === "logs" && (
             <div className="space-y-4">
-              <h2 className="text-xl font-bold text-steel-900">
-                Crawl Logs ({logs.total})
-              </h2>
+              <div className="flex items-center justify-between">
+                <h2 className="text-xl font-bold text-steel-900">Crawl Logs ({logs.total})</h2>
+                <button onClick={loadData} className="btn-secondary flex items-center gap-2 text-sm">
+                  <RefreshCw className="w-4 h-4" /> Refresh
+                </button>
+              </div>
               <div className="card overflow-hidden">
                 <table className="w-full text-sm">
                   <thead className="bg-steel-50 border-b border-steel-200">
@@ -369,27 +629,26 @@ export default function AdminPage() {
                       const duration =
                         log.finished_at && log.started_at
                           ? Math.round(
-                              (new Date(log.finished_at).getTime() -
-                                new Date(log.started_at).getTime()) /
-                                1000
+                              (new Date(log.finished_at).getTime() - new Date(log.started_at).getTime()) / 1000
                             ) + "s"
                           : "Running...";
                       return (
                         <tr key={log.id} className="border-b border-steel-50 hover:bg-steel-50">
                           <td className="px-4 py-3">{log.website_id}</td>
-                          <td className="px-4 py-3">
-                            <span className={statusColor(log.status)}>{log.status}</span>
-                          </td>
+                          <td className="px-4 py-3"><span className={statusColor(log.status)}>{log.status}</span></td>
                           <td className="px-4 py-3">{log.machines_found}</td>
                           <td className="px-4 py-3 text-green-600 font-medium">{log.machines_new}</td>
                           <td className="px-4 py-3 text-red-500">{log.errors_count}</td>
-                          <td className="px-4 py-3 text-steel-400">
-                            {new Date(log.started_at).toLocaleString()}
-                          </td>
+                          <td className="px-4 py-3 text-steel-400">{new Date(log.started_at).toLocaleString()}</td>
                           <td className="px-4 py-3 text-steel-400">{duration}</td>
                         </tr>
                       );
                     })}
+                    {logs.items?.length === 0 && (
+                      <tr>
+                        <td colSpan={7} className="px-4 py-8 text-center text-steel-400">No crawl logs yet.</td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>
