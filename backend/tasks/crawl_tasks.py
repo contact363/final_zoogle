@@ -62,7 +62,8 @@ def _preflight_check() -> tuple[bool, str]:
             env=_build_subprocess_env(),
         )
         combined = (result.stdout or "") + (result.stderr or "")
-        if result.returncode != 0 or "generic" not in result.stdout:
+        # Accept any output that lists at least one spider (generic or dedicated)
+        if result.returncode != 0 or not result.stdout.strip():
             return False, f"Spider pre-flight FAILED (returncode={result.returncode}):\n{combined}"
         return True, "Spider loaded OK"
     except Exception as e:
@@ -72,6 +73,20 @@ def _preflight_check() -> tuple[bool, str]:
 # ─────────────────────────────────────────────────────────────────────────────
 # Run scrapy subprocess
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _select_spider(start_url: str) -> str:
+    """
+    Pick the best Scrapy spider for a given start URL.
+    Dedicated spiders take priority over the generic one because they use
+    site-specific extraction logic (e.g. Playwright-aware CSR handling).
+    """
+    from urllib.parse import urlparse
+    domain = urlparse(start_url).netloc.lower().lstrip("www.")
+    _DEDICATED = {
+        "corelmachine.com": "corelmachine",
+    }
+    return _DEDICATED.get(domain, "generic")
+
 
 def _run_scrapy(
     website_id: int,
@@ -84,8 +99,9 @@ def _run_scrapy(
     Full stdout+stderr captured so we can store it and parse stats from it.
     Passes training_rules as a JSON string if the website has been trained.
     """
+    spider_name = _select_spider(start_url)
     cmd = [
-        sys.executable, "-m", "scrapy", "crawl", "generic",
+        sys.executable, "-m", "scrapy", "crawl", spider_name,
         "-a", f"website_id={website_id}",
         "-a", f"start_url={start_url}",
         "-a", f"crawl_log_id={crawl_log_id}",
