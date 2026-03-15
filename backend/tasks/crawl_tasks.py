@@ -199,21 +199,30 @@ def _execute_crawl(website_id: int, db: Session) -> None:
     # ── Parse results ─────────────────────────────────────────────────────────
     stats = _parse_scrapy_stats(combined)
     machines_found = stats.get("item_scraped_count", 0)
+    requests_made  = stats.get("downloader/request_count", 0)
 
     # Determine status
-    if result.returncode == 0 and machines_found > 0:
-        status = "success"
-    elif result.returncode == 0 and machines_found == 0:
-        # Ran fine but found nothing — treat as warning, not hard error
-        status = "success"
+    status = "success" if result.returncode == 0 else "error"
+
+    # Always extract ERROR/WARNING lines from the full output
+    inline_errors = _extract_error_summary(combined)
+
+    if status == "error":
+        error_summary = inline_errors or f"[returncode={result.returncode}]\n{combined[-1500:]}"
+    elif machines_found == 0:
+        # Show extracted errors if any, plus a stats summary for debugging
+        stats_snippet = (
+            f"requests={requests_made} "
+            f"items={machines_found} "
+            f"dropped={stats.get('item_dropped_count', 0)} "
+            f"errors={stats.get('spider_exceptions_count', 0)}"
+        )
+        if inline_errors:
+            error_summary = f"[0 machines — errors found]\n{stats_snippet}\n\n{inline_errors}"
+        else:
+            error_summary = f"[0 machines — no errors logged]\n{stats_snippet}\n\n{combined[-1200:]}"
     else:
-        status = "error"
-
-    error_summary = _extract_error_summary(combined) if status == "error" else None
-
-    # Store 0-machine output for debugging even on "success"
-    if machines_found == 0 and not error_summary:
-        error_summary = f"[Crawl ran OK but found 0 machines]\n{combined[-1500:]}"
+        error_summary = None
 
     # ── Update crawl log ──────────────────────────────────────────────────────
     crawl_log.status = status

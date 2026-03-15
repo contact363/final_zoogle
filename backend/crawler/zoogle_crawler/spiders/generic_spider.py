@@ -87,6 +87,10 @@ class GenericSpider(BaseZoogleSpider):
         "DOWNLOAD_TIMEOUT": 30,
         # Cap response size at 10 MB to prevent RAM spikes on huge HTML blobs
         "DOWNLOAD_MAXSIZE": 10 * 1024 * 1024,
+        # Pass ALL HTTP responses (including 404) to spider callbacks — so
+        # _parse_sitemap, _parse_listing_page etc. can handle them gracefully
+        # instead of having them silently dropped by HttpErrorMiddleware.
+        "HTTPERROR_ALLOWED_CODES": [404, 410],
         # Use our enhanced middlewares (override settings.py order if needed)
         "DOWNLOADER_MIDDLEWARES": {
             "scrapy.downloadermiddlewares.retry.RetryMiddleware": None,  # disable default
@@ -134,10 +138,28 @@ class GenericSpider(BaseZoogleSpider):
 
     # ── Phase 1: Entry point ──────────────────────────────────────────────────
 
-    def parse(self, response: Response):
-        """Homepage: kick off sitemap fetch + parse the page itself."""
-        for path in ("/sitemap.xml", "/sitemap_index.xml", "/sitemap/"):
-            url = urljoin(response.url, path)
+    def start_requests(self):
+        """
+        Seed the crawl queue with:
+          1. The homepage (→ parse callback)
+          2. Common sitemap paths — sent immediately so they're crawled
+             even if parse() is slow or the homepage is a JS SPA.
+          3. Common machine listing paths for sites without sitemaps.
+        Sending these here (not inside parse()) guarantees they enter the
+        Scrapy scheduler regardless of what the homepage response looks like.
+        """
+        start_url = self.start_urls[0] if self.start_urls else None
+        if not start_url:
+            return
+
+        # 1. Homepage
+        yield scrapy.Request(start_url, callback=self.parse, errback=self._errback)
+
+        # 2. Sitemaps — dont_filter=True so they bypass duplicate filter
+        base = start_url.rstrip("/")
+        for path in ("/sitemap.xml", "/sitemap_index.xml", "/sitemap/",
+                     "/sitemap-0.xml", "/page-sitemap.xml", "/product-sitemap.xml"):
+            url = base + path
             if not self._is_visited(url):
                 self._mark_visited(url)
                 yield scrapy.Request(
@@ -145,14 +167,41 @@ class GenericSpider(BaseZoogleSpider):
                     dont_filter=True, errback=self._errback,
                 )
 
+        # 3. Common machine listing paths (handles sites with no sitemap)
+        for path in (
+            "/machines", "/maschinen", "/inventory", "/used-machines",
+            "/gebrauchtmaschinen", "/search", "/catalog", "/listings",
+            "/products", "/equipment", "/stock", "/shop",
+            "/machines/", "/maschinen/", "/inventory/", "/catalog/",
+        ):
+            url = base + path
+            if not self._is_visited(url):
+                self._mark_visited(url)
+                yield scrapy.Request(
+                    url, callback=self._parse_listing_page,
+                    errback=self._errback,
+                    meta={"referer": start_url},
+                )
+
+    def parse(self, response: Response):
+        """Homepage: process the page and follow all links."""
         yield from self._process_page(response)
 
     # ── Phase 1a: Sitemap ─────────────────────────────────────────────────────
 
     def _parse_sitemap(self, response: Response):
-        """Parse sitemap.xml or a sitemap index."""
+        """Parse sitemap.xml or a sitemap index. Silently skips non-XML responses."""
         try:
+            # Skip if not an XML/text response (e.g. HTML 404 page returned for missing sitemap)
+            content_type = (response.headers.get("Content-Type", b"") or b"").decode("utf-8", errors="ignore").lower()
             body = response.text
+
+            # If this looks like an HTML page (e.g. 404 or redirect), treat as listing page
+            if response.status != 200 or ("<html" in body[:500].lower() and "<loc>" not in body):
+                if response.status == 200:
+                    logger.debug(f"Sitemap URL returned HTML, treating as listing page: {response.url}")
+                    yield from self._parse_listing_page(response)
+                return
 
             # Sitemap index → recurse into child sitemaps
             for url in re.findall(r"<sitemap>\s*<loc>(.*?)</loc>", body, re.DOTALL):
@@ -180,7 +229,6 @@ class GenericSpider(BaseZoogleSpider):
                     yield scrapy.Request(url, callback=self._parse_detail_page,
                                          errback=self._errback)
                 else:
-                    # Follow all sitemap URLs — even score-0 URLs may be listing pages
                     yield scrapy.Request(url, callback=self._parse_listing_page,
                                          errback=self._errback)
         except Exception as exc:
