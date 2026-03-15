@@ -276,6 +276,8 @@ class GenericSpider(BaseZoogleSpider):
 
         # 4. JSON API probe paths — for Next.js / headless-CMS sites that
         #    expose machine data via internal REST endpoints.
+        # dont_filter=True bypasses Scrapy's fingerprint-dedup filter so
+        # these are ALWAYS sent even if something else queued the same URL.
         for path in (
             "/api/subcategory/all", "/api/subcategories",
             "/api/categories", "/api/machine-types",
@@ -283,14 +285,13 @@ class GenericSpider(BaseZoogleSpider):
             "/api/stock", "/api/inventory",
         ):
             url = base + path
-            if not self._is_visited(url):
-                self._mark_visited(url)
-                yield scrapy.Request(
-                    url, callback=self._parse_json_api,
-                    errback=self._errback,
-                    meta={"referer": start_url, "json_api_probe": True},
-                    headers={"Accept": "application/json"},
-                )
+            yield scrapy.Request(
+                url, callback=self._parse_json_api,
+                errback=self._errback,
+                dont_filter=True,
+                meta={"referer": start_url, "json_api_probe": True},
+                headers={"Accept": "application/json"},
+            )
 
     def parse(self, response: Response):
         """
@@ -301,10 +302,13 @@ class GenericSpider(BaseZoogleSpider):
         is updated before any link-following begins.
         Also probes inline scripts / JS bundles for embedded API credentials
         (e.g. Supabase anon key) so we can call the backend API directly.
+        For Next.js / headless sites, directly re-probes the JSON API paths
+        from the homepage response as a backup to start_requests probing.
         """
         self._update_base_domain(response)
         yield from self._process_page(response)
         yield from self._try_extract_api_from_scripts(response)
+        yield from self._probe_json_apis_from_homepage(response)
 
     # ── Phase 1a: Sitemap ─────────────────────────────────────────────────────
 
@@ -1564,23 +1568,68 @@ class GenericSpider(BaseZoogleSpider):
 
     # ── JSON API detection (for Next.js / headless sites) ─────────────────────
 
+    def _probe_json_apis_from_homepage(self, response: Response):
+        """
+        Secondary JSON API probe — called from the homepage callback so it runs
+        regardless of what start_requests generated.  Uses dont_filter=True so
+        the requests always go through even if start_requests already probed
+        the same URLs (duplicate items are safely deduplicated by the pipeline).
+        Only fires on the root path (/) to avoid probing on every page.
+        """
+        parsed = urlparse(response.url)
+        if parsed.path.strip("/"):
+            return  # Not the homepage
+
+        ct = (response.headers.get("Content-Type", b"") or b"").decode("utf-8", errors="ignore").lower()
+        if "html" not in ct:
+            return  # Only probe when homepage is HTML (i.e. an SPA / SSR site)
+
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        logger.info(f"[json_api] homepage probe — base={base}")
+
+        for path in (
+            "/api/subcategory/all", "/api/subcategories",
+            "/api/categories", "/api/machine-types",
+            "/api/products", "/api/machines",
+            "/api/stock", "/api/inventory",
+        ):
+            url = f"{base}{path}"
+            yield scrapy.Request(
+                url, callback=self._parse_json_api,
+                errback=self._errback,
+                dont_filter=True,
+                meta={"referer": response.url, "json_api_probe": True},
+                headers={"Accept": "application/json"},
+            )
+
     def _parse_json_api(self, response: Response):
         """
         Handle responses from probed JSON API endpoints.
-        Silently ignores non-JSON / error responses so probing never crashes
-        the crawl.  Handles two shapes:
+        Handles two shapes:
           • List of subcategories  → schedule /api/product/{slug} per entry
           • List of machine objects → yield MachineItems directly
         """
-        # Only process if we got a real JSON response
+        # Log every call so we can diagnose deployment / routing issues
         ct = (response.headers.get("Content-Type", b"") or b"").decode("utf-8", errors="ignore").lower()
-        if response.status not in (200,) or not any(t in ct for t in ("json", "javascript")):
-            # If it's a 404/HTML page, silently skip (this is a probe)
+        logger.info(
+            f"[json_api] callback fired — url={response.url} "
+            f"status={response.status} ct={ct[:60]!r}"
+        )
+
+        # Accept JSON content-type OR fallback: body starts with [ or { (some
+        # Next.js routes return text/html content-type even for JSON payloads).
+        body_start = response.text[:1].strip() if response.text else ""
+        is_json_body = body_start in ("[", "{")
+        is_json_ct   = any(t in ct for t in ("json", "javascript"))
+
+        if response.status not in (200,) or (not is_json_ct and not is_json_body):
+            logger.debug(f"[json_api] skip — not JSON (status={response.status} ct={ct[:40]!r} body_start={body_start!r})")
             return
 
         try:
             data = json.loads(response.text)
-        except Exception:
+        except Exception as exc:
+            logger.debug(f"[json_api] JSON parse failed at {response.url}: {exc}")
             return
 
         if not data:
@@ -1659,8 +1708,11 @@ class GenericSpider(BaseZoogleSpider):
                     )
         else:
             # Machine list — yield items directly and also schedule detail pages
+            # subcategory_slug is set when this list was fetched via /api/product/{slug}
+            subcategory_slug = response.meta.get("subcategory_slug", "")
             for d in data:
-                item = self._json_to_machine_item(d, page_url, base_url)
+                item = self._json_to_machine_item(d, page_url, base_url,
+                                                  fallback_subcategory=subcategory_slug)
                 if item:
                     yield item
                     # Schedule the HTML detail page too for richer extraction
@@ -1674,13 +1726,16 @@ class GenericSpider(BaseZoogleSpider):
                             meta={"referer": page_url, "partial_item": dict(item)},
                         )
 
-    def _json_to_machine_item(self, d: dict, page_url: str, base_url: str) -> "MachineItem | None":
+    def _json_to_machine_item(self, d: dict, page_url: str, base_url: str,
+                               fallback_subcategory: str = "") -> "MachineItem | None":
         """
         Convert a raw JSON dict to a MachineItem.
         Handles corelmachine.com's product shape:
           {title, reference_no, capacity, product_status, url,
            sub_category: {url}, image, year}
         Also handles generic shapes with price/brand/model/location.
+        fallback_subcategory: the subcategory slug from the API call
+          (used when the product JSON doesn't embed sub_category).
         """
         if not isinstance(d, dict):
             return None
@@ -1689,7 +1744,7 @@ class GenericSpider(BaseZoogleSpider):
         # d.get("status") can be a boolean (True/False) from JSON — cast to str first
         status_raw = d.get("product_status") or d.get("status") or ""
         status = str(status_raw).lower() if status_raw is not None else ""
-        if status in ("sold", "unavailable", "inactive", "deleted", "false"):
+        if status in ("sold", "unavailable", "inactive", "deleted"):
             return None
 
         # ── Title ──────────────────────────────────────────────────────────────
@@ -1701,7 +1756,12 @@ class GenericSpider(BaseZoogleSpider):
         # corelmachine pattern: /usedmachinestocklist/{sub_category.url}/{machine.url}
         raw_url = d.get("url") or d.get("slug") or d.get("link") or ""
         sub_cat = d.get("sub_category") or {}
-        sub_cat_url = sub_cat.get("url") if isinstance(sub_cat, dict) else None
+        # Prefer the embedded sub_category, fall back to the API slug used to fetch this list
+        sub_cat_url = (
+            (sub_cat.get("url") if isinstance(sub_cat, dict) else None)
+            or fallback_subcategory
+            or None
+        )
 
         if raw_url and not raw_url.startswith("http"):
             if sub_cat_url:
