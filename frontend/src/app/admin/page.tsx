@@ -14,7 +14,7 @@ import {
   Globe, Cpu, Users, Search, Play, Trash2, Download,
   BarChart3, FileText, Pencil, X, Check, RefreshCw, Wrench,
   ChevronDown, ChevronRight, ChevronLeft, Star, ExternalLink,
-  Plus, Inbox, Briefcase, BookMarked, MessageSquare,
+  Plus,
   SlidersHorizontal, Shield, ArrowUpDown, Image as ImageIcon,
 } from "lucide-react";
 import toast from "react-hot-toast";
@@ -30,13 +30,6 @@ const NAV_ITEMS: { key: Section; label: string; desc: string; icon: React.ReactN
   { key: "logs",      label: "Crawl Logs",  desc: "View crawl history & errors",      icon: <FileText className="w-5 h-5" /> },
 ];
 
-// extra placeholder items (not functional yet)
-const EXTRA_NAV = [
-  { label: "Enquiries",     desc: "View all enquiries",          icon: <MessageSquare className="w-5 h-5" /> },
-  { label: "Wanted Leads",  desc: "Buyer requirements",          icon: <BookMarked className="w-5 h-5" /> },
-  { label: "Opportunities", desc: "Business opportunity listings", icon: <Briefcase className="w-5 h-5" /> },
-  { label: "Inbox",         desc: "Read & reply to emails",      icon: <Inbox className="w-5 h-5" /> },
-];
 
 // ── Edit Website Modal ─────────────────────────────────────────────────────────
 function EditWebsiteModal({ site, onClose, onSaved }: { site: any; onClose: () => void; onSaved: () => void }) {
@@ -254,6 +247,13 @@ export default function AdminPage() {
   const { user } = useAuthStore();
   const router = useRouter();
 
+  // Track whether the Zustand store has hydrated from localStorage.
+  // On first render (SSR / before hydration) `user` is null even when the
+  // token exists — without this guard the auth check fires immediately and
+  // redirects to login on every refresh.
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => { setHydrated(true); }, []);
+
   const [section, setSection] = useState<Section>("machines");
   const [collapsed, setCollapsed] = useState(false);
 
@@ -283,10 +283,11 @@ export default function AdminPage() {
 
   const searchDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ── Auth guard ──
+  // ── Auth guard — only runs after store has hydrated from localStorage ──
   useEffect(() => {
+    if (!hydrated) return;
     if (!user?.is_admin) router.push("/auth/login");
-  }, [user]);
+  }, [hydrated, user]);
 
   // ── Load machines with debounce ──
   const loadMachines = useCallback(async (page = machPage, perPage = machPerPage) => {
@@ -395,6 +396,15 @@ export default function AdminPage() {
   const uniqueTypes = Array.from(new Set(machines.items?.map((m: any) => m.machine_type).filter(Boolean))).slice(0, 30);
   const uniqueBrands = Array.from(new Set(machines.items?.map((m: any) => m.brand).filter(Boolean))).slice(0, 30);
 
+  // Don't render anything until hydrated — prevents flash of login redirect
+  if (!hydrated) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-100">
+        <RefreshCw className="w-6 h-6 animate-spin text-gray-400" />
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen flex bg-gray-100">
       {/* Modals */}
@@ -481,29 +491,6 @@ export default function AdminPage() {
             );
           })}
 
-          {/* Divider + extra placeholder items */}
-          {!collapsed && (
-            <div className="pt-3 pb-1 px-2">
-              <div className="border-t border-white/10" />
-            </div>
-          )}
-
-          {EXTRA_NAV.map((item) => (
-            <button
-              key={item.label}
-              title={collapsed ? item.label : undefined}
-              onClick={() => toast("Coming soon!")}
-              className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-white/40 hover:bg-white/10 hover:text-white/70 transition-colors border-l-2 border-transparent text-left"
-            >
-              <span className="shrink-0">{item.icon}</span>
-              {!collapsed && (
-                <div className="min-w-0">
-                  <div className="text-sm font-medium leading-tight">{item.label}</div>
-                  <div className="text-xs text-white/30 leading-tight truncate">{item.desc}</div>
-                </div>
-              )}
-            </button>
-          ))}
         </nav>
 
         {/* User footer */}
@@ -717,24 +704,27 @@ export default function AdminPage() {
                       {/* Type */}
                       <td className="px-3 py-2.5">
                         {m.machine_type ? (
-                          <span className="text-blue-600 font-medium text-xs hover:underline cursor-default">{m.machine_type}</span>
-                        ) : <span className="text-gray-300">—</span>}
+                          <span className="inline-block px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 font-medium text-xs">{m.machine_type}</span>
+                        ) : <span className="text-xs text-gray-300 italic">—</span>}
                       </td>
 
                       {/* Brand */}
-                      <td className="px-3 py-2.5 text-gray-700 font-medium">{m.brand || "—"}</td>
+                      <td className="px-3 py-2.5 text-gray-700 font-medium">{m.brand || <span className="text-gray-300 italic text-xs">—</span>}</td>
 
                       {/* Location */}
-                      <td className="px-3 py-2.5 text-gray-500 max-w-[120px] truncate" title={m.location ?? ""}>{m.location || "—"}</td>
+                      <td className="px-3 py-2.5 max-w-[120px] truncate" title={m.location ?? ""}>
+                        {m.location ? (
+                          <span className="text-gray-600 text-xs">{m.location}</span>
+                        ) : <span className="text-xs text-gray-300 italic">—</span>}
+                      </td>
 
                       {/* Price */}
-                      <td className="px-3 py-2.5 text-gray-800">
+                      <td className="px-3 py-2.5">
                         {m.price != null ? (
-                          <span className="font-medium">
-                            {m.currency === "EUR" ? "€" : m.currency === "GBP" ? "£" : "$"}{" "}
-                            {Number(m.price).toLocaleString()}
+                          <span className="font-semibold text-gray-800 whitespace-nowrap">
+                            {m.currency === "EUR" ? "€" : m.currency === "GBP" ? "£" : "$"}{Number(m.price).toLocaleString()}
                           </span>
-                        ) : <span className="text-gray-300">—</span>}
+                        ) : <span className="text-xs text-gray-300 italic">—</span>}
                       </td>
 
                       {/* Premium */}
