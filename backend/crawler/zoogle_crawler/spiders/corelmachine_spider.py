@@ -53,8 +53,8 @@ from zoogle_crawler.spiders.generic_spider import GenericSpider
 
 logger = logging.getLogger(__name__)
 
-SPIDER_VERSION = "2026-03-15-v1"
-BASE_URL       = "https://www.corelmachine.com"
+SPIDER_VERSION = "2026-03-15-v2"
+BASE_URL       = "https://corelmachine.com"   # no www — API 404s on www variant
 
 # Known 2-word brand prefixes (first word alone would misidentify the brand)
 _TWO_WORD_BRANDS = (
@@ -101,10 +101,24 @@ class CoreMachineSpider(GenericSpider):
         "DOWNLOADER_MIDDLEWARES": {
             "scrapy.downloadermiddlewares.retry.RetryMiddleware":  None,
             "zoogle_crawler.middlewares.RetryWithBackoffMiddleware": 350,
-            "zoogle_crawler.middlewares.SmartHeadersMiddleware":     400,
+            # SmartHeadersMiddleware is intentionally DISABLED for this spider.
+            # It overwrites Accept: application/json with text/html on every
+            # request, which causes the Next.js API routes to return empty body.
+            "zoogle_crawler.middlewares.SmartHeadersMiddleware":     None,
             "zoogle_crawler.middlewares.BotDetectionMiddleware":     410,
             "zoogle_crawler.middlewares.RateLimiterMiddleware":      420,
             "zoogle_crawler.middlewares.ProxyMiddleware":            430,
+        },
+        # Static browser-like headers for all requests (no per-request rotation
+        # needed — corelmachine.com does not enforce UA-based bot detection).
+        "DEFAULT_REQUEST_HEADERS": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
         },
     }
 
@@ -149,16 +163,19 @@ class CoreMachineSpider(GenericSpider):
         """
         logger.info(f"[CoreMachineSpider v={SPIDER_VERSION}] start_requests")
 
-        # 1. JSON subcategory API
-        api_url = f"{BASE_URL}/api/subcategory/all"
-        self._visit(api_url)
-        yield scrapy.Request(
-            api_url,
-            callback=self._parse_subcategory_api,
-            headers={"Accept": "application/json"},
-            errback=self._errback,
-            dont_filter=True,
-        )
+        # 1. JSON subcategory API — probe both non-www and www so whichever
+        #    the server resolves returns valid JSON (non-www is the working one).
+        for api_base in ("https://corelmachine.com", "https://www.corelmachine.com"):
+            api_url = f"{api_base}/api/subcategory/all"
+            self._visit(api_url)
+            yield scrapy.Request(
+                api_url,
+                callback=self._parse_subcategory_api,
+                # SmartHeadersMiddleware is disabled so this header survives.
+                headers={"Accept": "application/json, */*;q=0.5"},
+                errback=self._errback,
+                dont_filter=True,
+            )
 
         # 2. Subcategory index page (plain SSR — link scan backup)
         index_url = f"{BASE_URL}/usedmachinestocklist"
@@ -183,21 +200,34 @@ class CoreMachineSpider(GenericSpider):
             "category": {"_id": "...", "title": "Engineering & Metal Works"},
             "description": "", "is_deleted": false}, ...]
         """
-        ct         = self._content_type(response)
-        body_start = response.text[:1].strip() if response.text else ""
-        is_json    = body_start in ("[", "{") or "json" in ct
+        ct   = self._content_type(response)
+        body = (response.body or b"").strip()
 
-        if response.status != 200 or not is_json:
-            logger.warning(
-                f"Subcategory API not JSON — "
-                f"status={response.status} ct={ct[:40]!r}"
+        logger.info(
+            f"[subcategory-api] status={response.status} "
+            f"ct={ct[:50]!r} body_len={len(body)} "
+            f"body_preview={body[:80]!r}"
+        )
+
+        if response.status != 200:
+            logger.warning(f"Subcategory API HTTP {response.status} at {response.url}")
+            return
+
+        if not body:
+            logger.error(
+                f"Subcategory API returned empty body at {response.url}. "
+                "This usually means the www-redirect stripped the response or "
+                "the Accept header was wrong. Check DEFAULT_REQUEST_HEADERS."
             )
             return
 
         try:
-            data = json.loads(response.text)
+            data = json.loads(body.decode("utf-8", errors="replace"))
         except Exception as exc:
-            logger.error(f"Subcategory API JSON parse error: {exc}")
+            logger.error(
+                f"Subcategory API JSON parse error at {response.url}: {exc} "
+                f"— body preview: {body[:120]!r}"
+            )
             return
 
         if not isinstance(data, list):
