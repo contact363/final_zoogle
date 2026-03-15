@@ -150,8 +150,28 @@ export async function getAdminMachines(params?: {
   skip?: number;
   limit?: number;
   website_id?: number;
+  machine_type?: string;
+  brand?: string;
+  q?: string;
+  is_active?: boolean;
 }) {
   const { data } = await api.get("/api/admin/machines", { params });
+  return data;
+}
+
+export async function createMachine(payload: {
+  website_id: number;
+  machine_type?: string;
+  brand?: string;
+  model?: string;
+  price?: number | null;
+  currency?: string;
+  location?: string;
+  description?: string;
+  machine_url?: string;
+  is_active?: boolean;
+}): Promise<any> {
+  const { data } = await api.post("/api/admin/machines", payload);
   return data;
 }
 

@@ -1,33 +1,45 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import {
   getAdminStats, listWebsites, addWebsite, updateWebsite, deleteWebsite,
   recalculateMachineCounts, fixWebsiteNames,
   startCrawl, startAllCrawls, fixStuckCrawls, getCrawlLogs,
-  getAdminMachines, updateMachine, deleteMachine,
+  getAdminMachines, updateMachine, deleteMachine, createMachine,
   exportMachinesExcelUrl, fillMachineTypes,
 } from "@/lib/api";
 import { useAuthStore } from "@/lib/store";
 import { useRouter } from "next/navigation";
 import {
   Globe, Cpu, Users, Search, Play, Trash2, Download,
-  BarChart3, FileText, Pencil, X, Check, RefreshCw, Wrench, ChevronDown, ChevronRight,
+  BarChart3, FileText, Pencil, X, Check, RefreshCw, Wrench,
+  ChevronDown, ChevronRight, ChevronLeft, Star, ExternalLink,
+  Plus, Inbox, Briefcase, BookMarked, MessageSquare,
+  SlidersHorizontal, Shield, ArrowUpDown, Image as ImageIcon,
 } from "lucide-react";
 import toast from "react-hot-toast";
 
-type Tab = "dashboard" | "websites" | "machines" | "logs";
+type Section = "machines" | "dashboard" | "websites" | "logs";
+type SortDir = "asc" | "desc";
 
-// ── Edit modal for Website ────────────────────────────────────────────────────
-function EditWebsiteModal({
-  site,
-  onClose,
-  onSaved,
-}: {
-  site: any;
-  onClose: () => void;
-  onSaved: () => void;
-}) {
+// ── Sidebar nav config ─────────────────────────────────────────────────────────
+const NAV_ITEMS: { key: Section; label: string; desc: string; icon: React.ReactNode }[] = [
+  { key: "machines",  label: "Machines",    desc: "Approve, edit, manage listings",  icon: <Cpu className="w-5 h-5" /> },
+  { key: "dashboard", label: "Dashboard",   desc: "Platform overview & stats",        icon: <BarChart3 className="w-5 h-5" /> },
+  { key: "websites",  label: "Web Sources", desc: "Manage crawl sources",             icon: <Globe className="w-5 h-5" /> },
+  { key: "logs",      label: "Crawl Logs",  desc: "View crawl history & errors",      icon: <FileText className="w-5 h-5" /> },
+];
+
+// extra placeholder items (not functional yet)
+const EXTRA_NAV = [
+  { label: "Enquiries",     desc: "View all enquiries",          icon: <MessageSquare className="w-5 h-5" /> },
+  { label: "Wanted Leads",  desc: "Buyer requirements",          icon: <BookMarked className="w-5 h-5" /> },
+  { label: "Opportunities", desc: "Business opportunity listings", icon: <Briefcase className="w-5 h-5" /> },
+  { label: "Inbox",         desc: "Read & reply to emails",      icon: <Inbox className="w-5 h-5" /> },
+];
+
+// ── Edit Website Modal ─────────────────────────────────────────────────────────
+function EditWebsiteModal({ site, onClose, onSaved }: { site: any; onClose: () => void; onSaved: () => void }) {
   const [form, setForm] = useState({
     name: site.name ?? "",
     description: site.description ?? "",
@@ -43,58 +55,35 @@ function EditWebsiteModal({
       toast.success("Website updated");
       onSaved();
       onClose();
-    } catch {
-      toast.error("Failed to update website");
-    } finally {
-      setSaving(false);
-    }
+    } catch { toast.error("Failed to update website"); }
+    finally { setSaving(false); }
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="bg-white rounded-xl shadow-xl w-full max-w-md p-6 space-y-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-md p-6 space-y-4">
         <div className="flex items-center justify-between">
-          <h3 className="text-lg font-semibold text-steel-900">Edit Website</h3>
-          <button onClick={onClose} className="text-steel-400 hover:text-steel-700"><X className="w-5 h-5" /></button>
+          <h3 className="text-lg font-semibold">Edit Website</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-700"><X className="w-5 h-5" /></button>
         </div>
-
         <div className="space-y-3">
           <div>
-            <label className="text-sm font-medium text-steel-700">Name</label>
-            <input
-              className="input w-full mt-1"
-              value={form.name}
-              onChange={(e) => setForm({ ...form, name: e.target.value })}
-            />
+            <label className="text-sm font-medium text-gray-700">Name</label>
+            <input className="input w-full mt-1" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
           </div>
           <div>
-            <label className="text-sm font-medium text-steel-700">Description</label>
-            <textarea
-              className="input w-full mt-1 h-20 resize-none"
-              value={form.description}
-              onChange={(e) => setForm({ ...form, description: e.target.value })}
-            />
+            <label className="text-sm font-medium text-gray-700">Description</label>
+            <textarea className="input w-full mt-1 h-20 resize-none" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
           </div>
-          <div className="flex items-center gap-6">
-            <label className="flex items-center gap-2 text-sm text-steel-700 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={form.is_active}
-                onChange={(e) => setForm({ ...form, is_active: e.target.checked })}
-              />
-              Active
+          <div className="flex gap-6">
+            <label className="flex items-center gap-2 text-sm cursor-pointer">
+              <input type="checkbox" checked={form.is_active} onChange={(e) => setForm({ ...form, is_active: e.target.checked })} /> Active
             </label>
-            <label className="flex items-center gap-2 text-sm text-steel-700 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={form.crawl_enabled}
-                onChange={(e) => setForm({ ...form, crawl_enabled: e.target.checked })}
-              />
-              Crawl Enabled
+            <label className="flex items-center gap-2 text-sm cursor-pointer">
+              <input type="checkbox" checked={form.crawl_enabled} onChange={(e) => setForm({ ...form, crawl_enabled: e.target.checked })} /> Crawl Enabled
             </label>
           </div>
         </div>
-
         <div className="flex justify-end gap-3 pt-2">
           <button onClick={onClose} className="btn-secondary">Cancel</button>
           <button onClick={handleSave} disabled={saving} className="btn-primary flex items-center gap-2">
@@ -106,53 +95,53 @@ function EditWebsiteModal({
   );
 }
 
-// ── Edit modal for Machine ────────────────────────────────────────────────────
-function EditMachineModal({
-  machine,
-  onClose,
-  onSaved,
-}: {
-  machine: any;
-  onClose: () => void;
-  onSaved: () => void;
-}) {
+// ── Machine Modal (create + edit) ──────────────────────────────────────────────
+function MachineModal({
+  machine, websites, onClose, onSaved,
+}: { machine: any | null; websites: any[]; onClose: () => void; onSaved: () => void }) {
+  const isNew = !machine;
   const [form, setForm] = useState({
-    machine_type: machine.machine_type ?? "",
-    brand: machine.brand ?? "",
-    model: machine.model ?? "",
-    price: machine.price != null ? String(machine.price) : "",
-    location: machine.location ?? "",
-    description: machine.description ?? "",
-    is_active: machine.is_active ?? true,
+    website_id: machine?.website_id ?? (websites[0]?.id ?? ""),
+    machine_type: machine?.machine_type ?? "",
+    brand: machine?.brand ?? "",
+    model: machine?.model ?? "",
+    price: machine?.price != null ? String(machine.price) : "",
+    currency: machine?.currency ?? "USD",
+    location: machine?.location ?? "",
+    machine_url: machine?.machine_url ?? "",
+    description: machine?.description ?? "",
+    is_active: machine?.is_active ?? true,
   });
   const [saving, setSaving] = useState(false);
 
   const handleSave = async () => {
     setSaving(true);
     try {
-      const payload: any = {
-        machine_type: form.machine_type || null,
-        brand: form.brand || null,
-        model: form.model || null,
-        price: form.price !== "" ? parseFloat(form.price) : null,
-        location: form.location || null,
-        description: form.description || null,
-        is_active: form.is_active,
-      };
-      await updateMachine(machine.id, payload);
-      toast.success("Machine updated");
+      const priceVal = form.price !== "" ? parseFloat(form.price) : null;
+      if (isNew) {
+        await createMachine({ ...form, website_id: Number(form.website_id), price: priceVal });
+        toast.success("Machine created");
+      } else {
+        await updateMachine(machine.id, {
+          machine_type: form.machine_type || null,
+          brand: form.brand || null,
+          model: form.model || null,
+          price: priceVal,
+          location: form.location || null,
+          description: form.description || null,
+          is_active: form.is_active,
+        });
+        toast.success("Machine updated");
+      }
       onSaved();
       onClose();
-    } catch {
-      toast.error("Failed to update machine");
-    } finally {
-      setSaving(false);
-    }
+    } catch { toast.error(isNew ? "Failed to create machine" : "Failed to update machine"); }
+    finally { setSaving(false); }
   };
 
   const Field = ({ label, field, type = "text" }: { label: string; field: keyof typeof form; type?: string }) => (
     <div>
-      <label className="text-sm font-medium text-steel-700">{label}</label>
+      <label className="text-sm font-medium text-gray-700">{label}</label>
       <input
         type={type}
         className="input w-full mt-1"
@@ -163,42 +152,55 @@ function EditMachineModal({
   );
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="bg-white rounded-xl shadow-xl w-full max-w-lg p-6 space-y-4 max-h-[90vh] overflow-y-auto">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg p-6 space-y-4 max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between">
-          <h3 className="text-lg font-semibold text-steel-900">Edit Machine</h3>
-          <button onClick={onClose} className="text-steel-400 hover:text-steel-700"><X className="w-5 h-5" /></button>
+          <h3 className="text-lg font-semibold">{isNew ? "Add Machine" : "Edit Machine"}</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-700"><X className="w-5 h-5" /></button>
         </div>
+
+        {isNew && websites.length > 0 && (
+          <div>
+            <label className="text-sm font-medium text-gray-700">Source Website</label>
+            <select
+              className="input w-full mt-1"
+              value={form.website_id}
+              onChange={(e) => setForm({ ...form, website_id: e.target.value })}
+            >
+              {websites.map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}
+            </select>
+          </div>
+        )}
 
         <div className="grid grid-cols-2 gap-3">
           <Field label="Brand" field="brand" />
           <Field label="Model" field="model" />
           <Field label="Machine Type" field="machine_type" />
-          <Field label="Price (USD)" field="price" type="number" />
+          <Field label="Price" field="price" type="number" />
+          <Field label="Currency" field="currency" />
           <Field label="Location" field="location" />
-          <div className="flex items-center gap-2 pt-5">
+          <div className="col-span-2">
+            <Field label="Listing URL" field="machine_url" />
+          </div>
+          <div className="flex items-center gap-2 pt-4">
             <input
               type="checkbox"
-              id="is_active"
+              id="is_active_m"
               checked={form.is_active}
               onChange={(e) => setForm({ ...form, is_active: e.target.checked })}
             />
-            <label htmlFor="is_active" className="text-sm text-steel-700 cursor-pointer">Active</label>
+            <label htmlFor="is_active_m" className="text-sm cursor-pointer">Active</label>
           </div>
         </div>
         <div>
-          <label className="text-sm font-medium text-steel-700">Description</label>
-          <textarea
-            className="input w-full mt-1 h-24 resize-none"
-            value={form.description}
-            onChange={(e) => setForm({ ...form, description: e.target.value })}
-          />
+          <label className="text-sm font-medium text-gray-700">Description</label>
+          <textarea className="input w-full mt-1 h-20 resize-none" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
         </div>
 
         <div className="flex justify-end gap-3 pt-2">
           <button onClick={onClose} className="btn-secondary">Cancel</button>
           <button onClick={handleSave} disabled={saving} className="btn-primary flex items-center gap-2">
-            <Check className="w-4 h-4" />{saving ? "Saving..." : "Save"}
+            <Check className="w-4 h-4" />{saving ? "Saving..." : (isNew ? "Create" : "Save")}
           </button>
         </div>
       </div>
@@ -206,70 +208,156 @@ function EditMachineModal({
   );
 }
 
+// ── Status badge ───────────────────────────────────────────────────────────────
+function StatusDot({ active }: { active: boolean }) {
+  return (
+    <span className={`inline-flex items-center gap-1.5 text-xs font-medium ${active ? "text-green-700" : "text-red-500"}`}>
+      <span className={`w-2 h-2 rounded-full ${active ? "bg-green-500" : "bg-red-400"}`} />
+      {active ? "Active" : "Inactive"}
+    </span>
+  );
+}
+
+function CrawlStatusBadge({ status }: { status: string }) {
+  const map: Record<string, string> = {
+    success: "bg-green-100 text-green-800",
+    error:   "bg-red-100 text-red-800",
+    running: "bg-blue-100 text-blue-800",
+  };
+  return (
+    <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${map[status] ?? "bg-gray-100 text-gray-700"}`}>
+      {status}
+    </span>
+  );
+}
+
+// ── Sort header ────────────────────────────────────────────────────────────────
+function SortTh({
+  label, field, sortField, sortDir, onSort,
+}: { label: string; field: string; sortField: string | null; sortDir: SortDir; onSort: (f: string) => void }) {
+  const active = sortField === field;
+  return (
+    <th
+      className="px-3 py-3 text-left text-xs font-semibold text-gray-600 cursor-pointer select-none whitespace-nowrap hover:text-gray-900"
+      onClick={() => onSort(field)}
+    >
+      <span className="inline-flex items-center gap-1">
+        {label}
+        <ArrowUpDown className={`w-3 h-3 ${active ? "text-blue-600" : "text-gray-400"}`} />
+      </span>
+    </th>
+  );
+}
+
 // ── Main Admin Page ────────────────────────────────────────────────────────────
 export default function AdminPage() {
   const { user } = useAuthStore();
   const router = useRouter();
-  const [tab, setTab] = useState<Tab>("dashboard");
+
+  const [section, setSection] = useState<Section>("machines");
+  const [collapsed, setCollapsed] = useState(false);
+
+  // ── machines state ──
+  const [machines, setMachines] = useState<any>({ total: 0, items: [] });
+  const [machLoading, setMachLoading] = useState(false);
+  const [machPage, setMachPage] = useState(1);
+  const [machPerPage, setMachPerPage] = useState(50);
+  const [machSearch, setMachSearch] = useState("");
+  const [machStatus, setMachStatus] = useState<"all" | "active" | "inactive">("all");
+  const [machType, setMachType] = useState("");
+  const [machBrand, setMachBrand] = useState("");
+  const [machSortField, setMachSortField] = useState<string | null>(null);
+  const [machSortDir, setMachSortDir] = useState<SortDir>("asc");
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [editMachine, setEditMachine] = useState<any | null>(null);
+  const [addMachineOpen, setAddMachineOpen] = useState(false);
+
+  // ── other sections state ──
   const [stats, setStats] = useState<any>(null);
   const [websites, setWebsites] = useState<any[]>([]);
-  const [machines, setMachines] = useState<any>({ total: 0, items: [] });
   const [logs, setLogs] = useState<any>({ total: 0, items: [] });
   const [loading, setLoading] = useState(false);
   const [newSite, setNewSite] = useState({ name: "", url: "", description: "" });
-
-  // Edit modal state
   const [editWebsite, setEditWebsite] = useState<any | null>(null);
-  const [editMachine, setEditMachine] = useState<any | null>(null);
   const [expandedLog, setExpandedLog] = useState<number | null>(null);
 
-  useEffect(() => {
-    if (!user?.is_admin) {
-      router.push("/auth/login");
-      return;
-    }
-    loadData();
-  }, [tab]);
+  const searchDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const loadData = async () => {
+  // ── Auth guard ──
+  useEffect(() => {
+    if (!user?.is_admin) router.push("/auth/login");
+  }, [user]);
+
+  // ── Load machines with debounce ──
+  const loadMachines = useCallback(async (page = machPage, perPage = machPerPage) => {
+    setMachLoading(true);
+    try {
+      const params: any = {
+        skip: (page - 1) * perPage,
+        limit: perPage,
+      };
+      if (machSearch.trim()) params.q = machSearch.trim();
+      if (machType.trim()) params.machine_type = machType.trim();
+      if (machBrand.trim()) params.brand = machBrand.trim();
+      if (machStatus === "active") params.is_active = true;
+      if (machStatus === "inactive") params.is_active = false;
+      const res = await getAdminMachines(params);
+      setMachines(res);
+    } catch { toast.error("Failed to load machines"); }
+    finally { setMachLoading(false); }
+  }, [machPage, machPerPage, machSearch, machType, machBrand, machStatus]);
+
+  // ── Load other sections ──
+  const loadSection = useCallback(async () => {
+    if (section === "machines") { loadMachines(machPage, machPerPage); return; }
     setLoading(true);
     try {
-      if (tab === "dashboard") setStats(await getAdminStats());
-      if (tab === "websites") setWebsites(await listWebsites());
-      if (tab === "machines") setMachines(await getAdminMachines({ limit: 100 }));
-      if (tab === "logs") setLogs(await getCrawlLogs());
-    } catch {
-      toast.error("Failed to load data");
-    } finally {
-      setLoading(false);
-    }
+      if (section === "dashboard") setStats(await getAdminStats());
+      if (section === "websites") setWebsites(await listWebsites());
+      if (section === "logs") setLogs(await getCrawlLogs());
+    } catch { toast.error("Failed to load data"); }
+    finally { setLoading(false); }
+  }, [section, machPage, machPerPage]);
+
+  useEffect(() => {
+    if (section !== "machines") loadSection();
+    else loadMachines(1, machPerPage);
+    setMachPage(1);
+  }, [section]);
+
+  // Reload machines when filters/page change
+  useEffect(() => {
+    if (section !== "machines") return;
+    if (searchDebounce.current) clearTimeout(searchDebounce.current);
+    searchDebounce.current = setTimeout(() => loadMachines(machPage, machPerPage), 300);
+    return () => { if (searchDebounce.current) clearTimeout(searchDebounce.current); };
+  }, [machSearch, machType, machBrand, machStatus, machPage, machPerPage]);
+
+  const totalPages = Math.max(1, Math.ceil(machines.total / machPerPage));
+
+  const handleSort = (field: string) => {
+    if (machSortField === field) setMachSortDir(d => d === "asc" ? "desc" : "asc");
+    else { setMachSortField(field); setMachSortDir("asc"); }
   };
 
-  const handleAddWebsite = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      await addWebsite(newSite);
-      toast.success("Website added!");
-      setNewSite({ name: "", url: "", description: "" });
-      setWebsites(await listWebsites());
-    } catch {
-      toast.error("Failed to add website");
-    }
-  };
+  const sortedItems = [...(machines.items ?? [])].sort((a, b) => {
+    if (!machSortField) return 0;
+    const av = a[machSortField] ?? "";
+    const bv = b[machSortField] ?? "";
+    const cmp = String(av).localeCompare(String(bv), undefined, { numeric: true });
+    return machSortDir === "asc" ? cmp : -cmp;
+  });
 
-  const handleStartCrawl = async (id: number) => {
-    try {
-      const res = await startCrawl(id);
-      toast.success(`Crawl started (${res.task_id?.slice(0, 8)}...)`);
-      setWebsites(await listWebsites());
-    } catch { toast.error("Failed to start crawl"); }
+  const toggleSelect = (id: number) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
   };
-
-  const handleStartAll = async () => {
-    try {
-      await startAllCrawls();
-      toast.success("All crawls queued");
-    } catch { toast.error("Failed"); }
+  const toggleAll = () => {
+    if (selectedIds.size === sortedItems.length) setSelectedIds(new Set());
+    else setSelectedIds(new Set(sortedItems.map((m: any) => m.id)));
   };
 
   const handleDeleteMachine = async (id: number) => {
@@ -277,7 +365,7 @@ export default function AdminPage() {
     try {
       await deleteMachine(id);
       toast.success("Machine deleted");
-      setMachines(await getAdminMachines({ limit: 100 }));
+      loadMachines(machPage, machPerPage);
     } catch { toast.error("Failed to delete"); }
   };
 
@@ -290,23 +378,26 @@ export default function AdminPage() {
     } catch { toast.error("Failed to delete"); }
   };
 
-  const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
-    { key: "dashboard", label: "Dashboard", icon: <BarChart3 className="w-4 h-4" /> },
-    { key: "websites", label: "Websites", icon: <Globe className="w-4 h-4" /> },
-    { key: "machines", label: "Machines", icon: <Cpu className="w-4 h-4" /> },
-    { key: "logs", label: "Crawl Logs", icon: <FileText className="w-4 h-4" /> },
-  ];
-
-  const statusColor = (s: string) => {
-    if (s === "success") return "badge-green";
-    if (s === "error") return "badge-red";
-    if (s === "running") return "badge-blue";
-    return "badge-gray";
+  const handleStartCrawl = async (id: number) => {
+    try {
+      const res = await startCrawl(id);
+      toast.success(`Crawl started (${res.task_id?.slice(0, 8)}...)`);
+      setWebsites(await listWebsites());
+    } catch { toast.error("Failed to start crawl"); }
   };
 
+  const clearFilters = () => {
+    setMachSearch(""); setMachStatus("all"); setMachType(""); setMachBrand("");
+    setMachPage(1);
+  };
+
+  // ── Unique types/brands from current page (for dropdown hints) ──
+  const uniqueTypes = Array.from(new Set(machines.items?.map((m: any) => m.machine_type).filter(Boolean))).slice(0, 30);
+  const uniqueBrands = Array.from(new Set(machines.items?.map((m: any) => m.brand).filter(Boolean))).slice(0, 30);
+
   return (
-    <div className="min-h-screen bg-steel-50">
-      {/* Edit Modals */}
+    <div className="min-h-screen flex bg-gray-100">
+      {/* Modals */}
       {editWebsite && (
         <EditWebsiteModal
           site={editWebsite}
@@ -314,444 +405,684 @@ export default function AdminPage() {
           onSaved={() => listWebsites().then(setWebsites)}
         />
       )}
-      {editMachine && (
-        <EditMachineModal
-          machine={editMachine}
-          onClose={() => setEditMachine(null)}
-          onSaved={() => getAdminMachines({ limit: 100 }).then(setMachines)}
+      {(editMachine || addMachineOpen) && (
+        <MachineModal
+          machine={addMachineOpen ? null : editMachine}
+          websites={websites.length ? websites : []}
+          onClose={() => { setEditMachine(null); setAddMachineOpen(false); }}
+          onSaved={() => loadMachines(machPage, machPerPage)}
         />
       )}
 
-      {/* Admin Header */}
-      <header className="bg-steel-900 text-white px-6 py-4 flex items-center justify-between">
-        <div>
-          <h1 className="text-lg font-bold">Zoogle Admin</h1>
-          <p className="text-steel-400 text-xs">Industrial Machine Search Engine</p>
+      {/* ── Sidebar ─────────────────────────────────────────────────────────── */}
+      <aside
+        className={`${collapsed ? "w-16" : "w-64"} bg-[#1c3344] text-white flex flex-col shrink-0 transition-all duration-200 min-h-screen`}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between px-4 py-5 border-b border-white/10">
+          {!collapsed && (
+            <div>
+              <div className="font-bold text-base leading-tight">Admin Panel</div>
+              <div className="text-xs text-white/50 mt-0.5">Manage your platform</div>
+            </div>
+          )}
+          <button
+            onClick={() => setCollapsed(c => !c)}
+            className="p-1.5 rounded hover:bg-white/10 text-white/70 hover:text-white ml-auto"
+          >
+            {collapsed ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
+          </button>
         </div>
-        <div className="flex items-center gap-4">
-          <span className="text-sm text-steel-300">{user?.email}</span>
-          <a href="/" className="text-sm text-steel-400 hover:text-white">← Public Site</a>
-        </div>
-      </header>
 
-      <div className="max-w-7xl mx-auto px-4 py-6 flex gap-6">
-        {/* Sidebar */}
-        <nav className="w-48 shrink-0">
-          <div className="card p-2 space-y-1">
-            {TABS.map((t) => (
+        {/* Reset All Data */}
+        {!collapsed && (
+          <div className="px-4 py-3 border-b border-white/10">
+            <button
+              onClick={() => {
+                if (!confirm("This will delete ALL machines and reset all data. Are you sure?")) return;
+                toast.error("Reset not implemented — protect your data!");
+              }}
+              className="w-full flex items-center justify-center gap-2 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors"
+            >
+              <Trash2 className="w-4 h-4" /> Reset All Data
+            </button>
+          </div>
+        )}
+
+        {/* Nav */}
+        <nav className="flex-1 px-2 py-4 space-y-1 overflow-y-auto">
+          {!collapsed && (
+            <div className="px-2 pb-2 text-xs font-semibold uppercase tracking-widest text-white/30">
+              Management
+            </div>
+          )}
+
+          {NAV_ITEMS.map((item) => {
+            const active = section === item.key;
+            return (
               <button
-                key={t.key}
-                onClick={() => setTab(t.key)}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
-                  tab === t.key ? "bg-brand-600 text-white" : "text-steel-700 hover:bg-steel-100"
+                key={item.key}
+                onClick={() => setSection(item.key)}
+                title={collapsed ? item.label : undefined}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors text-left ${
+                  active
+                    ? "bg-white/15 text-white border-l-2 border-white"
+                    : "text-white/70 hover:bg-white/10 hover:text-white border-l-2 border-transparent"
                 }`}
               >
-                {t.icon}
-                {t.label}
+                <span className="shrink-0">{item.icon}</span>
+                {!collapsed && (
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium leading-tight">{item.label}</div>
+                    <div className="text-xs text-white/40 leading-tight truncate">{item.desc}</div>
+                  </div>
+                )}
               </button>
-            ))}
-          </div>
+            );
+          })}
+
+          {/* Divider + extra placeholder items */}
+          {!collapsed && (
+            <div className="pt-3 pb-1 px-2">
+              <div className="border-t border-white/10" />
+            </div>
+          )}
+
+          {EXTRA_NAV.map((item) => (
+            <button
+              key={item.label}
+              title={collapsed ? item.label : undefined}
+              onClick={() => toast("Coming soon!")}
+              className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-white/40 hover:bg-white/10 hover:text-white/70 transition-colors border-l-2 border-transparent text-left"
+            >
+              <span className="shrink-0">{item.icon}</span>
+              {!collapsed && (
+                <div className="min-w-0">
+                  <div className="text-sm font-medium leading-tight">{item.label}</div>
+                  <div className="text-xs text-white/30 leading-tight truncate">{item.desc}</div>
+                </div>
+              )}
+            </button>
+          ))}
         </nav>
 
-        {/* Main content */}
-        <main className="flex-1 min-w-0">
-          {loading && <div className="text-center py-12 text-steel-400">Loading...</div>}
+        {/* User footer */}
+        {!collapsed && (
+          <div className="px-4 py-3 border-t border-white/10">
+            <div className="text-xs text-white/40 truncate">{user?.email}</div>
+            <a href="/" className="text-xs text-white/50 hover:text-white mt-0.5 inline-block">← Public Site</a>
+          </div>
+        )}
+      </aside>
 
-          {/* ── Dashboard ── */}
-          {!loading && tab === "dashboard" && stats && (
-            <div className="space-y-6">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xl font-bold text-steel-900">Dashboard</h2>
-                <button onClick={loadData} className="btn-secondary flex items-center gap-2 text-sm">
-                  <RefreshCw className="w-4 h-4" /> Refresh
+      {/* ── Main content ────────────────────────────────────────────────────── */}
+      <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
+
+        {/* ══ MACHINES ══════════════════════════════════════════════════════ */}
+        {section === "machines" && (
+          <div className="flex flex-col h-full">
+            {/* Top bar */}
+            <div className="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between gap-4 flex-wrap shrink-0">
+              <div className="flex items-center gap-3 flex-wrap">
+                <h2 className="text-base font-bold text-gray-900 whitespace-nowrap">
+                  Machines ({machLoading ? "..." : machines.total?.toLocaleString()})
+                </h2>
+                {/* Show per page */}
+                <div className="flex items-center gap-1 text-sm text-gray-500">
+                  <span>Show:</span>
+                  <select
+                    value={machPerPage}
+                    onChange={(e) => { setMachPerPage(Number(e.target.value)); setMachPage(1); }}
+                    className="border border-gray-200 rounded px-2 py-1 text-sm bg-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  >
+                    {[25, 50, 100].map(n => <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </div>
+                {/* Pagination */}
+                <span className="text-sm text-gray-500 whitespace-nowrap">
+                  Page {machPage} of {totalPages}
+                </span>
+                <button
+                  disabled={machPage <= 1}
+                  onClick={() => setMachPage(p => Math.max(1, p - 1))}
+                  className="px-3 py-1 text-sm border border-gray-200 rounded hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Prev
+                </button>
+                <button
+                  disabled={machPage >= totalPages}
+                  onClick={() => setMachPage(p => Math.min(totalPages, p + 1))}
+                  className="px-3 py-1 text-sm border border-gray-200 rounded hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Next
                 </button>
               </div>
 
-              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                {[
-                  { label: "Total Machines", value: stats.total_machines?.toLocaleString(), icon: <Cpu className="w-5 h-5" />, color: "text-blue-600 bg-blue-50" },
-                  { label: "Indexed Websites", value: stats.total_websites, icon: <Globe className="w-5 h-5" />, color: "text-green-600 bg-green-50" },
-                  { label: "Users", value: stats.total_users, icon: <Users className="w-5 h-5" />, color: "text-purple-600 bg-purple-50" },
-                  { label: "Total Searches", value: stats.total_searches?.toLocaleString(), icon: <Search className="w-5 h-5" />, color: "text-orange-600 bg-orange-50" },
-                ].map((s) => (
-                  <div key={s.label} className="card p-5">
-                    <div className={`inline-flex p-2 rounded-lg mb-3 ${s.color}`}>{s.icon}</div>
-                    <div className="text-2xl font-bold text-steel-900">{s.value ?? "—"}</div>
-                    <div className="text-sm text-steel-500 mt-1">{s.label}</div>
-                  </div>
-                ))}
-              </div>
-
-              <div className="card p-5">
-                <h3 className="font-semibold text-steel-900 mb-4">Recent Crawls</h3>
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="text-steel-500 text-left border-b border-steel-100">
-                      <th className="pb-2">Website Name</th>
-                      <th className="pb-2">Status</th>
-                      <th className="pb-2">Found</th>
-                      <th className="pb-2">New</th>
-                      <th className="pb-2">Started</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {stats.recent_crawls?.map((c: any) => (
-                      <tr key={c.id} className="border-b border-steel-50">
-                        <td className="py-2 font-medium text-steel-900">{c.website_name}</td>
-                        <td className="py-2"><span className={statusColor(c.status)}>{c.status}</span></td>
-                        <td className="py-2 text-steel-700">{c.machines_found ?? 0}</td>
-                        <td className="py-2 text-green-600 font-medium">{c.machines_new ?? 0}</td>
-                        <td className="py-2 text-steel-400">{c.started_at ? new Date(c.started_at).toLocaleString() : "—"}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+              {/* Action buttons */}
+              <div className="flex items-center gap-2 flex-wrap">
+                <button className="flex items-center gap-1.5 px-3 py-1.5 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 text-gray-600">
+                  <SlidersHorizontal className="w-4 h-4" /> Columns
+                </button>
+                <button
+                  onClick={() => { if (!websites.length) listWebsites().then(setWebsites); setAddMachineOpen(true); }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-gray-900 text-white rounded-lg hover:bg-gray-800 font-medium"
+                >
+                  <Plus className="w-4 h-4" /> Add Machine
+                </button>
+                <button
+                  onClick={async () => {
+                    try { const r = await fillMachineTypes(); toast.success(`Filled ${r.updated} types`); loadMachines(machPage, machPerPage); }
+                    catch { toast.error("Failed"); }
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 text-gray-600"
+                >
+                  <Wrench className="w-4 h-4" /> Fill Types
+                </button>
+                <a
+                  href={exportMachinesExcelUrl()} target="_blank" rel="noopener noreferrer"
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 text-gray-600"
+                >
+                  <Download className="w-4 h-4" /> Export
+                </a>
+                <button onClick={clearFilters} className="px-3 py-1.5 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 text-gray-600">
+                  Clear
+                </button>
               </div>
             </div>
-          )}
 
-          {/* ── Websites ── */}
-          {!loading && tab === "websites" && (
-            <div className="space-y-6">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xl font-bold text-steel-900">Websites ({websites.length})</h2>
-                <div className="flex gap-2">
-                  <button onClick={loadData} className="btn-secondary flex items-center gap-2 text-sm">
-                    <RefreshCw className="w-4 h-4" />
-                  </button>
-                  <button
-                    onClick={async () => {
-                      try {
-                        const r = await fixWebsiteNames();
-                        toast.success(`Fixed ${r.fixed} website name(s)`);
-                        setWebsites(await listWebsites());
-                      } catch { toast.error("Failed to fix names"); }
-                    }}
-                    className="btn-secondary flex items-center gap-2 text-sm"
-                    title="Auto-fix names that were set to the URL"
-                  >
-                    <Wrench className="w-4 h-4" /> Fix Names
-                  </button>
-                  <button
-                    onClick={async () => {
-                      try {
-                        await recalculateMachineCounts();
-                        toast.success("Machine counts updated");
-                        setWebsites(await listWebsites());
-                      } catch { toast.error("Failed to recalculate"); }
-                    }}
-                    className="btn-secondary flex items-center gap-2 text-sm"
-                    title="Recalculate machine count from database"
-                  >
-                    <RefreshCw className="w-4 h-4" /> Fix Counts
-                  </button>
-                  <button onClick={handleStartAll} className="btn-primary flex items-center gap-2 text-sm">
-                    <Play className="w-4 h-4" /> Crawl All
-                  </button>
-                </div>
+            {/* Filter row */}
+            <div className="bg-white border-b border-gray-200 px-6 py-2 flex items-center gap-2 flex-wrap shrink-0">
+              {/* Search */}
+              <div className="relative">
+                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400" />
+                <input
+                  value={machSearch}
+                  onChange={(e) => { setMachSearch(e.target.value); setMachPage(1); }}
+                  placeholder="SKU, model, brand..."
+                  className="pl-8 pr-3 py-1.5 text-sm border border-gray-200 rounded-lg w-44 focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white"
+                />
               </div>
 
-              {/* Add website form */}
-              <div className="card p-5">
-                <h3 className="font-semibold text-steel-900 mb-4">Add New Website</h3>
-                <form onSubmit={handleAddWebsite} className="flex gap-3 flex-wrap">
-                  <input
-                    required
-                    placeholder="Name (e.g. Machinio)"
-                    value={newSite.name}
-                    onChange={(e) => setNewSite({ ...newSite, name: e.target.value })}
-                    className="input flex-1 min-w-40"
-                  />
-                  <input
-                    required
-                    placeholder="URL (e.g. https://machinio.com)"
-                    value={newSite.url}
-                    onChange={(e) => {
-                      const url = e.target.value;
-                      // Auto-fill name from URL if name is still empty
-                      let autoName = newSite.name;
-                      if (!newSite.name && url.includes(".")) {
-                        try {
-                          const domain = new URL(url.startsWith("http") ? url : `https://${url}`).hostname;
-                          autoName = domain.replace(/^www\./, "").split(".")[0]
-                            .replace(/[-_]/g, " ")
-                            .replace(/\b\w/g, c => c.toUpperCase());
-                        } catch {}
-                      }
-                      setNewSite({ ...newSite, url, name: autoName });
-                    }}
-                    className="input flex-1 min-w-60"
-                  />
-                  <input
-                    placeholder="Description (optional)"
-                    value={newSite.description}
-                    onChange={(e) => setNewSite({ ...newSite, description: e.target.value })}
-                    className="input flex-1 min-w-40"
-                  />
-                  <button type="submit" className="btn-primary">Add Website</button>
-                </form>
-              </div>
+              {/* Status */}
+              <select
+                value={machStatus}
+                onChange={(e) => { setMachStatus(e.target.value as any); setMachPage(1); }}
+                className="px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white"
+              >
+                <option value="all">All Status</option>
+                <option value="active">Active</option>
+                <option value="inactive">Inactive</option>
+              </select>
 
-              {/* Website table */}
-              <div className="card overflow-hidden">
-                <table className="w-full text-sm">
-                  <thead className="bg-steel-50 border-b border-steel-200">
-                    <tr className="text-steel-500 text-left">
-                      <th className="px-4 py-3">Name / URL</th>
-                      <th className="px-4 py-3">Status</th>
-                      <th className="px-4 py-3">Machines</th>
-                      <th className="px-4 py-3">Last Crawl</th>
-                      <th className="px-4 py-3">Crawl</th>
-                      <th className="px-4 py-3">Actions</th>
+              {/* Type */}
+              <select
+                value={machType}
+                onChange={(e) => { setMachType(e.target.value); setMachPage(1); }}
+                className="px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white max-w-[180px]"
+              >
+                <option value="">All Types</option>
+                {(uniqueTypes as string[]).map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+
+              {/* Brand */}
+              <select
+                value={machBrand}
+                onChange={(e) => { setMachBrand(e.target.value); setMachPage(1); }}
+                className="px-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white max-w-[160px]"
+              >
+                <option value="">All Brands</option>
+                {(uniqueBrands as string[]).map(b => <option key={b} value={b}>{b}</option>)}
+              </select>
+
+              {/* Refresh */}
+              <button
+                onClick={() => loadMachines(machPage, machPerPage)}
+                className="p-1.5 border border-gray-200 rounded-lg hover:bg-gray-50 text-gray-500"
+                title="Refresh"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${machLoading ? "animate-spin" : ""}`} />
+              </button>
+
+              {selectedIds.size > 0 && (
+                <span className="text-xs text-blue-600 font-medium">{selectedIds.size} selected</span>
+              )}
+            </div>
+
+            {/* Table */}
+            <div className="flex-1 overflow-auto">
+              <table className="w-full text-sm border-collapse">
+                <thead className="bg-gray-50 sticky top-0 z-10">
+                  <tr className="border-b border-gray-200">
+                    <th className="px-3 py-3 w-8">
+                      <input
+                        type="checkbox"
+                        checked={sortedItems.length > 0 && selectedIds.size === sortedItems.length}
+                        onChange={toggleAll}
+                        className="rounded"
+                      />
+                    </th>
+                    <th className="px-3 py-3 text-left text-xs font-semibold text-gray-600 w-16">Image</th>
+                    <SortTh label="Model"    field="model"        sortField={machSortField} sortDir={machSortDir} onSort={handleSort} />
+                    <SortTh label="Type"     field="machine_type" sortField={machSortField} sortDir={machSortDir} onSort={handleSort} />
+                    <SortTh label="Brand"    field="brand"        sortField={machSortField} sortDir={machSortDir} onSort={handleSort} />
+                    <SortTh label="Location" field="location"     sortField={machSortField} sortDir={machSortDir} onSort={handleSort} />
+                    <SortTh label="Price"    field="price"        sortField={machSortField} sortDir={machSortDir} onSort={handleSort} />
+                    <th className="px-3 py-3 text-left text-xs font-semibold text-gray-600">Premium</th>
+                    <th className="px-3 py-3 text-left text-xs font-semibold text-gray-600">Status</th>
+                    <th className="px-3 py-3 text-left text-xs font-semibold text-gray-600">E-URL</th>
+                    <th className="px-3 py-3 text-left text-xs font-semibold text-gray-600">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {machLoading && (
+                    <tr>
+                      <td colSpan={11} className="px-4 py-12 text-center text-gray-400">
+                        <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2" />
+                        Loading machines...
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {websites.map((site) => (
-                      <tr key={site.id} className="border-b border-steel-50 hover:bg-steel-50">
-                        <td className="px-4 py-3">
-                          <div className="font-medium text-steel-900">{site.name}</div>
-                          <div className="text-steel-400 text-xs truncate max-w-xs">{site.url}</div>
-                        </td>
-                        <td className="px-4 py-3">
-                          <span className={statusColor(site.crawl_status)}>{site.crawl_status}</span>
-                          {!site.is_active && <span className="ml-1 text-xs text-red-400">(inactive)</span>}
-                        </td>
-                        <td className="px-4 py-3">{site.machine_count}</td>
-                        <td className="px-4 py-3 text-steel-400">
-                          {site.last_crawled_at ? new Date(site.last_crawled_at).toLocaleDateString() : "Never"}
-                        </td>
-                        <td className="px-4 py-3">
-                          <button
-                            onClick={() => handleStartCrawl(site.id)}
-                            className="p-1.5 hover:bg-green-50 rounded text-green-600"
-                            title="Start crawl"
-                          >
-                            <Play className="w-4 h-4" />
-                          </button>
-                        </td>
-                        <td className="px-4 py-3">
-                          <div className="flex items-center gap-1">
-                            <button
-                              onClick={() => setEditWebsite(site)}
-                              className="p-1.5 hover:bg-blue-50 rounded text-blue-500"
-                              title="Edit"
-                            >
-                              <Pencil className="w-4 h-4" />
-                            </button>
-                            <button
-                              onClick={() => handleDeleteWebsite(site.id)}
-                              className="p-1.5 hover:bg-red-50 rounded text-red-500"
-                              title="Delete"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
+                  )}
+                  {!machLoading && sortedItems.map((m: any) => (
+                    <tr
+                      key={m.id}
+                      className={`hover:bg-blue-50/40 transition-colors ${!m.is_active ? "opacity-60" : ""} ${selectedIds.has(m.id) ? "bg-blue-50" : "bg-white"}`}
+                    >
+                      {/* Checkbox */}
+                      <td className="px-3 py-2.5">
+                        <input type="checkbox" checked={selectedIds.has(m.id)} onChange={() => toggleSelect(m.id)} className="rounded" />
+                      </td>
+
+                      {/* Thumbnail */}
+                      <td className="px-3 py-2.5">
+                        {m.thumbnail_url ? (
+                          <img
+                            src={m.thumbnail_url}
+                            alt={m.model ?? "machine"}
+                            className="w-10 h-10 object-cover rounded border border-gray-200"
+                            onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                          />
+                        ) : (
+                          <div className="w-10 h-10 rounded border border-gray-200 bg-gray-100 flex items-center justify-center">
+                            <ImageIcon className="w-4 h-4 text-gray-300" />
                           </div>
-                        </td>
-                      </tr>
-                    ))}
-                    {websites.length === 0 && (
-                      <tr>
-                        <td colSpan={6} className="px-4 py-8 text-center text-steel-400">No websites added yet.</td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
+                        )}
+                      </td>
 
-          {/* ── Machines ── */}
-          {!loading && tab === "machines" && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xl font-bold text-steel-900">
-                  Machines ({machines.total?.toLocaleString()})
-                </h2>
-                <div className="flex gap-2">
-                  <button onClick={loadData} className="btn-secondary flex items-center gap-2 text-sm">
-                    <RefreshCw className="w-4 h-4" />
-                  </button>
-                  <button
-                    onClick={async () => {
-                      try {
-                        const r = await fillMachineTypes();
-                        toast.success(`Filled types for ${r.updated} machines`);
-                        loadData();
-                      } catch {
-                        toast.error("Failed to fill types");
-                      }
-                    }}
-                    className="btn-secondary flex items-center gap-2 text-sm"
-                  >
-                    <Wrench className="w-4 h-4" /> Fill Types
-                  </button>
-                  <a
-                    href={exportMachinesExcelUrl()}
-                    className="btn-secondary flex items-center gap-2 text-sm"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    <Download className="w-4 h-4" /> Export Excel
-                  </a>
-                </div>
-              </div>
+                      {/* Model */}
+                      <td className="px-3 py-2.5">
+                        <div className="font-medium text-gray-900 max-w-[180px] truncate" title={m.model ?? ""}>{m.model || "—"}</div>
+                        <div className="text-xs text-gray-400 truncate max-w-[180px]">{m.website_source || ""}</div>
+                      </td>
 
-              <div className="card overflow-hidden">
-                <table className="w-full text-sm">
-                  <thead className="bg-steel-50 border-b border-steel-200">
-                    <tr className="text-steel-500 text-left">
-                      <th className="px-4 py-3">Machine</th>
-                      <th className="px-4 py-3">Type</th>
-                      <th className="px-4 py-3">Price</th>
-                      <th className="px-4 py-3">Location</th>
-                      <th className="px-4 py-3">Source</th>
-                      <th className="px-4 py-3">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {machines.items?.map((m: any) => (
-                      <tr key={m.id} className={`border-b border-steel-50 hover:bg-steel-50 ${!m.is_active ? "opacity-50" : ""}`}>
-                        <td className="px-4 py-3">
-                          <div className="font-medium text-steel-900">{m.brand} {m.model}</div>
-                          <a
-                            href={m.machine_url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-brand-600 text-xs hover:underline"
-                          >
-                            View listing
+                      {/* Type */}
+                      <td className="px-3 py-2.5">
+                        {m.machine_type ? (
+                          <span className="text-blue-600 font-medium text-xs hover:underline cursor-default">{m.machine_type}</span>
+                        ) : <span className="text-gray-300">—</span>}
+                      </td>
+
+                      {/* Brand */}
+                      <td className="px-3 py-2.5 text-gray-700 font-medium">{m.brand || "—"}</td>
+
+                      {/* Location */}
+                      <td className="px-3 py-2.5 text-gray-500 max-w-[120px] truncate" title={m.location ?? ""}>{m.location || "—"}</td>
+
+                      {/* Price */}
+                      <td className="px-3 py-2.5 text-gray-800">
+                        {m.price != null ? (
+                          <span className="font-medium">
+                            {m.currency === "EUR" ? "€" : m.currency === "GBP" ? "£" : "$"}{" "}
+                            {Number(m.price).toLocaleString()}
+                          </span>
+                        ) : <span className="text-gray-300">—</span>}
+                      </td>
+
+                      {/* Premium */}
+                      <td className="px-3 py-2.5">
+                        <Star className="w-4 h-4 text-gray-300" />
+                      </td>
+
+                      {/* Status */}
+                      <td className="px-3 py-2.5">
+                        <StatusDot active={m.is_active} />
+                      </td>
+
+                      {/* E-URL */}
+                      <td className="px-3 py-2.5">
+                        {m.machine_url ? (
+                          <a href={m.machine_url} target="_blank" rel="noopener noreferrer" className="text-gray-400 hover:text-blue-600">
+                            <ExternalLink className="w-4 h-4" />
                           </a>
-                        </td>
-                        <td className="px-4 py-3 text-steel-500">{m.machine_type || "—"}</td>
-                        <td className="px-4 py-3">
-                          {m.price ? `$${Number(m.price).toLocaleString()}` : "—"}
-                        </td>
-                        <td className="px-4 py-3 text-steel-500">{m.location || "—"}</td>
-                        <td className="px-4 py-3 text-steel-400 text-xs">{m.website_source}</td>
-                        <td className="px-4 py-3">
-                          <div className="flex items-center gap-1">
-                            <button
-                              onClick={() => setEditMachine(m)}
-                              className="p-1.5 hover:bg-blue-50 rounded text-blue-500"
-                              title="Edit"
-                            >
-                              <Pencil className="w-4 h-4" />
-                            </button>
-                            <button
-                              onClick={() => handleDeleteMachine(m.id)}
-                              className="p-1.5 hover:bg-red-50 rounded text-red-500"
-                              title="Delete"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                    {machines.items?.length === 0 && (
-                      <tr>
-                        <td colSpan={6} className="px-4 py-8 text-center text-steel-400">No machines found.</td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
+                        ) : <span className="text-gray-200">—</span>}
+                      </td>
+
+                      {/* Actions */}
+                      <td className="px-3 py-2.5">
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => setEditMachine(m)}
+                            className="p-1 rounded hover:bg-blue-100 text-blue-500 hover:text-blue-700"
+                            title="Edit"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => handleDeleteMachine(m.id)}
+                            className="p-1 rounded hover:bg-red-100 text-red-400 hover:text-red-600"
+                            title="Delete"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                  {!machLoading && sortedItems.length === 0 && (
+                    <tr>
+                      <td colSpan={11} className="px-4 py-12 text-center text-gray-400">No machines found.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Bottom pagination bar */}
+            <div className="bg-white border-t border-gray-200 px-6 py-3 flex items-center justify-between text-sm text-gray-500 shrink-0">
+              <span>
+                {machines.total > 0
+                  ? `Showing ${((machPage - 1) * machPerPage) + 1}–${Math.min(machPage * machPerPage, machines.total)} of ${machines.total?.toLocaleString()} machines`
+                  : "No machines"}
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  disabled={machPage <= 1}
+                  onClick={() => setMachPage(1)}
+                  className="px-2 py-1 border border-gray-200 rounded hover:bg-gray-50 disabled:opacity-40"
+                >«</button>
+                <button
+                  disabled={machPage <= 1}
+                  onClick={() => setMachPage(p => p - 1)}
+                  className="px-3 py-1 border border-gray-200 rounded hover:bg-gray-50 disabled:opacity-40"
+                >Prev</button>
+                <span className="px-3 py-1 bg-gray-900 text-white rounded text-xs font-medium">{machPage}</span>
+                <button
+                  disabled={machPage >= totalPages}
+                  onClick={() => setMachPage(p => p + 1)}
+                  className="px-3 py-1 border border-gray-200 rounded hover:bg-gray-50 disabled:opacity-40"
+                >Next</button>
+                <button
+                  disabled={machPage >= totalPages}
+                  onClick={() => setMachPage(totalPages)}
+                  className="px-2 py-1 border border-gray-200 rounded hover:bg-gray-50 disabled:opacity-40"
+                >»</button>
               </div>
             </div>
-          )}
+          </div>
+        )}
 
-          {/* ── Crawl Logs ── */}
-          {!loading && tab === "logs" && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xl font-bold text-steel-900">Crawl Logs ({logs.total})</h2>
-                <div className="flex gap-2">
-                  <button
-                    onClick={async () => {
-                      try {
-                        const r = await fixStuckCrawls();
-                        toast.success(`Fixed ${r.fixed_crawl_logs} stuck crawl(s)`);
-                        loadData();
-                      } catch { toast.error("Failed to fix stuck crawls"); }
-                    }}
-                    className="btn-secondary flex items-center gap-2 text-sm"
-                  >
-                    <Wrench className="w-4 h-4" /> Fix Stuck
-                  </button>
-                  <button onClick={loadData} className="btn-secondary flex items-center gap-2 text-sm">
-                    <RefreshCw className="w-4 h-4" /> Refresh
-                  </button>
+        {/* ══ DASHBOARD ═════════════════════════════════════════════════════ */}
+        {section === "dashboard" && (
+          <div className="p-6 space-y-6 overflow-auto">
+            <div className="flex items-center justify-between">
+              <h2 className="text-xl font-bold text-gray-900">Dashboard</h2>
+              <button onClick={loadSection} className="flex items-center gap-2 text-sm btn-secondary">
+                <RefreshCw className="w-4 h-4" /> Refresh
+              </button>
+            </div>
+
+            {loading && <div className="text-center py-12 text-gray-400"><RefreshCw className="w-5 h-5 animate-spin mx-auto" /></div>}
+
+            {!loading && stats && (
+              <>
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                  {[
+                    { label: "Total Machines",    value: stats.total_machines?.toLocaleString(),  icon: <Cpu className="w-5 h-5" />,    color: "text-blue-600 bg-blue-50" },
+                    { label: "Indexed Websites",  value: stats.total_websites,                    icon: <Globe className="w-5 h-5" />,   color: "text-green-600 bg-green-50" },
+                    { label: "Users",             value: stats.total_users,                       icon: <Users className="w-5 h-5" />,   color: "text-purple-600 bg-purple-50" },
+                    { label: "Total Searches",    value: stats.total_searches?.toLocaleString(),  icon: <Search className="w-5 h-5" />,  color: "text-orange-600 bg-orange-50" },
+                  ].map((s) => (
+                    <div key={s.label} className="card p-5">
+                      <div className={`inline-flex p-2 rounded-lg mb-3 ${s.color}`}>{s.icon}</div>
+                      <div className="text-2xl font-bold text-gray-900">{s.value ?? "—"}</div>
+                      <div className="text-sm text-gray-500 mt-1">{s.label}</div>
+                    </div>
+                  ))}
                 </div>
+
+                <div className="card p-5">
+                  <h3 className="font-semibold text-gray-900 mb-4">Recent Crawls</h3>
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-gray-500 text-left border-b border-gray-100">
+                        <th className="pb-2 font-medium">Website</th>
+                        <th className="pb-2 font-medium">Status</th>
+                        <th className="pb-2 font-medium">Found</th>
+                        <th className="pb-2 font-medium">New</th>
+                        <th className="pb-2 font-medium">Started</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {stats.recent_crawls?.map((c: any) => (
+                        <tr key={c.id} className="border-b border-gray-50">
+                          <td className="py-2 font-medium text-gray-900">{c.website_name}</td>
+                          <td className="py-2"><CrawlStatusBadge status={c.status} /></td>
+                          <td className="py-2 text-gray-700">{c.machines_found ?? 0}</td>
+                          <td className="py-2 text-green-600 font-medium">{c.machines_new ?? 0}</td>
+                          <td className="py-2 text-gray-400">{c.started_at ? new Date(c.started_at).toLocaleString() : "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ══ WEBSITES ══════════════════════════════════════════════════════ */}
+        {section === "websites" && (
+          <div className="p-6 space-y-6 overflow-auto">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <h2 className="text-xl font-bold text-gray-900">Web Sources ({websites.length})</h2>
+              <div className="flex gap-2 flex-wrap">
+                <button onClick={loadSection} className="btn-secondary flex items-center gap-2 text-sm"><RefreshCw className="w-4 h-4" /></button>
+                <button
+                  onClick={async () => {
+                    try { const r = await fixWebsiteNames(); toast.success(`Fixed ${r.fixed} name(s)`); setWebsites(await listWebsites()); }
+                    catch { toast.error("Failed"); }
+                  }}
+                  className="btn-secondary flex items-center gap-2 text-sm"
+                >
+                  <Wrench className="w-4 h-4" /> Fix Names
+                </button>
+                <button
+                  onClick={async () => {
+                    try { await recalculateMachineCounts(); toast.success("Counts updated"); setWebsites(await listWebsites()); }
+                    catch { toast.error("Failed"); }
+                  }}
+                  className="btn-secondary flex items-center gap-2 text-sm"
+                >
+                  <RefreshCw className="w-4 h-4" /> Fix Counts
+                </button>
+                <button onClick={async () => { try { await startAllCrawls(); toast.success("All crawls queued"); } catch { toast.error("Failed"); } }} className="btn-primary flex items-center gap-2 text-sm">
+                  <Play className="w-4 h-4" /> Crawl All
+                </button>
               </div>
+            </div>
 
-              <p className="text-xs text-steel-400">Click any row to see full scrapy output / error details.</p>
+            {loading && <div className="text-center py-12 text-gray-400"><RefreshCw className="w-5 h-5 animate-spin mx-auto" /></div>}
 
+            {!loading && (
+              <>
+                {/* Add website */}
+                <div className="card p-5">
+                  <h3 className="font-semibold text-gray-900 mb-4">Add New Website</h3>
+                  <form
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      try {
+                        await addWebsite(newSite);
+                        toast.success("Website added!");
+                        setNewSite({ name: "", url: "", description: "" });
+                        setWebsites(await listWebsites());
+                      } catch { toast.error("Failed to add website"); }
+                    }}
+                    className="flex gap-3 flex-wrap"
+                  >
+                    <input required placeholder="Name" value={newSite.name} onChange={(e) => setNewSite({ ...newSite, name: e.target.value })} className="input flex-1 min-w-36" />
+                    <input
+                      required placeholder="URL (https://...)" value={newSite.url}
+                      onChange={(e) => {
+                        const url = e.target.value;
+                        let autoName = newSite.name;
+                        if (!newSite.name && url.includes(".")) {
+                          try {
+                            const domain = new URL(url.startsWith("http") ? url : `https://${url}`).hostname;
+                            autoName = domain.replace(/^www\./, "").split(".")[0].replace(/[-_]/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+                          } catch {}
+                        }
+                        setNewSite({ ...newSite, url, name: autoName });
+                      }}
+                      className="input flex-1 min-w-52"
+                    />
+                    <input placeholder="Description (optional)" value={newSite.description} onChange={(e) => setNewSite({ ...newSite, description: e.target.value })} className="input flex-1 min-w-36" />
+                    <button type="submit" className="btn-primary">Add Website</button>
+                  </form>
+                </div>
+
+                {/* Websites table */}
+                <div className="card overflow-hidden">
+                  <table className="w-full text-sm">
+                    <thead className="bg-gray-50 border-b border-gray-200">
+                      <tr className="text-gray-500 text-left">
+                        <th className="px-4 py-3 font-semibold">Name / URL</th>
+                        <th className="px-4 py-3 font-semibold">Status</th>
+                        <th className="px-4 py-3 font-semibold">Machines</th>
+                        <th className="px-4 py-3 font-semibold">Last Crawl</th>
+                        <th className="px-4 py-3 font-semibold">Crawl</th>
+                        <th className="px-4 py-3 font-semibold">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {websites.map((site) => (
+                        <tr key={site.id} className="hover:bg-gray-50">
+                          <td className="px-4 py-3">
+                            <div className="font-medium text-gray-900">{site.name}</div>
+                            <div className="text-gray-400 text-xs truncate max-w-xs">{site.url}</div>
+                          </td>
+                          <td className="px-4 py-3">
+                            <CrawlStatusBadge status={site.crawl_status} />
+                            {!site.is_active && <span className="ml-1 text-xs text-red-400">(inactive)</span>}
+                          </td>
+                          <td className="px-4 py-3 font-medium">{site.machine_count?.toLocaleString()}</td>
+                          <td className="px-4 py-3 text-gray-400 text-xs">
+                            {site.last_crawled_at ? new Date(site.last_crawled_at).toLocaleDateString() : "Never"}
+                          </td>
+                          <td className="px-4 py-3">
+                            <button onClick={() => handleStartCrawl(site.id)} className="p-1.5 hover:bg-green-50 rounded text-green-600" title="Start crawl">
+                              <Play className="w-4 h-4" />
+                            </button>
+                          </td>
+                          <td className="px-4 py-3">
+                            <div className="flex gap-1">
+                              <button onClick={() => setEditWebsite(site)} className="p-1.5 hover:bg-blue-50 rounded text-blue-500"><Pencil className="w-4 h-4" /></button>
+                              <button onClick={() => handleDeleteWebsite(site.id)} className="p-1.5 hover:bg-red-50 rounded text-red-500"><Trash2 className="w-4 h-4" /></button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                      {websites.length === 0 && (
+                        <tr><td colSpan={6} className="px-4 py-10 text-center text-gray-400">No websites added yet.</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ══ CRAWL LOGS ════════════════════════════════════════════════════ */}
+        {section === "logs" && (
+          <div className="p-6 space-y-4 overflow-auto">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <h2 className="text-xl font-bold text-gray-900">Crawl Logs ({logs.total})</h2>
+              <div className="flex gap-2">
+                <button
+                  onClick={async () => {
+                    try { const r = await fixStuckCrawls(); toast.success(`Fixed ${r.fixed_crawl_logs} stuck crawl(s)`); loadSection(); }
+                    catch { toast.error("Failed"); }
+                  }}
+                  className="btn-secondary flex items-center gap-2 text-sm"
+                >
+                  <Wrench className="w-4 h-4" /> Fix Stuck
+                </button>
+                <button onClick={loadSection} className="btn-secondary flex items-center gap-2 text-sm">
+                  <RefreshCw className="w-4 h-4" /> Refresh
+                </button>
+              </div>
+            </div>
+
+            <p className="text-xs text-gray-400">Click any row to expand scrapy output / error details.</p>
+
+            {loading && <div className="text-center py-12 text-gray-400"><RefreshCw className="w-5 h-5 animate-spin mx-auto" /></div>}
+
+            {!loading && (
               <div className="card overflow-hidden">
                 <table className="w-full text-sm">
-                  <thead className="bg-steel-50 border-b border-steel-200">
-                    <tr className="text-steel-500 text-left">
-                      <th className="px-4 py-3 w-8"></th>
-                      <th className="px-4 py-3">Website Name</th>
-                      <th className="px-4 py-3">Status</th>
-                      <th className="px-4 py-3">Found</th>
-                      <th className="px-4 py-3">New</th>
-                      <th className="px-4 py-3">Errors</th>
-                      <th className="px-4 py-3">Started</th>
-                      <th className="px-4 py-3">Duration</th>
+                  <thead className="bg-gray-50 border-b border-gray-200">
+                    <tr className="text-gray-500 text-left">
+                      <th className="px-4 py-3 w-8" />
+                      <th className="px-4 py-3 font-semibold">Website</th>
+                      <th className="px-4 py-3 font-semibold">Status</th>
+                      <th className="px-4 py-3 font-semibold">Found</th>
+                      <th className="px-4 py-3 font-semibold">New</th>
+                      <th className="px-4 py-3 font-semibold">Errors</th>
+                      <th className="px-4 py-3 font-semibold">Started</th>
+                      <th className="px-4 py-3 font-semibold">Duration</th>
                     </tr>
                   </thead>
-                  <tbody>
+                  <tbody className="divide-y divide-gray-100">
                     {logs.items?.map((log: any) => {
-                      const duration =
-                        log.finished_at && log.started_at
-                          ? Math.round((new Date(log.finished_at).getTime() - new Date(log.started_at).getTime()) / 1000) + "s"
-                          : "Running...";
+                      const duration = log.finished_at && log.started_at
+                        ? Math.round((new Date(log.finished_at).getTime() - new Date(log.started_at).getTime()) / 1000) + "s"
+                        : "Running...";
                       const isExpanded = expandedLog === log.id;
                       const hasDetail = log.error_details || log.log_output;
                       return (
                         <>
                           <tr
                             key={log.id}
-                            className={`border-b border-steel-50 hover:bg-steel-50 ${hasDetail ? "cursor-pointer" : ""}`}
+                            className={`hover:bg-gray-50 ${hasDetail ? "cursor-pointer" : ""}`}
                             onClick={() => hasDetail && setExpandedLog(isExpanded ? null : log.id)}
                           >
-                            <td className="px-4 py-3 text-steel-400">
-                              {hasDetail
-                                ? (isExpanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />)
-                                : null}
+                            <td className="px-4 py-3 text-gray-400">
+                              {hasDetail ? (isExpanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />) : null}
                             </td>
                             <td className="px-4 py-3">
-                              <div className="font-medium text-steel-900">{log.website_name}</div>
-                              {log.website_url && (
-                                <div className="text-xs text-steel-400 truncate max-w-[180px]">{log.website_url}</div>
-                              )}
+                              <div className="font-medium text-gray-900">{log.website_name}</div>
+                              {log.website_url && <div className="text-xs text-gray-400 truncate max-w-[160px]">{log.website_url}</div>}
                             </td>
-                            <td className="px-4 py-3"><span className={statusColor(log.status)}>{log.status}</span></td>
+                            <td className="px-4 py-3"><CrawlStatusBadge status={log.status} /></td>
                             <td className="px-4 py-3">{log.machines_found ?? 0}</td>
                             <td className="px-4 py-3 text-green-600 font-medium">{log.machines_new ?? 0}</td>
                             <td className="px-4 py-3 text-red-500">{log.errors_count ?? 0}</td>
-                            <td className="px-4 py-3 text-steel-400">{new Date(log.started_at).toLocaleString()}</td>
-                            <td className="px-4 py-3 text-steel-400">{duration}</td>
+                            <td className="px-4 py-3 text-gray-400 text-xs">{new Date(log.started_at).toLocaleString()}</td>
+                            <td className="px-4 py-3 text-gray-400">{duration}</td>
                           </tr>
-
                           {isExpanded && (
-                            <tr key={`${log.id}-expanded`}>
-                              <td colSpan={8} className="px-0 py-0 bg-steel-900">
-                                {/* Error summary */}
+                            <tr key={`${log.id}-detail`}>
+                              <td colSpan={8} className="p-0 bg-gray-900">
                                 {log.error_details && (
                                   <div className="px-6 pt-3 pb-1">
                                     <p className="text-xs font-semibold text-red-400 mb-1">Error Summary</p>
-                                    <pre className="text-xs text-red-300 whitespace-pre-wrap font-mono bg-black/30 rounded p-2 max-h-32 overflow-auto">
-                                      {log.error_details}
-                                    </pre>
+                                    <pre className="text-xs text-red-300 whitespace-pre-wrap font-mono bg-black/30 rounded p-2 max-h-32 overflow-auto">{log.error_details}</pre>
                                   </div>
                                 )}
-                                {/* Full log output */}
                                 {log.log_output && (
                                   <div className="px-6 pt-2 pb-3">
-                                    <p className="text-xs font-semibold text-green-400 mb-1">Full Scrapy Output (last 5000 chars)</p>
-                                    <pre className="text-xs text-green-300 whitespace-pre-wrap font-mono bg-black/30 rounded p-3 max-h-64 overflow-auto">
-                                      {log.log_output}
-                                    </pre>
+                                    <p className="text-xs font-semibold text-green-400 mb-1">Scrapy Output</p>
+                                    <pre className="text-xs text-green-300 whitespace-pre-wrap font-mono bg-black/30 rounded p-3 max-h-64 overflow-auto">{log.log_output}</pre>
                                   </div>
                                 )}
                               </td>
@@ -761,17 +1092,15 @@ export default function AdminPage() {
                       );
                     })}
                     {logs.items?.length === 0 && (
-                      <tr>
-                        <td colSpan={8} className="px-4 py-8 text-center text-steel-400">No crawl logs yet.</td>
-                      </tr>
+                      <tr><td colSpan={8} className="px-4 py-10 text-center text-gray-400">No crawl logs yet.</td></tr>
                     )}
                   </tbody>
                 </table>
               </div>
-            </div>
-          )}
-        </main>
-      </div>
+            )}
+          </div>
+        )}
+      </main>
     </div>
   );
 }

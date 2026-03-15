@@ -381,6 +381,8 @@ async def list_machines(
     website_id: Optional[int] = None,
     machine_type: Optional[str] = None,
     brand: Optional[str] = None,
+    q: Optional[str] = None,
+    is_active: Optional[bool] = None,
     db: AsyncSession = Depends(get_db),
     _=Depends(require_admin),
 ):
@@ -391,6 +393,18 @@ async def list_machines(
         stmt = stmt.where(Machine.type_normalized.ilike(f"%{machine_type}%"))
     if brand:
         stmt = stmt.where(Machine.brand_normalized.ilike(f"%{brand}%"))
+    if q:
+        search = f"%{q}%"
+        from sqlalchemy import or_
+        stmt = stmt.where(
+            or_(
+                Machine.model.ilike(search),
+                Machine.brand.ilike(search),
+                Machine.machine_type.ilike(search),
+            )
+        )
+    if is_active is not None:
+        stmt = stmt.where(Machine.is_active == is_active)
 
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar()
     rows = (await db.execute(stmt.offset(skip).limit(limit))).scalars().all()
@@ -418,6 +432,50 @@ async def list_machines(
     ]
 
     return {"total": total, "items": items}
+
+
+@router.post("/machines", status_code=201)
+async def create_machine(
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    from app.models.website import Website as WebsiteModel
+    website_id = payload.get("website_id")
+    if not website_id:
+        raise HTTPException(status_code=400, detail="website_id is required")
+    site = (await db.execute(select(WebsiteModel).where(WebsiteModel.id == website_id))).scalar_one_or_none()
+    if not site:
+        raise HTTPException(status_code=404, detail="Website not found")
+
+    machine = Machine(
+        website_id=website_id,
+        machine_type=payload.get("machine_type"),
+        brand=payload.get("brand"),
+        model=payload.get("model"),
+        price=payload.get("price"),
+        currency=payload.get("currency", "USD"),
+        location=payload.get("location"),
+        description=payload.get("description"),
+        machine_url=payload.get("machine_url", ""),
+        website_source=site.name,
+        is_active=payload.get("is_active", True),
+    )
+    db.add(machine)
+    await db.flush()
+    return {
+        "id": machine.id,
+        "machine_type": machine.machine_type,
+        "brand": machine.brand,
+        "model": machine.model,
+        "price": float(machine.price) if machine.price else None,
+        "currency": machine.currency,
+        "location": machine.location,
+        "description": machine.description,
+        "machine_url": machine.machine_url,
+        "website_source": machine.website_source,
+        "is_active": machine.is_active,
+    }
 
 
 @router.patch("/machines/{machine_id}")
