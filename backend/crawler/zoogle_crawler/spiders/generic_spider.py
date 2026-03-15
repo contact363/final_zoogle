@@ -61,6 +61,10 @@ from zoogle_crawler.page_analyzer import (
 
 logger = logging.getLogger(__name__)
 
+# Bump this every deploy so the crawl log shows which version is running.
+# If you see this in the crawl log, the latest code is active on Render.
+SPIDER_VERSION = "2026-03-15-v6"
+
 # Maximum number of URLs to keep in the visited set.
 # Once exceeded, the oldest 10 % are removed to free memory.
 MAX_VISITED = 50_000
@@ -128,8 +132,10 @@ class GenericSpider(BaseZoogleSpider):
         self._original_domain = urlparse(start_url).netloc.lower() if start_url else ""
         self._base_domain     = _strip_www(self._original_domain)
         logger.info(
-            f"Crawler init — original domain: {self._original_domain!r}, "
-            f"normalized base domain: {self._base_domain!r}"
+            f"[SPIDER v={SPIDER_VERSION}] init — "
+            f"website_id={self.website_id} "
+            f"domain={self._original_domain!r} "
+            f"base={self._base_domain!r}"
         )
 
         # ── Training rules ────────────────────────────────────────────────────
@@ -147,6 +153,10 @@ class GenericSpider(BaseZoogleSpider):
                 )
             except Exception as exc:
                 logger.warning(f"Could not parse training_rules JSON: {exc}")
+
+        # Tracks the actual host after any www/non-www redirect (e.g. https://www.example.com)
+        # Set by _update_base_domain when a redirect is detected.
+        self._redirected_base: str = ""
 
         # Deque for O(1) insertion + ordered eviction
         self._visited_order: deque[str] = deque()
@@ -197,12 +207,12 @@ class GenericSpider(BaseZoogleSpider):
             return  # nothing changed
 
         logger.info(
-            f"Domain redirect detected — "
-            f"original: {self._original_domain!r}, "
-            f"redirected: {redirected!r}, "
-            f"normalized base domain: {canonical!r}"
+            f"[www-redirect] original={self._original_domain!r} → "
+            f"redirected={redirected!r} → canonical={canonical!r} — "
+            f"base_domain updated"
         )
         self._base_domain = canonical
+        self._redirected_base = f"{urlparse(response.url).scheme}://{redirected}"
 
     # ── Phase 1: Entry point ──────────────────────────────────────────────────
 
@@ -219,6 +229,8 @@ class GenericSpider(BaseZoogleSpider):
         start_url = self.start_urls[0] if self.start_urls else None
         if not start_url:
             return
+
+        logger.info(f"[SPIDER v={SPIDER_VERSION}] start_requests — url={start_url!r}")
 
         # 1. Homepage
         yield scrapy.Request(start_url, callback=self.parse, errback=self._errback)
@@ -278,12 +290,14 @@ class GenericSpider(BaseZoogleSpider):
         #    expose machine data via internal REST endpoints.
         # dont_filter=True bypasses Scrapy's fingerprint-dedup filter so
         # these are ALWAYS sent even if something else queued the same URL.
-        for path in (
+        _json_api_paths = (
             "/api/subcategory/all", "/api/subcategories",
             "/api/categories", "/api/machine-types",
             "/api/products", "/api/machines",
             "/api/stock", "/api/inventory",
-        ):
+        )
+        logger.info(f"[SPIDER v={SPIDER_VERSION}] scheduling {len(_json_api_paths)} JSON API probes for {base!r}")
+        for path in _json_api_paths:
             url = base + path
             yield scrapy.Request(
                 url, callback=self._parse_json_api,
@@ -1575,6 +1589,8 @@ class GenericSpider(BaseZoogleSpider):
         the requests always go through even if start_requests already probed
         the same URLs (duplicate items are safely deduplicated by the pipeline).
         Only fires on the root path (/) to avoid probing on every page.
+        Probes BOTH the original base and any www-redirected base so that
+        www ↔ non-www redirects never block API discovery.
         """
         parsed = urlparse(response.url)
         if parsed.path.strip("/"):
@@ -1584,23 +1600,33 @@ class GenericSpider(BaseZoogleSpider):
         if "html" not in ct:
             return  # Only probe when homepage is HTML (i.e. an SPA / SSR site)
 
-        base = f"{parsed.scheme}://{parsed.netloc}"
-        logger.info(f"[json_api] homepage probe — base={base}")
+        # Collect the base URLs to probe: the response URL (canonical after redirects)
+        # plus the original start URL base in case they differ (www ↔ non-www).
+        bases_to_probe: set[str] = {f"{parsed.scheme}://{parsed.netloc}"}
+        if self.start_urls:
+            orig = urlparse(self.start_urls[0])
+            bases_to_probe.add(f"{orig.scheme}://{orig.netloc}")
+        if self._redirected_base:
+            bases_to_probe.add(self._redirected_base)
 
-        for path in (
+        _json_api_paths = (
             "/api/subcategory/all", "/api/subcategories",
             "/api/categories", "/api/machine-types",
             "/api/products", "/api/machines",
             "/api/stock", "/api/inventory",
-        ):
-            url = f"{base}{path}"
-            yield scrapy.Request(
-                url, callback=self._parse_json_api,
-                errback=self._errback,
-                dont_filter=True,
-                meta={"referer": response.url, "json_api_probe": True},
-                headers={"Accept": "application/json"},
-            )
+        )
+        logger.info(f"[json_api] homepage probe — bases={bases_to_probe} paths={len(_json_api_paths)}")
+
+        for base in bases_to_probe:
+            for path in _json_api_paths:
+                url = f"{base}{path}"
+                yield scrapy.Request(
+                    url, callback=self._parse_json_api,
+                    errback=self._errback,
+                    dont_filter=True,
+                    meta={"referer": response.url, "json_api_probe": True},
+                    headers={"Accept": "application/json"},
+                )
 
     def _parse_json_api(self, response: Response):
         """
