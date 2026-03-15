@@ -274,6 +274,24 @@ class GenericSpider(BaseZoogleSpider):
                     meta={"referer": start_url},
                 )
 
+        # 4. JSON API probe paths — for Next.js / headless-CMS sites that
+        #    expose machine data via internal REST endpoints.
+        for path in (
+            "/api/subcategory/all", "/api/subcategories",
+            "/api/categories", "/api/machine-types",
+            "/api/products", "/api/machines",
+            "/api/stock", "/api/inventory",
+        ):
+            url = base + path
+            if not self._is_visited(url):
+                self._mark_visited(url)
+                yield scrapy.Request(
+                    url, callback=self._parse_json_api,
+                    errback=self._errback,
+                    meta={"referer": start_url, "json_api_probe": True},
+                    headers={"Accept": "application/json"},
+                )
+
     def parse(self, response: Response):
         """
         Homepage entry point.
@@ -281,9 +299,12 @@ class GenericSpider(BaseZoogleSpider):
         Calls _update_base_domain() so that www ↔ non-www (or any hostname)
         redirects are detected on the very first response and self._base_domain
         is updated before any link-following begins.
+        Also probes inline scripts / JS bundles for embedded API credentials
+        (e.g. Supabase anon key) so we can call the backend API directly.
         """
         self._update_base_domain(response)
         yield from self._process_page(response)
+        yield from self._try_extract_api_from_scripts(response)
 
     # ── Phase 1a: Sitemap ─────────────────────────────────────────────────────
 
@@ -1540,3 +1561,345 @@ class GenericSpider(BaseZoogleSpider):
         """True if the text contains a machine-type keyword."""
         from zoogle_crawler.page_analyzer import MACHINE_WORDS
         return bool(set(re.split(r"\W+", text.lower())) & MACHINE_WORDS)
+
+    # ── JSON API detection (for Next.js / headless sites) ─────────────────────
+
+    def _parse_json_api(self, response: Response):
+        """
+        Handle responses from probed JSON API endpoints.
+        Silently ignores non-JSON / error responses so probing never crashes
+        the crawl.  Handles two shapes:
+          • List of subcategories  → schedule /api/product/{slug} per entry
+          • List of machine objects → yield MachineItems directly
+        """
+        # Only process if we got a real JSON response
+        ct = (response.headers.get("Content-Type", b"") or b"").decode("utf-8", errors="ignore").lower()
+        if response.status not in (200,) or not any(t in ct for t in ("json", "javascript")):
+            # If it's a 404/HTML page, silently skip (this is a probe)
+            return
+
+        try:
+            data = json.loads(response.text)
+        except Exception:
+            return
+
+        if not data:
+            return
+
+        logger.info(f"JSON API response at {response.url}: {type(data).__name__} len={len(data) if isinstance(data, (list, dict)) else '?'}")
+        yield from self._extract_json_api_items(data, response)
+
+    def _extract_json_api_items(self, data, response: Response):
+        """
+        Dispatch JSON API data to either subcategory chaining or direct machine
+        item extraction.
+        """
+        base_url = "{0.scheme}://{0.netloc}".format(urlparse(response.url))
+        page_url = response.url
+
+        # Unwrap common envelope shapes: {"data": [...]} or {"results": [...]}
+        if isinstance(data, dict):
+            for key in ("data", "results", "items", "products", "machines", "records"):
+                if isinstance(data.get(key), list):
+                    data = data[key]
+                    break
+            else:
+                # Single machine object?
+                item = self._json_to_machine_item(data, page_url, base_url)
+                if item:
+                    yield item
+                return
+
+        if not isinstance(data, list) or not data:
+            return
+
+        first = data[0] if data else {}
+        if not isinstance(first, dict):
+            return
+
+        # ── Detect subcategory list vs machine list ────────────────────────────
+        # corelmachine /api/subcategory/all returns objects with {_id, title, url, image, order}
+        # but no machine-specific fields like price/year/reference_no.
+        machine_fields = {"price", "year", "reference_no", "capacity", "product_status",
+                          "brand", "model", "location", "description"}
+        is_subcategory_list = (
+            not any(f in first for f in machine_fields)
+            and ("url" in first or "slug" in first)
+            and len(data) <= 100  # subcategory lists are small
+        )
+
+        if is_subcategory_list:
+            # Schedule /api/product/{url} for each subcategory
+            base_api = "{0.scheme}://{0.netloc}".format(urlparse(page_url))
+            for entry in data:
+                slug = entry.get("url") or entry.get("slug") or entry.get("id")
+                if not slug:
+                    continue
+                api_url = f"{base_api}/api/product/{slug}"
+                if not self._is_visited(api_url):
+                    self._mark_visited(api_url)
+                    logger.debug(f"Scheduling subcategory API: {api_url}")
+                    yield scrapy.Request(
+                        api_url,
+                        callback=self._parse_json_api,
+                        errback=self._errback,
+                        headers={"Accept": "application/json"},
+                        meta={"subcategory_slug": slug},
+                    )
+        else:
+            # Machine list — yield items directly and also schedule detail pages
+            for d in data:
+                item = self._json_to_machine_item(d, page_url, base_url)
+                if item:
+                    yield item
+                    # Schedule the HTML detail page too for richer extraction
+                    detail = item.get("machine_url", "")
+                    if detail and detail.startswith("http") and not self._is_visited(detail):
+                        self._mark_visited(detail)
+                        yield scrapy.Request(
+                            detail,
+                            callback=self._parse_detail_page,
+                            errback=self._errback,
+                            meta={"referer": page_url, "partial_item": dict(item)},
+                        )
+
+    def _json_to_machine_item(self, d: dict, page_url: str, base_url: str) -> "MachineItem | None":
+        """
+        Convert a raw JSON dict to a MachineItem.
+        Handles corelmachine.com's product shape:
+          {title, reference_no, capacity, product_status, url,
+           sub_category: {url}, image, year}
+        Also handles generic shapes with price/brand/model/location.
+        """
+        if not isinstance(d, dict):
+            return None
+
+        # Skip sold / unavailable machines
+        status = (d.get("product_status") or d.get("status") or "").lower()
+        if status in ("sold", "unavailable", "inactive", "deleted"):
+            return None
+
+        # ── Title ──────────────────────────────────────────────────────────────
+        title = (d.get("title") or d.get("name") or d.get("model") or "").strip()
+        if not title:
+            return None
+
+        # ── Machine URL ────────────────────────────────────────────────────────
+        # corelmachine pattern: /usedmachinestocklist/{sub_category.url}/{machine.url}
+        raw_url = d.get("url") or d.get("slug") or d.get("link") or ""
+        sub_cat = d.get("sub_category") or {}
+        sub_cat_url = sub_cat.get("url") if isinstance(sub_cat, dict) else None
+
+        if raw_url and not raw_url.startswith("http"):
+            if sub_cat_url:
+                # corelmachine detail URL pattern
+                machine_url = f"{base_url}/usedmachinestocklist/{sub_cat_url}/{raw_url}"
+            else:
+                machine_url = urljoin(base_url + "/", raw_url.lstrip("/"))
+        elif raw_url.startswith("http"):
+            machine_url = raw_url
+        else:
+            machine_url = page_url
+
+        # ── Brand / Model ──────────────────────────────────────────────────────
+        brand = (d.get("brand") or d.get("make") or d.get("manufacturer") or "").strip() or None
+        model = (d.get("model") or "").strip() or None
+        if not brand and not model:
+            brand, model = self._split_brand_model(title)
+
+        # ── Price ──────────────────────────────────────────────────────────────
+        raw_price = d.get("price") or d.get("asking_price") or d.get("sale_price")
+        price = None
+        if raw_price is not None:
+            try:
+                price = float(str(raw_price).replace(",", "").replace(" ", ""))
+            except (ValueError, TypeError):
+                pass
+
+        # ── Location ──────────────────────────────────────────────────────────
+        location = (d.get("location") or d.get("city") or d.get("country") or "").strip() or None
+
+        # ── Description ───────────────────────────────────────────────────────
+        desc_parts = []
+        if d.get("capacity"):
+            desc_parts.append(f"Capacity: {d['capacity']}")
+        if d.get("year"):
+            desc_parts.append(f"Year: {d['year']}")
+        if d.get("reference_no"):
+            desc_parts.append(f"Ref: {d['reference_no']}")
+        if d.get("description"):
+            desc_parts.append(str(d["description"]))
+        description = " | ".join(desc_parts) or None
+
+        # ── Image ──────────────────────────────────────────────────────────────
+        img = d.get("image") or d.get("thumbnail") or d.get("photo") or ""
+        if isinstance(img, list):
+            img = img[0] if img else ""
+        if img and not img.startswith("http"):
+            img = urljoin(base_url + "/", img.lstrip("/"))
+        thumbnail = img or None
+
+        # ── Machine type ──────────────────────────────────────────────────────
+        machine_type = (d.get("category") or d.get("machine_type") or d.get("type") or "").strip() or None
+        if not machine_type:
+            machine_type = self._infer_machine_type_from_text(title)
+
+        item = MachineItem()
+        item["website_id"]    = self.website_id
+        item["crawl_log_id"]  = self.crawl_log_id
+        item["machine_url"]   = machine_url
+        item["machine_type"]  = machine_type
+        item["brand"]         = brand
+        item["model"]         = model
+        item["price"]         = price
+        item["currency"]      = "USD"
+        item["location"]      = location
+        item["description"]   = description
+        item["thumbnail_url"] = thumbnail
+        item["specs"]         = []
+        item["images"]        = [thumbnail] if thumbnail else []
+        return item
+
+    # ── Supabase / SPA API detection ──────────────────────────────────────────
+
+    def _try_extract_api_from_scripts(self, response: Response):
+        """
+        Detect embedded API credentials (Supabase, Firebase, etc.) in:
+          1. Inline <script> tags
+          2. The main JS bundle referenced in <script src="...">
+        If found, yields API requests to fetch machine data directly.
+        If JS bundle URLs are found, schedules them for credential scanning.
+        """
+        try:
+            # 1. Check inline scripts for Supabase patterns
+            for script_text in response.css("script:not([src])::text").getall():
+                if "supabase" in script_text.lower() or "supabase.co" in script_text:
+                    logger.info(f"Supabase credentials found in inline script at {response.url}")
+                    yield from self._try_supabase_from_text(script_text, response.url)
+                    return  # Only need to find one
+
+            # 2. Look for main JS bundle URLs to fetch and scan
+            bundle_patterns = [
+                "script[src*='/assets/index']::attr(src)",
+                "script[src*='/static/js/main']::attr(src)",
+                "script[src*='/static/js/bundle']::attr(src)",
+                "script[src*='app.']::attr(src)",
+            ]
+            for sel in bundle_patterns:
+                src = response.css(sel).get()
+                if src:
+                    bundle_url = urljoin(response.url, src)
+                    if not self._is_visited(bundle_url):
+                        self._mark_visited(bundle_url)
+                        logger.info(f"Scheduling JS bundle scan: {bundle_url}")
+                        yield scrapy.Request(
+                            bundle_url,
+                            callback=self._parse_js_for_api_creds,
+                            errback=self._errback,
+                            meta={"referer": response.url},
+                        )
+                    return  # One bundle is enough
+
+            # 3. Broader: any script with /assets/*.js or /static/js/*.js
+            for src in response.css("script[src]::attr(src)").getall():
+                if re.search(r"/assets/[^/]+\.js$|/static/js/[^/]+\.js$", src):
+                    bundle_url = urljoin(response.url, src)
+                    if not self._is_visited(bundle_url):
+                        self._mark_visited(bundle_url)
+                        logger.info(f"Scheduling JS bundle scan (fallback): {bundle_url}")
+                        yield scrapy.Request(
+                            bundle_url,
+                            callback=self._parse_js_for_api_creds,
+                            errback=self._errback,
+                            meta={"referer": response.url},
+                        )
+                    return  # One bundle is enough
+
+        except Exception as exc:
+            logger.debug(f"API script detection error at {response.url}: {exc}")
+
+    def _parse_js_for_api_creds(self, response: Response):
+        """
+        Search a downloaded JS bundle for embedded API credentials.
+        Currently detects: Supabase project URL + anon JWT.
+        """
+        if response.status != 200:
+            return
+
+        text = response.text
+        logger.info(f"Scanning JS bundle ({len(text)} chars) for API creds: {response.url}")
+
+        referer = response.meta.get("referer", response.url)
+        yield from self._try_supabase_from_text(text, referer)
+
+    def _try_supabase_from_text(self, text: str, page_url: str):
+        """
+        Extract Supabase project URL + anon key from JS/HTML text.
+        If found, schedules REST API requests for common public table names.
+        """
+        # Match Supabase project URL: https://<20-char-id>.supabase.co
+        url_match = re.search(r"https://([a-z0-9]{20})\.supabase\.co", text)
+        # Match JWT anon key (starts with eyJ and is long)
+        key_match = re.search(r'"(eyJ[A-Za-z0-9_\-]{50,}\.[A-Za-z0-9_\-]{50,}\.[A-Za-z0-9_\-]{10,})"', text)
+
+        if not url_match or not key_match:
+            return
+
+        supabase_url = f"https://{url_match.group(1)}.supabase.co"
+        anon_key = key_match.group(1)
+        logger.info(f"Supabase detected! URL={supabase_url} (key length={len(anon_key)})")
+
+        # Try common public table names used by industrial machine sites
+        for table in ("machines_public", "machines", "products", "listings",
+                      "stock", "inventory", "equipment"):
+            api_url = f"{supabase_url}/rest/v1/{table}?select=*&limit=1000"
+            if not self._is_visited(api_url):
+                self._mark_visited(api_url)
+                yield scrapy.Request(
+                    api_url,
+                    callback=self._parse_supabase_api,
+                    errback=self._errback,
+                    headers={
+                        "apikey": anon_key,
+                        "Authorization": f"Bearer {anon_key}",
+                        "Accept": "application/json",
+                    },
+                    meta={"supabase_table": table, "referer": page_url},
+                )
+
+    def _parse_supabase_api(self, response: Response):
+        """
+        Handle a Supabase PostgREST API response.
+        Expects a JSON array of machine objects (with RLS-filtered public view).
+        """
+        table = response.meta.get("supabase_table", "?")
+
+        if response.status == 404 or response.status == 400:
+            # Table doesn't exist — silent skip
+            return
+
+        if response.status != 200:
+            logger.debug(f"Supabase table {table!r} returned {response.status}")
+            return
+
+        try:
+            data = json.loads(response.text)
+        except Exception:
+            return
+
+        if not isinstance(data, list):
+            # PostgREST error envelope {"code": ..., "message": ...}
+            if isinstance(data, dict) and data.get("code"):
+                logger.debug(f"Supabase table {table!r} error: {data.get('message')}")
+            return
+
+        if not data:
+            return
+
+        logger.info(f"Supabase table {table!r}: {len(data)} rows")
+        base_url = "{0.scheme}://{0.netloc}".format(urlparse(response.meta.get("referer", response.url)))
+
+        for row in data:
+            item = self._json_to_machine_item(row, response.url, base_url)
+            if item:
+                yield item
