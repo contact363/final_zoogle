@@ -18,9 +18,12 @@ from app.routers import auth, search, machines, users, admin
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create tables on startup (use Alembic in production)
+    # Create any missing tables
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Add any columns that exist in models but not yet in the DB
+    await auto_migrate()
 
     # Ensure media dir exists
     os.makedirs(settings.MEDIA_DIR, exist_ok=True)
@@ -34,6 +37,61 @@ async def lifespan(app: FastAPI):
     logger.info(f"Zoogle API started — {settings.APP_NAME} v{settings.APP_VERSION}")
     yield
     await engine.dispose()
+
+
+async def auto_migrate():
+    """
+    Safely add any columns that exist in the SQLAlchemy models but are missing
+    from the live database.  Uses ALTER TABLE … ADD COLUMN IF NOT EXISTS so it
+    is idempotent and safe to run on every startup.
+
+    This handles the case where Alembic migrations were not run after a deploy
+    (e.g. Render free tier where manual migration is inconvenient).
+    """
+    from sqlalchemy import text
+
+    migrations = [
+        # 0002 — extended training rules
+        "ALTER TABLE website_training_rules ADD COLUMN IF NOT EXISTS crawl_type           VARCHAR(20)  DEFAULT 'auto'",
+        "ALTER TABLE website_training_rules ADD COLUMN IF NOT EXISTS use_playwright       BOOLEAN      DEFAULT FALSE",
+        "ALTER TABLE website_training_rules ADD COLUMN IF NOT EXISTS api_url              TEXT",
+        "ALTER TABLE website_training_rules ADD COLUMN IF NOT EXISTS api_key              TEXT",
+        "ALTER TABLE website_training_rules ADD COLUMN IF NOT EXISTS api_headers_json     TEXT",
+        "ALTER TABLE website_training_rules ADD COLUMN IF NOT EXISTS api_data_path        VARCHAR(255)",
+        "ALTER TABLE website_training_rules ADD COLUMN IF NOT EXISTS api_pagination_param VARCHAR(50)",
+        "ALTER TABLE website_training_rules ADD COLUMN IF NOT EXISTS api_page_size        INTEGER",
+        "ALTER TABLE website_training_rules ADD COLUMN IF NOT EXISTS field_map_json       TEXT",
+        "ALTER TABLE website_training_rules ADD COLUMN IF NOT EXISTS product_link_pattern TEXT",
+        "ALTER TABLE website_training_rules ADD COLUMN IF NOT EXISTS skip_url_patterns    TEXT",
+        "ALTER TABLE website_training_rules ADD COLUMN IF NOT EXISTS request_delay        NUMERIC(5,2)",
+        "ALTER TABLE website_training_rules ADD COLUMN IF NOT EXISTS max_items            INTEGER",
+        # 0002 — crawl log extra counters
+        "ALTER TABLE crawl_logs ADD COLUMN IF NOT EXISTS machines_updated INTEGER DEFAULT 0",
+        "ALTER TABLE crawl_logs ADD COLUMN IF NOT EXISTS machines_skipped INTEGER DEFAULT 0",
+        # 0003 — stock number and cross-language dedup key
+        "ALTER TABLE machines ADD COLUMN IF NOT EXISTS stock_number VARCHAR(100)",
+        "ALTER TABLE machines ADD COLUMN IF NOT EXISTS dedup_key    VARCHAR(64)",
+    ]
+
+    index_migrations = [
+        "CREATE INDEX IF NOT EXISTS ix_machines_stock_website ON machines (stock_number, website_id) WHERE stock_number IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS ix_machines_dedup_key     ON machines (dedup_key)                WHERE dedup_key    IS NOT NULL",
+    ]
+
+    async with engine.begin() as conn:
+        for stmt in migrations:
+            try:
+                await conn.execute(text(stmt))
+            except Exception as exc:
+                logger.warning(f"auto_migrate skipped: {exc!s:.120}")
+
+        for stmt in index_migrations:
+            try:
+                await conn.execute(text(stmt))
+            except Exception as exc:
+                logger.debug(f"auto_migrate index skipped: {exc!s:.80}")
+
+    logger.info("auto_migrate: schema is up to date")
 
 
 async def reset_stuck_crawls():
