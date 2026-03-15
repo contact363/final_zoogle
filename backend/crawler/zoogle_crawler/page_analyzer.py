@@ -177,11 +177,20 @@ def is_worth_following(url: str) -> bool:
     return score_url(url) >= 1
 
 
+def _strip_www(domain: str) -> str:
+    """Remove leading 'www.' so www.foo.com and foo.com are treated identically."""
+    return domain[4:] if domain.startswith("www.") else domain
+
+
 def same_domain(url: str, base_domain: str) -> bool:
-    """True if *url* belongs to the same (sub)domain as *base_domain*."""
+    """
+    True if *url* belongs to the same (sub)domain as *base_domain*.
+    Ignores the www. prefix so that a www→non-www (or non-www→www) redirect
+    does not break link-following for the whole crawl.
+    """
     parsed = urlparse(url)
-    netloc = parsed.netloc.lower()
-    base = base_domain.lower()
+    netloc = _strip_www(parsed.netloc.lower())
+    base   = _strip_www(base_domain.lower())
     return netloc == base or netloc.endswith("." + base)
 
 

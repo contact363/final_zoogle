@@ -208,7 +208,20 @@ class GenericSpider(BaseZoogleSpider):
                 )
 
     def parse(self, response: Response):
-        """Homepage: process the page and follow all links."""
+        """
+        Homepage entry point.
+
+        Also updates self._base_domain from the *actual* response URL so that
+        www ↔ non-www redirects (e.g. www.site.com → site.com) don't break the
+        same_domain() check for every link on the site.
+        """
+        actual = urlparse(response.url).netloc.lower()
+        if actual and actual != self._base_domain:
+            from zoogle_crawler.page_analyzer import _strip_www
+            canonical = _strip_www(actual)
+            if canonical != _strip_www(self._base_domain):
+                logger.info(f"Base domain redirect: {self._base_domain} → {canonical}")
+            self._base_domain = canonical
         yield from self._process_page(response)
 
     # ── Phase 1a: Sitemap ─────────────────────────────────────────────────────
@@ -283,23 +296,29 @@ class GenericSpider(BaseZoogleSpider):
             category = self._extract_category(response)
 
             # Try structured card extraction first
-            cards_found = list(self._extract_machine_cards(response, category))
-            yield from cards_found
+            # _extract_machine_cards yields both MachineItem objects and
+            # scrapy.Request objects (for detail-page scheduling).
+            # Separate them so we can check whether any *items* were found.
+            machine_items_found = []
+            for obj in self._extract_machine_cards(response, category):
+                yield obj
+                from zoogle_crawler.items import MachineItem
+                if isinstance(obj, MachineItem):
+                    machine_items_found.append(obj)
 
             # Try JSON-LD on every page
             jsonld_items = list(self._extract_jsonld(response))
             yield from jsonld_items
 
-            if not cards_found and not jsonld_items:
+            if not machine_items_found and not jsonld_items:
                 if self._looks_like_detail(response):
-                    # Page has an h1 — try CSS detail extraction (handles machine
-                    # detail pages that scored too low to reach _parse_detail_page)
+                    # Page has machine-related signals — try CSS detail extraction
+                    # (handles detail pages that scored too low for _parse_detail_page)
                     logger.debug(f"No cards/JSON-LD on {response.url} — trying detail CSS extraction")
                     yield from self._parse_detail_css(response)
                 else:
-                    # No structured content found at all — do link-based machine
-                    # discovery: find links whose text/URL contains machine keywords
-                    # and schedule them as detail page requests.
+                    # No structured content found — do link-based machine discovery:
+                    # follow links whose text/URL contains machine keywords.
                     yield from self._schedule_machine_links(response)
 
             yield from self._follow_all_links(response)
@@ -587,8 +606,37 @@ class GenericSpider(BaseZoogleSpider):
             logger.warning(f"JS render pipeline error at {response.url}: {exc}")
 
     def _looks_like_detail(self, response: Response) -> bool:
-        """A page 'looks like a detail page' if it has any h1 heading."""
-        return bool(response.css("h1").get())
+        """
+        True if the page looks like a machine detail or listing page.
+        Requires an h1 PLUS at least one machine-relevance signal:
+          - a machine keyword in the heading/URL text
+          - a price element
+          - a spec table or definition list
+          - structured machine data (itemprop, JSON-LD)
+        This prevents extracting "About Us" / "Contact" pages as machines.
+        """
+        if not response.css("h1").get():
+            return False
+
+        # Fast keyword scan across headings + URL
+        heading_text = " ".join(
+            response.css("h1 *::text, h1::text, h2 *::text, h2::text").getall()
+        ).lower()
+        url_lower = response.url.lower()
+        combined = heading_text + " " + url_lower
+
+        if any(w in combined for w in MACHINE_WORDS):
+            return True
+        # Price element present → looks like a product page
+        if response.css("[itemprop='price'], .price, [class*='price'], [data-price]").get():
+            return True
+        # Spec table or definition list → product detail page
+        if response.css("table.specs, table.specifications, dl, .specs, .specifications").get():
+            return True
+        # JSON-LD or microdata → structured product data
+        if response.css("script[type='application/ld+json'], [itemtype]").get():
+            return True
+        return False
 
     # ── JSON-LD extraction ────────────────────────────────────────────────────
 
