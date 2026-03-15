@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 # Bump this every deploy so the crawl log shows which version is running.
 # If you see this in the crawl log, the latest code is active on Render.
-SPIDER_VERSION = "2026-03-15-v6"
+SPIDER_VERSION = "2026-03-15-v7"   # scalable rule system — no per-site spiders
 
 # Maximum number of URLs to keep in the visited set.
 # Once exceeded, the oldest 10 % are removed to free memory.
@@ -139,8 +139,9 @@ class GenericSpider(BaseZoogleSpider):
         )
 
         # ── Training rules ────────────────────────────────────────────────────
-        # Passed as a JSON string by crawl_tasks when the admin has configured
-        # per-website selectors.  Empty dict = auto-discovery (default).
+        # Full rule set (CSS selectors + API config + URL patterns + delays).
+        # Passed as a JSON string by crawl_tasks.  One spider handles all
+        # websites — behaviour is controlled entirely by these rules.
         self._rules: dict = {}
         if training_rules:
             try:
@@ -153,6 +154,58 @@ class GenericSpider(BaseZoogleSpider):
                 )
             except Exception as exc:
                 logger.warning(f"Could not parse training_rules JSON: {exc}")
+
+        # ── Extended rule helpers ─────────────────────────────────────────────
+        # Crawl mode: auto | html | api | playwright
+        self._crawl_type: str = self._rules.get("crawl_type", "auto")
+
+        # Compiled skip-URL patterns (built-in + site-specific)
+        _builtin_skips = [
+            r"/contact", r"/about", r"/blog", r"/news", r"/faq",
+            r"/privacy", r"/terms", r"/login", r"/register",
+            r"/cart", r"/checkout", r"/account", r"/sitemap\.html",
+        ]
+        _extra_skips_raw = self._rules.get("skip_url_patterns")
+        _extra_skips: list = []
+        if _extra_skips_raw:
+            try:
+                _extra_skips = json.loads(_extra_skips_raw)
+            except Exception:
+                pass
+        self._skip_patterns: list = [
+            re.compile(p, re.I) for p in (_builtin_skips + _extra_skips)
+        ]
+
+        # Optional regex that product detail URLs must match
+        _plp = self._rules.get("product_link_pattern")
+        self._product_link_re = re.compile(_plp, re.I) if _plp else None
+
+        # Field mapping for API responses: API key → MachineItem field
+        _fmj = self._rules.get("field_map_json")
+        self._field_map: dict = {}
+        if _fmj:
+            try:
+                self._field_map = json.loads(_fmj)
+            except Exception:
+                pass
+
+        # Per-site download delay override (applied in start_requests)
+        _delay = self._rules.get("request_delay")
+        if _delay is not None:
+            try:
+                self.custom_settings = dict(self.custom_settings)   # make mutable copy
+                self.custom_settings["DOWNLOAD_DELAY"] = float(_delay)
+            except (TypeError, ValueError):
+                pass
+
+        # Per-site max items override
+        _max = self._rules.get("max_items")
+        if _max is not None:
+            try:
+                self.custom_settings = dict(self.custom_settings)
+                self.custom_settings["CLOSESPIDER_ITEMCOUNT"] = int(_max)
+            except (TypeError, ValueError):
+                pass
 
         # Tracks the actual host after any www/non-www redirect (e.g. https://www.example.com)
         # Set by _update_base_domain when a redirect is detected.
@@ -230,7 +283,21 @@ class GenericSpider(BaseZoogleSpider):
         if not start_url:
             return
 
-        logger.info(f"[SPIDER v={SPIDER_VERSION}] start_requests — url={start_url!r}")
+        logger.info(
+            f"[SPIDER v={SPIDER_VERSION}] start_requests — url={start_url!r} "
+            f"crawl_type={self._crawl_type!r}"
+        )
+
+        # ── API-mode shortcut ─────────────────────────────────────────────────
+        # If the admin configured a direct REST endpoint we probe it immediately
+        # and ALSO continue with normal HTML crawl as a fallback.
+        _api_url = self._rules.get("api_url")
+        if _api_url:
+            logger.info(f"Direct API URL configured: {_api_url!r} — scheduling first page")
+            yield from self._build_direct_api_requests(_api_url, start_url)
+            if self._crawl_type == "api":
+                # Pure API mode — skip all HTML crawling
+                return
 
         # 1. Homepage
         yield scrapy.Request(start_url, callback=self.parse, errback=self._errback)
@@ -2013,3 +2080,246 @@ class GenericSpider(BaseZoogleSpider):
             item = self._json_to_machine_item(row, response.url, base_url)
             if item:
                 yield item
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # SCALABLE RULE SYSTEM — added for 500-website architecture
+    # ═════════════════════════════════════════════════════════════════════════
+
+    # ── URL filtering ─────────────────────────────────────────────────────────
+
+    def _should_skip_url(self, url: str) -> bool:
+        """
+        Return True if this URL should be skipped entirely.
+
+        Checks:
+          1. Built-in skip_url() heuristics (contact, login, assets, etc.)
+          2. Site-specific skip_url_patterns from training rules (regex list).
+        """
+        from zoogle_crawler.page_analyzer import skip_url as _builtin_skip
+        if _builtin_skip(url):
+            return True
+        for pat in self._skip_patterns:
+            if pat.search(url):
+                return True
+        return False
+
+    def _is_product_url(self, url: str) -> bool:
+        """
+        Return True if this URL looks like a machine/product detail page.
+
+        If product_link_pattern is configured, ONLY URLs matching that regex
+        are accepted as detail pages.  Otherwise falls back to the built-in
+        is_detail_url() scorer from page_analyzer.
+        """
+        if self._product_link_re:
+            return bool(self._product_link_re.search(url))
+        from zoogle_crawler.page_analyzer import is_detail_url
+        return is_detail_url(url)
+
+    # ── Content validation ────────────────────────────────────────────────────
+
+    def _validate_item(self, item: MachineItem) -> bool:
+        """
+        Drop items that are clearly not machines.
+
+        A valid machine item must have:
+          • machine_url
+          • At least one of: title (model), brand
+          • At least one of: image URL, spec dict with entries
+
+        Items that fail this check are silently dropped (not yielded).
+        """
+        if not item.get("machine_url"):
+            return False
+
+        has_identity = bool(item.get("model") or item.get("brand"))
+        if not has_identity:
+            return False
+
+        has_content = bool(
+            (item.get("images") and len(item["images"]) > 0)
+            or (item.get("specs") and len(item["specs"]) > 0)
+            or item.get("description")
+            or item.get("price")
+        )
+        if not has_content:
+            return False
+
+        return True
+
+    # ── Field mapping for REST API responses ──────────────────────────────────
+
+    def _resolve_nested(self, data: dict, dotpath: str):
+        """
+        Walk a dot-separated path in a nested dict.
+        E.g. _resolve_nested(row, "brands.name") → row["brands"]["name"]
+        Returns None if any key is missing.
+        """
+        parts = dotpath.split(".")
+        cur = data
+        for p in parts:
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(p)
+        return cur
+
+    def _apply_field_map(self, row: dict, site_base: str) -> MachineItem | None:
+        """
+        Convert a REST API row to MachineItem using self._field_map.
+
+        field_map_json format (admin-configured):
+          {"model_name": "model", "brands.name": "brand", "price_inr": "price", ...}
+
+        Keys are dot-paths in the API row, values are MachineItem field names.
+        Falls back to self._json_to_machine_item() for unmapped fields.
+        """
+        if not self._field_map:
+            return self._json_to_machine_item(row, site_base, site_base)
+
+        item = MachineItem()
+        item["website_id"]     = self.website_id
+        item["website_source"] = self._base_domain
+        item["currency"]       = "USD"
+        item["specs"]          = {}
+        item["images"]         = []
+
+        for api_key, machine_field in self._field_map.items():
+            val = self._resolve_nested(row, api_key)
+            if val is None:
+                continue
+            if machine_field in ("price",):
+                try:
+                    item["price"] = float(str(val).replace(",", "").strip())
+                except (ValueError, TypeError):
+                    pass
+            elif machine_field == "images":
+                if isinstance(val, list):
+                    item["images"] = [str(v) for v in val if v]
+                elif val:
+                    item["images"] = [str(val)]
+            elif machine_field == "specs":
+                if isinstance(val, dict):
+                    item["specs"] = val
+            elif machine_field in MachineItem.fields:
+                item[machine_field] = str(val).strip() if val else None
+
+        # Build machine_url if not provided by map
+        if not item.get("machine_url"):
+            slug = row.get("slug") or row.get("sku") or row.get("id")
+            if slug:
+                item["machine_url"] = f"{site_base}/machine/{slug}"
+            else:
+                return None
+
+        if not self._validate_item(item):
+            return None
+        return item
+
+    # ── Direct REST API pagination ────────────────────────────────────────────
+
+    def _build_direct_api_requests(self, api_url: str, referer: str):
+        """
+        Build the first paginated request(s) to a directly-configured REST API.
+        Subsequent pages are requested by _parse_direct_api_response() itself.
+        """
+        import json as _json
+        page_size = int(self._rules.get("api_page_size") or 100)
+        param     = self._rules.get("api_pagination_param") or "page"
+        first_url = f"{api_url}?{param}=1&limit={page_size}" if "?" not in api_url else api_url
+
+        headers = {"Accept": "application/json"}
+        _api_key = self._rules.get("api_key")
+        if _api_key:
+            headers["Authorization"] = f"Bearer {_api_key}"
+        _extra_headers_raw = self._rules.get("api_headers_json")
+        if _extra_headers_raw:
+            try:
+                headers.update(_json.loads(_extra_headers_raw))
+            except Exception:
+                pass
+
+        yield scrapy.Request(
+            first_url,
+            callback=self._parse_direct_api_response,
+            errback=self._errback,
+            headers=headers,
+            meta={
+                "referer": referer,
+                "api_page": 1,
+                "api_page_size": page_size,
+                "api_param": param,
+                "api_base_url": api_url,
+                "api_headers": headers,
+            },
+            dont_filter=True,
+        )
+
+    def _parse_direct_api_response(self, response):
+        """
+        Parse a direct REST API response (configured via api_url training rule).
+
+        Handles:
+          • JSON arrays at root level
+          • Nested JSON at api_data_path (e.g. "data", "results.items")
+          • Automatic pagination until empty page is returned
+        """
+        import json as _json
+
+        if response.status not in (200, 201):
+            logger.warning(f"Direct API returned {response.status}: {response.url}")
+            return
+
+        try:
+            payload = _json.loads(response.text)
+        except Exception as exc:
+            logger.warning(f"Direct API JSON parse failed: {exc} url={response.url}")
+            return
+
+        # Extract results array using configured data path
+        data_path = self._rules.get("api_data_path") or ""
+        if data_path:
+            rows = self._resolve_nested(payload, data_path) if isinstance(payload, dict) else None
+        else:
+            rows = payload if isinstance(payload, list) else (
+                payload.get("results") or payload.get("data") or payload.get("items")
+                or payload.get("machines") or payload.get("products")
+                if isinstance(payload, dict) else None
+            )
+
+        if not rows or not isinstance(rows, list):
+            logger.info(f"Direct API: no rows at path={data_path!r} url={response.url}")
+            return
+
+        logger.info(f"Direct API: {len(rows)} rows from {response.url}")
+
+        site_base = "{0.scheme}://{0.netloc}".format(urlparse(response.url))
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            item = self._apply_field_map(row, site_base)
+            if item and self._validate_item(item):
+                yield item
+
+        # Paginate: if we got a full page, fetch the next one
+        page_size = response.meta.get("api_page_size", 100)
+        if len(rows) >= page_size:
+            page      = response.meta.get("api_page", 1) + 1
+            param     = response.meta.get("api_param", "page")
+            api_base  = response.meta.get("api_base_url", "")
+            headers   = response.meta.get("api_headers", {})
+
+            next_url = f"{api_base}?{param}={page}&limit={page_size}"
+            if not self._is_visited(next_url):
+                self._mark_visited(next_url)
+                yield scrapy.Request(
+                    next_url,
+                    callback=self._parse_direct_api_response,
+                    errback=self._errback,
+                    headers=headers,
+                    meta={
+                        **response.meta,
+                        "api_page": page,
+                    },
+                    dont_filter=True,
+                )

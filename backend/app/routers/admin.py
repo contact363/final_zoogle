@@ -282,6 +282,109 @@ async def stop_crawl(
     return {"task_id": task_id, "status": "stopped"}
 
 
+@router.post("/crawl/schedule")
+async def start_scheduled_crawl(
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """
+    Start a 24-hour distributed crawl schedule.
+
+    All active+enabled websites are crawled sequentially, spread evenly
+    across 24 hours.  Sites not crawled recently run first.
+
+    Uses Celery ETA tasks when available; falls back to a background thread.
+    """
+    try:
+        from tasks.scheduler import distributed_crawl_task
+        task = distributed_crawl_task.delay()
+        return {
+            "task_id": task.id,
+            "status": "scheduled",
+            "mode": "celery",
+            "message": "24-hour distributed crawl schedule started via Celery",
+        }
+    except Exception:
+        import asyncio
+        from tasks.scheduler import run_scheduled_crawls_direct
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, run_scheduled_crawls_direct
+        )
+        return {"status": "scheduled", **result}
+
+
+@router.get("/crawl/report")
+async def crawl_report(
+    website_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """
+    Return the crawl report for all (or one) website.
+
+    Each entry shows: website name, start/end time, duration, machines found,
+    new insertions, updates, skips, and error summary.
+    """
+    from tasks.scheduler import generate_crawl_report
+    from sqlalchemy.orm import Session as SyncSession
+    from sqlalchemy import create_engine
+    from app.config import settings as _settings
+
+    # generate_crawl_report is sync SQLAlchemy — run in thread executor
+    import asyncio
+
+    def _report():
+        engine  = create_engine(_settings.DATABASE_SYNC_URL, pool_pre_ping=True)
+        Sess    = __import__("sqlalchemy.orm", fromlist=["sessionmaker"]).sessionmaker(bind=engine)
+        sync_db = Sess()
+        try:
+            return generate_crawl_report(sync_db, website_id)
+        finally:
+            sync_db.close()
+            engine.dispose()
+
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _report)
+    return {"count": len(data), "reports": data}
+
+
+@router.get("/crawl/schedule/preview")
+async def preview_crawl_schedule(
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """
+    Preview the 24-hour schedule without starting it.
+    Returns a list of {website_id, website_name, scheduled_at} entries.
+    """
+    from tasks.scheduler import compute_crawl_schedule
+
+    result = await db.execute(
+        select(Website)
+        .where(Website.is_active == True, Website.crawl_enabled == True)
+        .order_by(Website.last_crawled_at.asc().nulls_first())
+    )
+    websites = result.scalars().all()
+    schedule = compute_crawl_schedule(websites)
+
+    n  = len(websites)
+    window = 24 * 3600
+    interval = window / n if n > 1 else 0
+
+    return {
+        "total_websites": n,
+        "window_hours": 24,
+        "interval_minutes": round(interval / 60, 1),
+        "schedule": [
+            {
+                "website_id": wid,
+                "scheduled_at": eta.isoformat(),
+            }
+            for wid, eta in schedule
+        ],
+    }
+
+
 @router.get("/crawl/diagnose/{website_id}")
 async def diagnose_crawl(
     website_id: int,

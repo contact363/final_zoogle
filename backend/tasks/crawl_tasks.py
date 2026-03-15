@@ -2,11 +2,18 @@
 Celery tasks that launch Scrapy crawls in a subprocess and record logs.
 run_crawl_direct() is a Redis-free fallback for when Celery is unavailable.
 
-Self-healing approach:
-  1. Pre-flight check: run 'scrapy list' to verify spider loads before crawling
-  2. Full scrapy output is stored in crawl_log.log_output on every run
-  3. Errors are parsed from output and stored in crawl_log.error_details
-  4. machine_count on Website is updated after every crawl
+Architecture
+────────────
+• ONE spider ("generic") handles ALL websites.
+• Per-website behaviour is controlled by WebsiteTrainingRules rows in the DB.
+• No dedicated per-site spider files — the rule system makes that unnecessary.
+
+Self-healing
+────────────
+  1. Pre-flight: run 'scrapy list' to verify spider loads before crawling.
+  2. Full scrapy output is stored in crawl_log.log_output on every run.
+  3. Errors are parsed from output and stored in crawl_log.error_details.
+  4. machine_count on Website is updated after every crawl.
 """
 import json
 import subprocess
@@ -62,7 +69,6 @@ def _preflight_check() -> tuple[bool, str]:
             env=_build_subprocess_env(),
         )
         combined = (result.stdout or "") + (result.stderr or "")
-        # Accept any output that lists at least one spider (generic or dedicated)
         if result.returncode != 0 or not result.stdout.strip():
             return False, f"Spider pre-flight FAILED (returncode={result.returncode}):\n{combined}"
         return True, "Spider loaded OK"
@@ -71,23 +77,61 @@ def _preflight_check() -> tuple[bool, str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Run scrapy subprocess
+# Build full training-rules payload for the spider
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _select_spider(start_url: str) -> str:
-    """
-    Pick the best Scrapy spider for a given start URL.
-    Dedicated spiders take priority over the generic one because they use
-    site-specific extraction logic (e.g. Playwright-aware CSR handling).
-    """
-    from urllib.parse import urlparse
-    domain = urlparse(start_url).netloc.lower().lstrip("www.")
-    _DEDICATED = {
-        "corelmachine.com":   "corelmachine",
-        "zatpatmachines.com": "zatpatmachines",
-    }
-    return _DEDICATED.get(domain, "generic")
+_RULE_FIELDS = (
+    # HTML selectors
+    "listing_selector", "title_selector", "url_selector",
+    "description_selector", "image_selector", "price_selector",
+    "category_selector", "pagination_selector",
+    # Crawl mode
+    "crawl_type", "use_playwright",
+    # API config
+    "api_url", "api_key", "api_headers_json", "api_data_path",
+    "api_pagination_param", "api_page_size", "field_map_json",
+    # URL filtering
+    "product_link_pattern", "skip_url_patterns",
+    # Request control
+    "request_delay", "max_items",
+)
 
+
+def _load_training_rules(db: Session, website_id: int) -> str | None:
+    """
+    Load all rule fields from WebsiteTrainingRules for this website.
+    Returns a compact JSON string (or None if no rules / all empty).
+    """
+    from app.models.training_rules import WebsiteTrainingRules
+
+    row = db.query(WebsiteTrainingRules).filter(
+        WebsiteTrainingRules.website_id == website_id
+    ).first()
+
+    if not row:
+        logger.info(f"No training rules for website {website_id} — using auto-discovery")
+        return None
+
+    rules = {}
+    for field in _RULE_FIELDS:
+        val = getattr(row, field, None)
+        if val is not None:
+            # Numeric types (Decimal) → convert to native Python type
+            if hasattr(val, "__float__"):
+                val = float(val)
+            rules[field] = val
+
+    if not rules:
+        logger.info(f"Training rules row exists for website {website_id} but all fields empty")
+        return None
+
+    logger.info(f"Training rules for website {website_id}: {list(rules.keys())}")
+    return json.dumps(rules)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Run scrapy subprocess — always uses the "generic" spider
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _run_scrapy(
     website_id: int,
@@ -96,13 +140,13 @@ def _run_scrapy(
     training_rules_json: str | None = None,
 ) -> subprocess.CompletedProcess:
     """
-    Run scrapy — capture all output directly (no --logfile).
-    Full stdout+stderr captured so we can store it and parse stats from it.
-    Passes training_rules as a JSON string if the website has been trained.
+    Launch: scrapy crawl generic -a website_id=N -a start_url=URL ...
+
+    Always uses the ONE generic spider.  Per-site behaviour is injected via
+    the training_rules argument (JSON string) which the spider reads at init.
     """
-    spider_name = _select_spider(start_url)
     cmd = [
-        sys.executable, "-m", "scrapy", "crawl", spider_name,
+        sys.executable, "-m", "scrapy", "crawl", "generic",
         "-a", f"website_id={website_id}",
         "-a", f"start_url={start_url}",
         "-a", f"crawl_log_id={crawl_log_id}",
@@ -111,6 +155,7 @@ def _run_scrapy(
     ]
     if training_rules_json:
         cmd += ["-a", f"training_rules={training_rules_json}"]
+
     return subprocess.run(
         cmd,
         cwd=_CRAWLER_DIR,
@@ -129,14 +174,12 @@ def _parse_scrapy_stats(output: str) -> dict:
     """Parse Scrapy's final stats block from combined stdout+stderr."""
     stats = {}
 
-    # Scrapy dumps: {'item_scraped_count': 42, 'downloader/request_count': 100, ...}
     block_match = re.search(r"Dumping Scrapy stats.*?(\{.*?\})", output, re.DOTALL)
     if block_match:
         block = block_match.group(1)
         for m in re.finditer(r"'([\w/]+)':\s*(\d+)", block):
             stats[m.group(1)] = int(m.group(2))
 
-    # Fallback: scan lines
     if not stats:
         for line in output.split("\n"):
             for key in ("item_scraped_count", "spider_exceptions_count",
@@ -157,12 +200,14 @@ def _extract_error_summary(output: str) -> str | None:
     lines = output.split("\n")
 
     for i, line in enumerate(lines):
-        if any(m in line for m in ["Traceback", "ERROR", "CRITICAL", "Error:", "Exception:", "ImportError", "ModuleNotFoundError"]):
-            # Grab this line + next 5 lines for context
-            error_lines.extend(lines[i:i+6])
+        if any(m in line for m in [
+            "Traceback", "ERROR", "CRITICAL", "Error:", "Exception:",
+            "ImportError", "ModuleNotFoundError",
+        ]):
+            error_lines.extend(lines[i:i + 6])
 
     if error_lines:
-        return "\n".join(dict.fromkeys(error_lines))[:3000]  # deduplicate + cap
+        return "\n".join(dict.fromkeys(error_lines))[:3000]
 
     return None
 
@@ -174,12 +219,11 @@ def _extract_error_summary(output: str) -> str | None:
 def _execute_crawl(website_id: int, db: Session) -> None:
     """
     Full crawl lifecycle:
-      preflight → create log → run scrapy → parse output → update DB
+      preflight → load rules → create log → run scrapy → parse output → update DB
     """
     from app.models.website import Website
     from app.models.crawl_log import CrawlLog
     from app.models.machine import Machine
-    from app.models.training_rules import WebsiteTrainingRules
     from sqlalchemy import func
 
     website = db.query(Website).filter(Website.id == website_id).first()
@@ -187,30 +231,10 @@ def _execute_crawl(website_id: int, db: Session) -> None:
         logger.error(f"Website {website_id} not found")
         return
 
-    # Load training rules (if the admin has configured them for this website)
-    rules_row = db.query(WebsiteTrainingRules).filter(
-        WebsiteTrainingRules.website_id == website_id
-    ).first()
-    training_rules_json: str | None = None
-    if rules_row:
-        rules_dict = {
-            k: getattr(rules_row, k)
-            for k in (
-                "listing_selector", "title_selector", "url_selector",
-                "description_selector", "image_selector", "price_selector",
-                "category_selector", "pagination_selector",
-            )
-            if getattr(rules_row, k)
-        }
-        if rules_dict:
-            training_rules_json = json.dumps(rules_dict)
-            logger.info(f"Training rules loaded for website {website_id}: {list(rules_dict.keys())}")
-        else:
-            logger.info(f"Training rules row exists for website {website_id} but all selectors are empty — using auto-discovery")
-    else:
-        logger.info(f"No training rules for website {website_id} — using auto-discovery")
+    # Load full training rules (all fields) for this website
+    training_rules_json = _load_training_rules(db, website_id)
 
-    # ── Pre-flight ────────────────────────────────────────────────────────────
+    # ── Pre-flight ─────────────────────────────────────────────────────────
     ok, preflight_msg = _preflight_check()
     logger.info(f"Pre-flight: {preflight_msg}")
 
@@ -226,7 +250,6 @@ def _execute_crawl(website_id: int, db: Session) -> None:
     db.commit()
 
     if not ok:
-        # Spider can't even load — fail immediately with the real error
         crawl_log.status = "error"
         crawl_log.error_details = preflight_msg
         crawl_log.log_output = preflight_msg
@@ -236,8 +259,8 @@ def _execute_crawl(website_id: int, db: Session) -> None:
         logger.error(f"Pre-flight failed for website {website_id}: {preflight_msg}")
         return
 
-    # ── Run scrapy ────────────────────────────────────────────────────────────
-    logger.info(f"Crawl start: website={website_id} url={website.url}")
+    # ── Run scrapy ─────────────────────────────────────────────────────────
+    logger.info(f"Crawl start: website={website_id} url={website.url} spider=generic")
 
     result = _run_scrapy(website_id, website.url, crawl_log.id, training_rules_json)
     combined = (result.stdout or "") + (result.stderr or "")
@@ -247,25 +270,22 @@ def _execute_crawl(website_id: int, db: Session) -> None:
         f"output={len(combined)} chars"
     )
 
-    # ── Parse results ─────────────────────────────────────────────────────────
+    # ── Parse results ──────────────────────────────────────────────────────
     stats = _parse_scrapy_stats(combined)
-    machines_found = stats.get("item_scraped_count", 0)
-    requests_made  = stats.get("downloader/request_count", 0)
+    machines_found   = stats.get("item_scraped_count", 0)
+    machines_dropped = stats.get("item_dropped_count", 0)
+    requests_made    = stats.get("downloader/request_count", 0)
 
-    # Determine status
     status = "success" if result.returncode == 0 else "error"
-
-    # Always extract ERROR/WARNING lines from the full output
     inline_errors = _extract_error_summary(combined)
 
     if status == "error":
         error_summary = inline_errors or f"[returncode={result.returncode}]\n{combined[-1500:]}"
     elif machines_found == 0:
-        # Show extracted errors if any, plus a stats summary for debugging
         stats_snippet = (
             f"requests={requests_made} "
             f"items={machines_found} "
-            f"dropped={stats.get('item_dropped_count', 0)} "
+            f"dropped={machines_dropped} "
             f"errors={stats.get('spider_exceptions_count', 0)}"
         )
         if inline_errors:
@@ -275,26 +295,27 @@ def _execute_crawl(website_id: int, db: Session) -> None:
     else:
         error_summary = None
 
-    # ── Update crawl log ──────────────────────────────────────────────────────
-    crawl_log.status = status
-    crawl_log.machines_found = machines_found
-    crawl_log.machines_new = machines_found
-    crawl_log.errors_count = stats.get("spider_exceptions_count", 0)
-    crawl_log.error_details = error_summary
-    crawl_log.log_output = combined[-5000:]   # store last 5000 chars of full output
-    crawl_log.finished_at = datetime.now(timezone.utc)
+    # ── Update crawl log ───────────────────────────────────────────────────
+    crawl_log.status          = status
+    crawl_log.machines_found  = machines_found
+    crawl_log.machines_new    = machines_found       # pipeline sets real new/updated counts
+    crawl_log.machines_skipped = machines_dropped
+    crawl_log.errors_count    = stats.get("spider_exceptions_count", 0)
+    crawl_log.error_details   = error_summary
+    crawl_log.log_output      = combined[-5000:]
+    crawl_log.finished_at     = datetime.now(timezone.utc)
     db.commit()
 
-    # ── Update website ────────────────────────────────────────────────────────
+    # ── Update website ─────────────────────────────────────────────────────
     count = db.query(func.count(Machine.id)).filter(Machine.website_id == website_id).scalar()
-    website.machine_count = count or 0
-    website.crawl_status = status
+    website.machine_count   = count or 0
+    website.crawl_status    = status
     website.last_crawled_at = crawl_log.finished_at
     db.commit()
 
     logger.info(
         f"Crawl complete: website={website_id} status={status} "
-        f"scraped={machines_found} total_in_db={website.machine_count}"
+        f"scraped={machines_found} dropped={machines_dropped} total_in_db={website.machine_count}"
     )
 
 
@@ -327,6 +348,7 @@ def crawl_website_task(self, website_id: int):
 
 @celery_app.task(name="tasks.crawl_tasks.crawl_all_websites_task")
 def crawl_all_websites_task():
+    """Queue every active+enabled website for crawling (immediate, no schedule)."""
     from app.models.website import Website
     db = get_sync_db()
     try:
