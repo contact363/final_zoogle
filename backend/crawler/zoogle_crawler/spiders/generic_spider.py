@@ -49,7 +49,7 @@ from zoogle_crawler.items import MachineItem
 from zoogle_crawler.spiders.base_spider import BaseZoogleSpider
 from zoogle_crawler.page_analyzer import (
     skip_url, score_url, is_detail_url, is_listing_url, is_worth_following,
-    same_domain, looks_like_pagination_url, build_page_url,
+    same_domain, looks_like_pagination_url, build_page_url, _strip_www,
     MACHINE_WORDS,
     NAV_SELECTORS, CARD_SELECTORS,
     CARD_TITLE_SELECTORS, CARD_PRICE_SELECTORS, CARD_LOCATION_SELECTORS,
@@ -108,7 +108,17 @@ class GenericSpider(BaseZoogleSpider):
         self.website_id  = int(website_id)  if website_id   else None
         self.crawl_log_id = int(crawl_log_id) if crawl_log_id else None
         self.start_urls  = [start_url] if start_url else []
-        self._base_domain = urlparse(start_url).netloc if start_url else ""
+
+        # Store original netloc for logging, then normalise immediately so
+        # same_domain() comparisons work even before the homepage response
+        # arrives (i.e. while sitemaps/listing paths are still in flight).
+        self._original_domain = urlparse(start_url).netloc.lower() if start_url else ""
+        self._base_domain     = _strip_www(self._original_domain)
+        logger.info(
+            f"Crawler init — original domain: {self._original_domain!r}, "
+            f"normalized base domain: {self._base_domain!r}"
+        )
+
         # Deque for O(1) insertion + ordered eviction
         self._visited_order: deque[str] = deque()
         self._visited: set[str] = set()
@@ -136,6 +146,34 @@ class GenericSpider(BaseZoogleSpider):
 
     def _is_visited(self, url: str) -> bool:
         return url in self._visited
+
+    # ── Domain redirect detection ─────────────────────────────────────────────
+
+    def _update_base_domain(self, response) -> None:
+        """
+        Detect www ↔ non-www (or any hostname) redirect and update
+        self._base_domain so that same_domain() keeps working for every
+        subsequent link on the site.
+
+        Logs three values on first redirect so the crawl is auditable:
+          • original domain  — as supplied in the start URL
+          • redirected domain — actual netloc of the response URL
+          • normalized base  — www-stripped canonical used for all comparisons
+        """
+        redirected = urlparse(response.url).netloc.lower()
+        if not redirected:
+            return
+        canonical = _strip_www(redirected)
+        if canonical == self._base_domain:
+            return  # nothing changed
+
+        logger.info(
+            f"Domain redirect detected — "
+            f"original: {self._original_domain!r}, "
+            f"redirected: {redirected!r}, "
+            f"normalized base domain: {canonical!r}"
+        )
+        self._base_domain = canonical
 
     # ── Phase 1: Entry point ──────────────────────────────────────────────────
 
@@ -211,23 +249,18 @@ class GenericSpider(BaseZoogleSpider):
         """
         Homepage entry point.
 
-        Also updates self._base_domain from the *actual* response URL so that
-        www ↔ non-www redirects (e.g. www.site.com → site.com) don't break the
-        same_domain() check for every link on the site.
+        Calls _update_base_domain() so that www ↔ non-www (or any hostname)
+        redirects are detected on the very first response and self._base_domain
+        is updated before any link-following begins.
         """
-        actual = urlparse(response.url).netloc.lower()
-        if actual and actual != self._base_domain:
-            from zoogle_crawler.page_analyzer import _strip_www
-            canonical = _strip_www(actual)
-            if canonical != _strip_www(self._base_domain):
-                logger.info(f"Base domain redirect: {self._base_domain} → {canonical}")
-            self._base_domain = canonical
+        self._update_base_domain(response)
         yield from self._process_page(response)
 
     # ── Phase 1a: Sitemap ─────────────────────────────────────────────────────
 
     def _parse_sitemap(self, response: Response):
         """Parse sitemap.xml or a sitemap index. Silently skips non-XML responses."""
+        self._update_base_domain(response)
         try:
             # Skip if not an XML/text response (e.g. HTML 404 page returned for missing sitemap)
             content_type = (response.headers.get("Content-Type", b"") or b"").decode("utf-8", errors="ignore").lower()
@@ -292,6 +325,7 @@ class GenericSpider(BaseZoogleSpider):
         Falls back to detail-page extraction when no card containers match.
         Wrapped in try/except so one bad listing page never halts the crawl.
         """
+        self._update_base_domain(response)
         try:
             category = self._extract_category(response)
 
@@ -557,6 +591,7 @@ class GenericSpider(BaseZoogleSpider):
         3. CSS heuristics
         4. [Optional] JS render + retry CSS heuristics
         """
+        self._update_base_domain(response)
         try:
             # 1. JSON-LD (fastest, most structured)
             jsonld = list(self._extract_jsonld(response))
