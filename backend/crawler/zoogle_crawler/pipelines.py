@@ -289,11 +289,7 @@ class DatabasePipeline:
                     ))
 
             self._count += 1
-
-            # Batch commit to reduce round-trips
-            if self._count % BATCH_SIZE == 0:
-                db.commit()
-                logger.debug(f"DB batch committed ({self._count} items total)")
+            db.commit()  # commit each item individually to prevent batch data loss
 
         except Exception as exc:
             logger.error(f"DB pipeline error for {adapter.get('machine_url')}: {exc}")

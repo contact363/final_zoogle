@@ -179,7 +179,8 @@ class GenericSpider(BaseZoogleSpider):
                 if s >= 5:
                     yield scrapy.Request(url, callback=self._parse_detail_page,
                                          errback=self._errback)
-                elif s >= 1:
+                else:
+                    # Follow all sitemap URLs — even score-0 URLs may be listing pages
                     yield scrapy.Request(url, callback=self._parse_listing_page,
                                          errback=self._errback)
         except Exception as exc:
@@ -773,15 +774,17 @@ class GenericSpider(BaseZoogleSpider):
             seen.add(url)
             s = score_url(url)
 
+            # Follow ALL intra-domain non-skipped links — machine listing URLs
+            # frequently score 0 (e.g. ?cat=5&lang=de, ?id=123) so we cannot
+            # gate on score >= 1.  Score is still used to choose the callback.
+            self._mark_visited(url)
             if s >= 5:
-                self._mark_visited(url)
                 yield response.follow(
                     url, callback=self._parse_detail_page,
                     errback=self._errback,
                     meta={"referer": response.url},
                 )
-            elif s >= 1:
-                self._mark_visited(url)
+            else:
                 yield response.follow(
                     url, callback=self._parse_listing_page,
                     errback=self._errback,

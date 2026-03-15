@@ -42,10 +42,12 @@ SKIP_WORDS: set[str] = {
     "feed", "cdn", "static", "assets", "/css/", "/js/", "/fonts/",
     "download", "upload", "account", "profile", "sign-in", "sign-up",
     "subscribe", "advertise", "sell-your", "sell-machine", "post-listing",
-    "dealer", "dealers", "help", "support", "warranty", "financing",
+    "help", "support", "warranty", "financing",
     "/auth/", "/user/", "logout", "wp-admin", "wp-login", "/admin/",
     "/api/", "/ajax/", "mailto:", "tel:", "javascript:", ".pdf", ".zip",
-    ".css", ".js", ".woff", ".woff2", ".ttf", ".eot",
+    # Note: .js/.css/.woff etc. are already caught by ASSET_EXTENSIONS regex —
+    # do NOT add them here as bare strings since that would also match URLs like
+    # "/listings?style=ajax" or query params containing "js".
 }
 
 ASSET_EXTENSIONS = re.compile(
