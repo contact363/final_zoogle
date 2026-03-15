@@ -24,6 +24,13 @@ BOT_NAME        = "zoogle_crawler"
 SPIDER_MODULES  = ["zoogle_crawler.spiders"]
 NEWSPIDER_MODULE = "zoogle_crawler.spiders"
 
+# ── Extensions ────────────────────────────────────────────────────────────────
+# Disable the Telnet console — it causes "AlreadyNegotiating" CRITICAL errors
+# on Render and other cloud environments where the telnet port is unavailable.
+EXTENSIONS = {
+    "scrapy.extensions.telnet.TelnetConsole": None,
+}
+
 # ── Crawl behaviour ───────────────────────────────────────────────────────────
 ROBOTSTXT_OBEY = False          # Many machine sites block all bots in robots.txt
 

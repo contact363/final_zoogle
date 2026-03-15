@@ -640,7 +640,8 @@ class GenericSpider(BaseZoogleSpider):
         _MACHINE_KEYS = {"machine", "brand", "model", "price", "equipment",
                           "listing", "product", "name", "title", "sku"}
         if isinstance(obj, dict):
-            keys_lower = {k.lower() for k in obj.keys()}
+            # Safe lower() — JSON can technically have non-string keys after parsing
+            keys_lower = {k.lower() for k in obj.keys() if isinstance(k, str)}
             if len(keys_lower & _MACHINE_KEYS) >= 3:
                 item = self._dict_to_item(obj, page_url)
                 if item:
@@ -700,6 +701,13 @@ class GenericSpider(BaseZoogleSpider):
 
     def _parse_detail_css(self, response: Response):
         """Last-resort extraction via CSS selectors."""
+        try:
+            yield from self._parse_detail_css_inner(response)
+        except Exception as exc:
+            logger.error(f"_parse_detail_css error at {response.url}: {exc}")
+
+    def _parse_detail_css_inner(self, response: Response):
+        """Inner implementation — separated so _parse_detail_css can wrap with try/except."""
         # Title is required
         title = None
         for sel in TITLE_SELECTORS:
@@ -797,6 +805,13 @@ class GenericSpider(BaseZoogleSpider):
 
     def _follow_all_links(self, response: Response):
         """Follow category and detail links from any page."""
+        try:
+            yield from self._follow_all_links_inner(response)
+        except Exception as exc:
+            logger.error(f"_follow_all_links error at {response.url}: {exc}")
+
+    def _follow_all_links_inner(self, response: Response):
+        """Inner implementation — separated so _follow_all_links can wrap with try/except."""
         seen: set[str] = set()
 
         # Priority: nav links (categories)
@@ -902,7 +917,7 @@ class GenericSpider(BaseZoogleSpider):
     def _errback(self, failure):
         """Log request failures without crashing the spider."""
         logger.warning(
-            f"Request failed [{failure.value.__class__.__name__}]: "
+            f"Request failed [{failure.value.__class__.__name__}: {failure.value}]: "
             f"{getattr(failure.request, 'url', 'unknown')}"
         )
 
