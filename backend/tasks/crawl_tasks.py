@@ -83,7 +83,8 @@ def _select_spider(start_url: str) -> str:
     from urllib.parse import urlparse
     domain = urlparse(start_url).netloc.lower().lstrip("www.")
     _DEDICATED = {
-        "corelmachine.com": "corelmachine",
+        "corelmachine.com":   "corelmachine",
+        "zatpatmachines.com": "zatpatmachines",
     }
     return _DEDICATED.get(domain, "generic")
 
