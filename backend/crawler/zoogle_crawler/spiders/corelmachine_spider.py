@@ -53,7 +53,7 @@ from zoogle_crawler.spiders.generic_spider import GenericSpider
 
 logger = logging.getLogger(__name__)
 
-SPIDER_VERSION = "2026-03-15-v2"
+SPIDER_VERSION = "2026-03-15-v3"
 BASE_URL       = "https://corelmachine.com"   # no www — API 404s on www variant
 
 # Known 2-word brand prefixes (first word alone would misidentify the brand)
@@ -118,7 +118,8 @@ class CoreMachineSpider(GenericSpider):
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
+            # No "br" — Scrapy cannot decompress Brotli; server falls back to gzip.
+            "Accept-Encoding": "gzip, deflate",
         },
     }
 
