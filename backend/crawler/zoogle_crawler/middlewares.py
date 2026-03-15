@@ -143,8 +143,12 @@ class SmartHeadersMiddleware:
                 request.headers["Referer"] = ref
 
     def process_response(self, request, response, spider):
-        # Store this URL in meta for child requests (Referer chaining)
-        response.meta["referer"] = response.url
+        # Store this URL in meta for child requests (Referer chaining).
+        # Use request.meta (already available as a parameter) instead of
+        # response.meta — response.meta is a property that accesses
+        # response.request.meta and raises AttributeError on synthetic responses
+        # that are not tied to any request object.
+        request.meta["referer"] = response.url
         return response
 
 
@@ -218,9 +222,10 @@ class BotDetectionMiddleware:
                         f"Bot-detection page detected ({signal!r}) at {response.url}. "
                         f"Will attempt JS fallback if enabled."
                     )
-                    # Tag the response so the spider can decide to JS-render it
-                    response.meta["bot_detected"] = True
-                    response.meta["bot_signal"] = signal
+                    # Use request.meta directly (same fix as SmartHeadersMiddleware —
+                    # response.meta raises AttributeError on synthetic responses).
+                    request.meta["bot_detected"] = True
+                    request.meta["bot_signal"] = signal
                     return response
         return response
 

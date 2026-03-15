@@ -167,12 +167,23 @@ class GenericSpider(BaseZoogleSpider):
                     dont_filter=True, errback=self._errback,
                 )
 
-        # 3. Common machine listing paths (handles sites with no sitemap)
+        # 3. Common machine listing paths (handles sites with no sitemap).
+        # Includes German, French and generic paths commonly used by industrial
+        # machine dealers.
         for path in (
             "/machines", "/maschinen", "/inventory", "/used-machines",
             "/gebrauchtmaschinen", "/search", "/catalog", "/listings",
             "/products", "/equipment", "/stock", "/shop",
             "/machines/", "/maschinen/", "/inventory/", "/catalog/",
+            # German machine dealer paths
+            "/angebote", "/angebote/", "/produkte", "/produkte/",
+            "/gebraucht", "/gebraucht/", "/occasion", "/occasion/",
+            "/haendler", "/haendler/",
+            # French paths
+            "/occasions", "/occasions/", "/annonces", "/annonces/",
+            # Generic English variants
+            "/for-sale", "/used-equipment", "/second-hand",
+            "/pre-owned", "/available-machines",
         ):
             url = base + path
             if not self._is_visited(url):
@@ -252,12 +263,29 @@ class GenericSpider(BaseZoogleSpider):
     def _parse_listing_page(self, response: Response):
         """
         Extract machine cards, follow detail links, follow pagination.
+        Falls back to detail-page extraction when no card containers match
+        (e.g. a machine detail page routed here due to low URL score).
         Wrapped in try/except so one bad listing page never halts the crawl.
         """
         try:
             category = self._extract_category(response)
-            yield from self._extract_machine_cards(response, category)
-            yield from self._extract_jsonld(response)
+
+            # Try structured card extraction first
+            cards_found = list(self._extract_machine_cards(response, category))
+            yield from cards_found
+
+            # Try JSON-LD on every page
+            jsonld_items = list(self._extract_jsonld(response))
+            yield from jsonld_items
+
+            # If no cards AND no JSON-LD were found and the page looks like a
+            # detail page (has an h1 + some content), attempt CSS detail extraction.
+            # This handles machine detail pages that scored too low to be routed
+            # to _parse_detail_page (e.g. /produkt/cnc-maschine-abc on German sites).
+            if not cards_found and not jsonld_items and self._looks_like_detail(response):
+                logger.debug(f"No cards/JSON-LD on {response.url} — trying detail CSS extraction")
+                yield from self._parse_detail_css(response)
+
             yield from self._follow_all_links(response)
             yield from self._follow_pagination(response)
         except Exception as exc:

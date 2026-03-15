@@ -57,6 +57,7 @@ ASSET_EXTENSIONS = re.compile(
 
 # Strong signals that a URL points to a single machine detail page
 _DETAIL_PATTERNS = [
+    # English
     re.compile(r"/machine[s]?/\d+", re.I),
     re.compile(r"/listing[s]?/\d+", re.I),
     re.compile(r"/product[s]?/\d+", re.I),
@@ -72,6 +73,20 @@ _DETAIL_PATTERNS = [
     re.compile(r"/sku/[a-z0-9-]+", re.I),
     re.compile(r"/ref/[a-z0-9-]+", re.I),
     re.compile(r"/view/[a-z0-9-]+", re.I),
+    # German industrial machine sites
+    re.compile(r"/produkt[e]?/[a-z0-9-]{3,}", re.I),       # German: product
+    re.compile(r"/angebot[e]?/[a-z0-9-]{3,}", re.I),       # German: offer/listing
+    re.compile(r"/maschine[n]?/[a-z0-9-]{3,}", re.I),      # German: machine
+    re.compile(r"/artikel/[a-z0-9-]{3,}", re.I),           # German: article/item
+    re.compile(r"/gebrauchtmaschine[n]?/[a-z0-9-]{3,}", re.I),  # German: used machine
+    re.compile(r"/occasion[s]?/[a-z0-9-]{3,}", re.I),      # French/German: used machine
+    re.compile(r"/annonce[s]?/[a-z0-9-]{3,}", re.I),       # French: listing
+    re.compile(r"/occasion[s]?/\d+", re.I),
+    re.compile(r"/angebot[e]?/\d+", re.I),
+    re.compile(r"/produkt[e]?/\d+", re.I),
+    re.compile(r"/maschine[n]?/\d+", re.I),
+    # Generic: slug path after known category keywords followed by a long slug
+    re.compile(r"/(machine|equipment|product|listing|item|maschine|produkt)/[a-z0-9][a-z0-9-]{5,}", re.I),
 ]
 
 # Patterns that look like category/listing pages
@@ -320,6 +335,10 @@ TITLE_SELECTORS: list[str] = [
     ".product_title::text", ".product-name h1::text",
     "[data-testid='product-name']::text",
     "h1::text",
+    # Broader fallbacks for sites that use h2/h3 as their main listing title
+    ".machine-title::text", ".product-heading::text", ".listing-heading::text",
+    "h2.title::text", "h2.name::text", "h2.product::text",
+    "h2::text", "h3::text",
 ]
 
 PRICE_SELECTORS: list[str] = [
