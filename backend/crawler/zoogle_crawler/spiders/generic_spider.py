@@ -92,6 +92,11 @@ class GenericSpider(BaseZoogleSpider):
         # _parse_sitemap, _parse_listing_page etc. can handle them gracefully
         # instead of having them silently dropped by HttpErrorMiddleware.
         "HTTPERROR_ALLOWED_CODES": [404, 410],
+        # Follow up to 20 redirect hops — industrial sites often chain multiple
+        # www → canonical → language-prefix redirects (default Scrapy limit is 20,
+        # but make it explicit so RedirectMiddleware is clearly configured).
+        "REDIRECT_ENABLED":   True,
+        "REDIRECT_MAX_TIMES": 20,
         # Use our enhanced middlewares (override settings.py order if needed)
         "DOWNLOADER_MIDDLEWARES": {
             "scrapy.downloadermiddlewares.retry.RetryMiddleware": None,  # disable default
@@ -107,6 +112,13 @@ class GenericSpider(BaseZoogleSpider):
         super().__init__(*args, **kwargs)
         self.website_id  = int(website_id)  if website_id   else None
         self.crawl_log_id = int(crawl_log_id) if crawl_log_id else None
+
+        # Ensure the URL has a scheme — Scrapy raises ValueError otherwise.
+        # Websites are sometimes stored as "www.example.com" without https://.
+        if start_url and "://" not in start_url:
+            start_url = "https://" + start_url
+            logger.info(f"Added missing scheme to start URL: {start_url!r}")
+
         self.start_urls  = [start_url] if start_url else []
 
         # Store original netloc for logging, then normalise immediately so
@@ -995,12 +1007,63 @@ class GenericSpider(BaseZoogleSpider):
 
         # Brand from dedicated elements
         brand_raw = None
-        for sel in ("[itemprop='brand']::text", ".brand::text",
-                    ".manufacturer::text", ".make::text", ".brand-name::text"):
+        for sel in (
+            "[itemprop='brand'] [itemprop='name']::text",
+            "[itemprop='brand']::text",
+            "meta[itemprop='brand']::attr(content)",
+            ".brand::text", ".brand-name::text",
+            ".manufacturer::text", ".make::text",
+            "[data-brand]::text", "[data-make]::text",
+        ):
             b = self.clean_text(response.css(sel).getall())
             if b:
                 brand_raw = b
                 break
+
+        # Brand fallback: scan spec table rows for known label words
+        if not brand_raw:
+            _BRAND_LABELS = {"make", "brand", "manufacturer", "hersteller",
+                             "marque", "fabricante", "марка", "fabrikant"}
+            for row in response.css("table tr, dl, .spec-row, .specs-row"):
+                cells = row.css("td, th, dt, .spec-label, .spec-key")
+                if not cells:
+                    continue
+                label = (cells[0].css("::text").get("") or "").strip().lower().rstrip(":")
+                if label in _BRAND_LABELS:
+                    val_cells = row.css("td:nth-child(2), dd, .spec-value, .spec-data")
+                    val = self.clean_text(val_cells.css("::text").getall())
+                    if val:
+                        brand_raw = val
+                        break
+
+        # Location fallback: scan spec table rows for location label words
+        if not location:
+            _LOC_LABELS = {"location", "city", "country", "address", "region",
+                           "state", "standort", "lieu", "ort", "pays", "land",
+                           "país", "ubicación", "sede"}
+            for row in response.css("table tr, dl, .spec-row, .specs-row"):
+                cells = row.css("td, th, dt, .spec-label, .spec-key")
+                if not cells:
+                    continue
+                label = (cells[0].css("::text").get("") or "").strip().lower().rstrip(":")
+                if label in _LOC_LABELS:
+                    val_cells = row.css("td:nth-child(2), dd, .spec-value, .spec-data")
+                    val = self.clean_text(val_cells.css("::text").getall())
+                    if val:
+                        location = val
+                        break
+
+        # Location fallback: structured address microdata
+        if not location:
+            parts = [
+                response.css("[itemprop='addressLocality']::text").get(""),
+                response.css("[itemprop='addressRegion']::text").get(""),
+                response.css("[itemprop='addressCountry']::text, "
+                             "[itemprop='addressCountry']::attr(content)").get(""),
+            ]
+            loc_str = ", ".join(p.strip() for p in parts if p.strip())
+            if loc_str:
+                location = loc_str
 
         brand, model = self._split_brand_model(title, brand_raw)
         machine_type = self._infer_machine_type(response)
