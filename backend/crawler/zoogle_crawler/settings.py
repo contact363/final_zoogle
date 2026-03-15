@@ -95,11 +95,21 @@ DOWNLOADER_MIDDLEWARES = {
 }
 
 # ── Item pipelines (priority order) ──────────────────────────────────────────
+#
+#  100  ValidationPipeline    — drop structurally invalid items (no brand/model/content)
+#  150  LanguageFilterPipeline — drop non-English pages (German/Italian/French/etc.)
+#  200  NormalizationPipeline  — multilingual type map, stock number extraction, price parse
+#  300  ImageDownloadPipeline  — download/store images
+#  380  DeduplicationPipeline  — in-run dedup (dedup_key + content_hash)
+#  400  DatabasePipeline       — upsert to PostgreSQL with cross-language dedup
+#
 ITEM_PIPELINES = {
-    "zoogle_crawler.pipelines.ValidationPipeline":    100,
-    "zoogle_crawler.pipelines.NormalizationPipeline": 200,
-    "zoogle_crawler.pipelines.ImageDownloadPipeline": 300,
-    "zoogle_crawler.pipelines.DatabasePipeline":      400,
+    "zoogle_crawler.pipelines.ValidationPipeline":      100,
+    "zoogle_crawler.pipelines.LanguageFilterPipeline":  150,
+    "zoogle_crawler.pipelines.NormalizationPipeline":   200,
+    "zoogle_crawler.pipelines.ImageDownloadPipeline":   300,
+    "zoogle_crawler.pipelines.DeduplicationPipeline":   380,
+    "zoogle_crawler.pipelines.DatabasePipeline":        400,
 }
 
 # ── Image storage ─────────────────────────────────────────────────────────────

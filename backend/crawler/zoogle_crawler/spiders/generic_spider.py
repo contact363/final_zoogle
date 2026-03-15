@@ -728,32 +728,76 @@ class GenericSpider(BaseZoogleSpider):
     def _parse_detail_page(self, response: Response):
         """
         Full extraction pipeline:
+        0. Language check + product page validation  ← NEW
         1. JSON-LD
         2. Embedded JS state (__NEXT_DATA__, window.__INITIAL_STATE__, etc.)
         3. CSS heuristics
         4. [Optional] JS render + retry CSS heuristics
+
+        Language handling:
+          - If the page is non-English AND has an English hreflang canonical,
+            schedule the canonical URL instead of extracting from this page.
+          - If the page is non-English with no canonical, skip entirely.
+          - The LanguageFilterPipeline is the final safety net for any item
+            that slips through with page_lang set to non-English.
         """
         self._update_base_domain(response)
         try:
-            # 1. JSON-LD (fastest, most structured)
+            # ── 0a. Language detection ────────────────────────────────────────
+            from zoogle_crawler.lang_detector import (
+                detect_language, is_english_page, get_english_alternate,
+            )
+            lang = detect_language(response.url, response)
+            if lang not in ("en", "unknown"):
+                # Check for English hreflang canonical — crawl that instead
+                en_url = get_english_alternate(response)
+                if en_url and not self._is_visited(en_url):
+                    self._mark_visited(en_url)
+                    logger.info(
+                        f"Non-English page ({lang}) → scheduling EN canonical: {en_url!r}"
+                    )
+                    yield scrapy.Request(
+                        en_url, callback=self._parse_detail_page,
+                        errback=self._errback,
+                        meta={"referer": response.url},
+                    )
+                else:
+                    logger.debug(
+                        f"Non-English page skipped (lang={lang!r}): {response.url!r}"
+                    )
+                return   # do NOT extract from the non-English page
+
+            # ── 0b. Valid product page check ──────────────────────────────────
+            from zoogle_crawler.page_analyzer import is_valid_product_page
+            if not is_valid_product_page(response):
+                logger.debug(f"Not a product page — skipped: {response.url!r}")
+                return
+
+            # ── 1. JSON-LD (fastest, most structured) ─────────────────────────
             jsonld = list(self._extract_jsonld(response))
             if jsonld:
+                for item in jsonld:
+                    item["page_lang"] = lang
                 yield from jsonld
                 return
 
-            # 2. Embedded script JSON
+            # ── 2. Embedded script JSON ───────────────────────────────────────
             script_items = list(self._extract_script_json(response))
             if script_items:
+                for item in script_items:
+                    item["page_lang"] = lang
                 yield from script_items
                 return
 
-            # 3. CSS heuristics
+            # ── 3. CSS heuristics ─────────────────────────────────────────────
             css_items = list(self._parse_detail_css(response))
             if css_items:
+                for item in css_items:
+                    item["page_lang"] = lang
                 yield from css_items
                 return
 
-            # 4. Page looks empty — try JS rendering if available
+            # ── 4. Page looks empty — try JS rendering if available ───────────
             if self._js_available and self._needs_js(response):
                 yield from self._try_js_render(response)
 

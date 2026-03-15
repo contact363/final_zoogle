@@ -177,6 +177,110 @@ def is_worth_following(url: str) -> bool:
     return score_url(url) >= 1
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Product page validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+# CSS selectors that indicate a product title is present
+_PRODUCT_TITLE_SELECTORS = [
+    "h1", "h2.product-title", "h1.product-title",
+    ".machine-title", ".product-name", ".listing-title",
+    ".machine-name", ".item-title", ".product-heading",
+    "[itemprop='name']", "[data-testid='product-title']",
+    ".wp-block-post-title",
+]
+
+# CSS selectors for specification tables / blocks
+_SPEC_SELECTORS = [
+    "table.specs", "table.specifications", "table.machine-specs",
+    ".specs", ".specifications", ".machine-specs", ".tech-specs",
+    ".product-specs", ".details-table", ".technical-data",
+    "dl.specs", "ul.specs", ".spec-list", ".attribute-list",
+    "[itemprop='description'] table",
+    ".woocommerce-product-attributes",
+    ".product-attributes", ".product-meta",
+]
+
+# CSS selectors for product images (not navigation logos / banners)
+_PRODUCT_IMAGE_SELECTORS = [
+    ".product-image img", ".machine-image img",
+    ".gallery img", ".product-gallery img",
+    ".listing-image img", ".main-image img",
+    "[itemprop='image']", ".swiper-slide img",
+    ".product-photo img", ".machine-photo img",
+    "figure.product img", ".featured-image img",
+    "img.product-img", "img.machine-img",
+]
+
+# CSS selectors for price
+_PRICE_SELECTORS_VALIDATE = [
+    ".price", ".product-price", ".machine-price",
+    ".asking-price", "[itemprop='price']",
+    ".listing-price", ".sale-price",
+]
+
+
+def is_valid_product_page(response) -> bool:
+    """
+    Return True if the response looks like a genuine machine product page.
+
+    A valid product page must have ALL of:
+      1. A product title (h1 or known title selectors)
+      2. At least ONE of: specs table | product image | price
+
+    Pages lacking these signals (category pages, blog posts, contact forms,
+    homepage, etc.) are rejected — no MachineItem will be emitted.
+
+    Designed to be called from _parse_detail_page before extraction begins.
+    """
+    try:
+        # ── 1. Title presence ─────────────────────────────────────────────────
+        title_found = False
+        for sel in _PRODUCT_TITLE_SELECTORS:
+            text = " ".join(response.css(f"{sel}::text").getall()).strip()
+            if len(text) > 4:         # minimum meaningful length
+                title_found = True
+                break
+
+        if not title_found:
+            return False
+
+        # ── 2. At least one content signal ────────────────────────────────────
+        # Specs table
+        for sel in _SPEC_SELECTORS:
+            if response.css(sel).get():
+                return True
+
+        # Product image (must be large-ish — skip tiny logo/icon images)
+        for sel in _PRODUCT_IMAGE_SELECTORS:
+            for img in response.css(sel):
+                src = img.attrib.get("src", "") or img.attrib.get("data-src", "")
+                # Skip data URIs and tiny images indicated by 'logo'/'icon' in src
+                if src and "logo" not in src.lower() and "icon" not in src.lower():
+                    # Check width if present
+                    w = img.attrib.get("width")
+                    if w:
+                        try:
+                            if int(w) >= 100:
+                                return True
+                        except ValueError:
+                            pass
+                    else:
+                        return True   # no width attr — accept
+
+        # Price
+        for sel in _PRICE_SELECTORS_VALIDATE:
+            text = " ".join(response.css(f"{sel}::text").getall()).strip()
+            if text and re.search(r"[\d,]+", text):
+                return True
+
+        return False
+
+    except Exception:
+        # If CSS selectors fail (e.g. non-HTML response) — reject
+        return False
+
+
 def _strip_www(domain: str) -> str:
     """Remove leading 'www.' so www.foo.com and foo.com are treated identically."""
     return domain[4:] if domain.startswith("www.") else domain
