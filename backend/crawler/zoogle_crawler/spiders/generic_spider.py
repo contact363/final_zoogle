@@ -1587,7 +1587,10 @@ class GenericSpider(BaseZoogleSpider):
             return
 
         logger.info(f"JSON API response at {response.url}: {type(data).__name__} len={len(data) if isinstance(data, (list, dict)) else '?'}")
-        yield from self._extract_json_api_items(data, response)
+        try:
+            yield from self._extract_json_api_items(data, response)
+        except Exception as exc:
+            logger.error(f"JSON API extraction error at {response.url}: {exc}", exc_info=True)
 
     def _extract_json_api_items(self, data, response: Response):
         """
@@ -1618,19 +1621,27 @@ class GenericSpider(BaseZoogleSpider):
             return
 
         # ── Detect subcategory list vs machine list ────────────────────────────
-        # corelmachine /api/subcategory/all returns objects with {_id, title, url, image, order}
-        # but no machine-specific fields like price/year/reference_no.
-        machine_fields = {"price", "year", "reference_no", "capacity", "product_status",
-                          "brand", "model", "location", "description"}
+        # corelmachine /api/subcategory/all returns:
+        #   {_id, title, url, image, order, description:"", status:true, category:{...}}
+        # These objects have 'description' (empty) and 'status' (bool True) but
+        # crucially do NOT have price/year/reference_no/capacity/product_status.
+        # Use only the discriminating machine-specific fields (not 'description'
+        # or 'brand'/'model' which can appear in both shapes).
+        strict_machine_fields = {"price", "year", "reference_no", "capacity", "product_status"}
         is_subcategory_list = (
-            not any(f in first for f in machine_fields)
+            not any(f in first for f in strict_machine_fields)
             and ("url" in first or "slug" in first)
-            and len(data) <= 100  # subcategory lists are small
+            and len(data) <= 200
         )
+        # Extra signal: corelmachine subcategories have a nested "category" dict
+        if not is_subcategory_list and isinstance(first.get("category"), dict):
+            if "url" in first and "price" not in first:
+                is_subcategory_list = True
 
         if is_subcategory_list:
             # Schedule /api/product/{url} for each subcategory
             base_api = "{0.scheme}://{0.netloc}".format(urlparse(page_url))
+            logger.info(f"Subcategory list detected at {page_url}: {len(data)} entries — scheduling product API calls")
             for entry in data:
                 slug = entry.get("url") or entry.get("slug") or entry.get("id")
                 if not slug:
@@ -1638,7 +1649,7 @@ class GenericSpider(BaseZoogleSpider):
                 api_url = f"{base_api}/api/product/{slug}"
                 if not self._is_visited(api_url):
                     self._mark_visited(api_url)
-                    logger.debug(f"Scheduling subcategory API: {api_url}")
+                    logger.info(f"Scheduling product API: {api_url}")
                     yield scrapy.Request(
                         api_url,
                         callback=self._parse_json_api,
@@ -1675,8 +1686,10 @@ class GenericSpider(BaseZoogleSpider):
             return None
 
         # Skip sold / unavailable machines
-        status = (d.get("product_status") or d.get("status") or "").lower()
-        if status in ("sold", "unavailable", "inactive", "deleted"):
+        # d.get("status") can be a boolean (True/False) from JSON — cast to str first
+        status_raw = d.get("product_status") or d.get("status") or ""
+        status = str(status_raw).lower() if status_raw is not None else ""
+        if status in ("sold", "unavailable", "inactive", "deleted", "false"):
             return None
 
         # ── Title ──────────────────────────────────────────────────────────────
@@ -1837,10 +1850,21 @@ class GenericSpider(BaseZoogleSpider):
         Extract Supabase project URL + anon key from JS/HTML text.
         If found, schedules REST API requests for common public table names.
         """
-        # Match Supabase project URL: https://<20-char-id>.supabase.co
-        url_match = re.search(r"https://([a-z0-9]{20})\.supabase\.co", text)
-        # Match JWT anon key (starts with eyJ and is long)
-        key_match = re.search(r'"(eyJ[A-Za-z0-9_\-]{50,}\.[A-Za-z0-9_\-]{50,}\.[A-Za-z0-9_\-]{10,})"', text)
+        # Match Supabase project URL: https://<ref-id>.supabase.co
+        # ref IDs are typically 20 chars but allow 10-30 to be safe
+        url_match = re.search(r"https://([a-z0-9]{10,30})\.supabase\.co", text)
+        # Match JWT anon key.
+        # Structure: <header>.<payload>.<signature>
+        # Real-world Supabase keys:
+        #   header    = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9  (36 chars, so 33 after "eyJ")
+        #   payload   = eyJpc3MiOiJzdXBhYmFzZSIs...            (100+ chars)
+        #   signature = GD_HVD-98oUUM9R...                     (40+ chars)
+        # The original regex used {50,} for the header — WRONG, header is only ~33 chars.
+        # Use optional surrounding quote characters (", ', or backtick from minified JS).
+        key_match = re.search(
+            r'["\x27`]?(eyJ[A-Za-z0-9_+/\-]{10,}\.[A-Za-z0-9_+/\-]{40,}\.[A-Za-z0-9_+/\-]{10,})["\x27`]?',
+            text,
+        )
 
         if not url_match or not key_match:
             return
