@@ -1,5 +1,5 @@
 import axios from "axios";
-import type { SearchFilters, SearchResponse, Machine, Website, AuthToken } from "@/types";
+import type { SearchFilters, SearchResponse, Machine, Website, AuthToken, TrainingRules, TrainingRulesForm } from "@/types";
 
 // Hardcode production URL as fallback so this works even when
 // NEXT_PUBLIC_API_URL is not set at Render build time.
@@ -204,4 +204,23 @@ export async function diagnoseCrawl(websiteId: number) {
 
 export function exportMachinesExcelUrl() {
   return `${API_BASE}/api/admin/machines/export/excel`;
+}
+
+// ── Training Rules ─────────────────────────────────────────────────────────────
+
+export async function getTrainingRules(websiteId: number): Promise<TrainingRules | null> {
+  const { data } = await api.get(`/api/admin/websites/${websiteId}/training`);
+  return data ?? null;
+}
+
+export async function saveTrainingRules(
+  websiteId: number,
+  payload: TrainingRulesForm,
+): Promise<TrainingRules> {
+  const { data } = await api.post(`/api/admin/websites/${websiteId}/training`, payload);
+  return data;
+}
+
+export async function deleteTrainingRules(websiteId: number): Promise<void> {
+  await api.delete(`/api/admin/websites/${websiteId}/training`);
 }

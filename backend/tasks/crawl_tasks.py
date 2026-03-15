@@ -8,6 +8,7 @@ Self-healing approach:
   3. Errors are parsed from output and stored in crawl_log.error_details
   4. machine_count on Website is updated after every crawl
 """
+import json
 import subprocess
 import sys
 import os
@@ -72,20 +73,29 @@ def _preflight_check() -> tuple[bool, str]:
 # Run scrapy subprocess
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_scrapy(website_id: int, start_url: str, crawl_log_id: int) -> subprocess.CompletedProcess:
+def _run_scrapy(
+    website_id: int,
+    start_url: str,
+    crawl_log_id: int,
+    training_rules_json: str | None = None,
+) -> subprocess.CompletedProcess:
     """
     Run scrapy — capture all output directly (no --logfile).
     Full stdout+stderr captured so we can store it and parse stats from it.
+    Passes training_rules as a JSON string if the website has been trained.
     """
+    cmd = [
+        sys.executable, "-m", "scrapy", "crawl", "generic",
+        "-a", f"website_id={website_id}",
+        "-a", f"start_url={start_url}",
+        "-a", f"crawl_log_id={crawl_log_id}",
+        "--set", "LOG_LEVEL=INFO",
+        "--set", "CLOSESPIDER_ITEMCOUNT=5000",
+    ]
+    if training_rules_json:
+        cmd += ["-a", f"training_rules={training_rules_json}"]
     return subprocess.run(
-        [
-            sys.executable, "-m", "scrapy", "crawl", "generic",
-            "-a", f"website_id={website_id}",
-            "-a", f"start_url={start_url}",
-            "-a", f"crawl_log_id={crawl_log_id}",
-            "--set", "LOG_LEVEL=INFO",
-            "--set", "CLOSESPIDER_ITEMCOUNT=5000",
-        ],
+        cmd,
         cwd=_CRAWLER_DIR,
         capture_output=True,
         text=True,
@@ -152,12 +162,36 @@ def _execute_crawl(website_id: int, db: Session) -> None:
     from app.models.website import Website
     from app.models.crawl_log import CrawlLog
     from app.models.machine import Machine
+    from app.models.training_rules import WebsiteTrainingRules
     from sqlalchemy import func
 
     website = db.query(Website).filter(Website.id == website_id).first()
     if not website:
         logger.error(f"Website {website_id} not found")
         return
+
+    # Load training rules (if the admin has configured them for this website)
+    rules_row = db.query(WebsiteTrainingRules).filter(
+        WebsiteTrainingRules.website_id == website_id
+    ).first()
+    training_rules_json: str | None = None
+    if rules_row:
+        rules_dict = {
+            k: getattr(rules_row, k)
+            for k in (
+                "listing_selector", "title_selector", "url_selector",
+                "description_selector", "image_selector", "price_selector",
+                "category_selector", "pagination_selector",
+            )
+            if getattr(rules_row, k)
+        }
+        if rules_dict:
+            training_rules_json = json.dumps(rules_dict)
+            logger.info(f"Training rules loaded for website {website_id}: {list(rules_dict.keys())}")
+        else:
+            logger.info(f"Training rules row exists for website {website_id} but all selectors are empty — using auto-discovery")
+    else:
+        logger.info(f"No training rules for website {website_id} — using auto-discovery")
 
     # ── Pre-flight ────────────────────────────────────────────────────────────
     ok, preflight_msg = _preflight_check()
@@ -188,7 +222,7 @@ def _execute_crawl(website_id: int, db: Session) -> None:
     # ── Run scrapy ────────────────────────────────────────────────────────────
     logger.info(f"Crawl start: website={website_id} url={website.url}")
 
-    result = _run_scrapy(website_id, website.url, crawl_log.id)
+    result = _run_scrapy(website_id, website.url, crawl_log.id, training_rules_json)
     combined = (result.stdout or "") + (result.stderr or "")
 
     logger.info(

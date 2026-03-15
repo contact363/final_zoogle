@@ -23,3 +23,10 @@ class Website(Base):
 
     machines = relationship("Machine", back_populates="website", passive_deletes=True)
     crawl_logs = relationship("CrawlLog", back_populates="website", passive_deletes=True)
+    training_rules = relationship(
+        "WebsiteTrainingRules",
+        back_populates="website",
+        uselist=False,          # one-to-one
+        passive_deletes=True,
+        cascade="all, delete-orphan",
+    )

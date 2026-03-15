@@ -7,14 +7,16 @@ import {
   startCrawl, startAllCrawls, fixStuckCrawls, getCrawlLogs,
   getAdminMachines, updateMachine, deleteMachine, createMachine,
   exportMachinesExcelUrl, fillMachineTypes,
+  getTrainingRules, saveTrainingRules, deleteTrainingRules,
 } from "@/lib/api";
+import type { TrainingRulesForm } from "@/types";
 import { useAuthStore } from "@/lib/store";
 import { useRouter } from "next/navigation";
 import {
   Globe, Cpu, Users, Search, Play, Trash2, Download,
   BarChart3, FileText, Pencil, X, Check, RefreshCw, Wrench,
   ChevronDown, ChevronRight, ChevronLeft, Star, ExternalLink,
-  Plus,
+  Plus, Brain,
   SlidersHorizontal, Shield, ArrowUpDown, Image as ImageIcon,
 } from "lucide-react";
 import toast from "react-hot-toast";
@@ -82,6 +84,202 @@ function EditWebsiteModal({ site, onClose, onSaved }: { site: any; onClose: () =
           <button onClick={handleSave} disabled={saving} className="btn-primary flex items-center gap-2">
             <Check className="w-4 h-4" />{saving ? "Saving..." : "Save"}
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Train Website Modal ────────────────────────────────────────────────────────
+const EMPTY_RULES: TrainingRulesForm = {
+  listing_selector:     null,
+  title_selector:       null,
+  url_selector:         null,
+  description_selector: null,
+  image_selector:       null,
+  price_selector:       null,
+  category_selector:    null,
+  pagination_selector:  null,
+};
+
+const SELECTOR_FIELDS: { key: keyof TrainingRulesForm; label: string; hint: string }[] = [
+  { key: "listing_selector",     label: "Listing Selector *",      hint: 'CSS selector for the repeating card container, e.g. ".product-card" or "li.machine-item"' },
+  { key: "title_selector",       label: "Title Selector",          hint: 'Within each card, e.g. "h2.title::text" or ".product-name a::text"' },
+  { key: "url_selector",         label: "URL / Link Selector",     hint: 'Within each card, e.g. "a.card-link::attr(href)" or "h3 a::attr(href)"' },
+  { key: "price_selector",       label: "Price Selector",          hint: 'Within each card, e.g. ".price::text" or "span.asking-price::text"' },
+  { key: "description_selector", label: "Description Selector",    hint: 'Within each card or detail page, e.g. ".description::text"' },
+  { key: "image_selector",       label: "Image Selector",          hint: 'Within each card, e.g. "img::attr(src)" or "img::attr(data-src)"' },
+  { key: "category_selector",    label: "Category Selector",       hint: 'Within each card, e.g. ".category::text"' },
+  { key: "pagination_selector",  label: "Pagination Selector",     hint: 'Next-page link, e.g. "a[rel=\'next\']::attr(href)" or "a.next::attr(href)"' },
+];
+
+function TrainWebsiteModal({
+  site,
+  onClose,
+  onSaved,
+}: {
+  site: any;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [form, setForm] = useState<TrainingRulesForm>(EMPTY_RULES);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [hasRules, setHasRules] = useState(false);
+
+  // Load existing rules on open
+  useEffect(() => {
+    getTrainingRules(site.id)
+      .then((rules) => {
+        if (rules) {
+          const { listing_selector, title_selector, url_selector,
+                  description_selector, image_selector, price_selector,
+                  category_selector, pagination_selector } = rules;
+          setForm({ listing_selector, title_selector, url_selector,
+                    description_selector, image_selector, price_selector,
+                    category_selector, pagination_selector });
+          setHasRules(true);
+        }
+      })
+      .catch(() => toast.error("Failed to load training rules"))
+      .finally(() => setLoading(false));
+  }, [site.id]);
+
+  const handleSave = async () => {
+    if (!form.listing_selector?.trim()) {
+      toast.error("Listing Selector is required");
+      return;
+    }
+    setSaving(true);
+    try {
+      // Normalize: convert empty strings to null
+      const payload: TrainingRulesForm = Object.fromEntries(
+        Object.entries(form).map(([k, v]) => [k, v?.trim() || null])
+      ) as TrainingRulesForm;
+      await saveTrainingRules(site.id, payload);
+      toast.success("Training rules saved! Run a crawl to apply them.");
+      onSaved();
+      onClose();
+    } catch { toast.error("Failed to save training rules"); }
+    finally { setSaving(false); }
+  };
+
+  const handleDelete = async () => {
+    if (!confirm("Remove all training rules for this website? The crawler will revert to auto-discovery.")) return;
+    try {
+      await deleteTrainingRules(site.id);
+      toast.success("Training rules removed");
+      onSaved();
+      onClose();
+    } catch { toast.error("Failed to remove training rules"); }
+  };
+
+  const set = (key: keyof TrainingRulesForm, val: string) =>
+    setForm((f) => ({ ...f, [key]: val }));
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 shrink-0">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+              <Brain className="w-5 h-5 text-purple-600" />
+              Train Scraper — {site.name}
+            </h3>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Configure CSS selectors so the crawler can reliably extract machines from this site.
+              Leave a field blank to let the crawler auto-detect it.
+            </p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-700 ml-4">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Body */}
+        <div className="overflow-y-auto flex-1 px-6 py-4 space-y-4">
+          {loading ? (
+            <div className="flex justify-center py-8">
+              <RefreshCw className="w-5 h-5 animate-spin text-gray-400" />
+            </div>
+          ) : (
+            <>
+              {hasRules && (
+                <div className="flex items-center gap-2 px-3 py-2 bg-purple-50 border border-purple-200 rounded-lg text-sm text-purple-700">
+                  <Check className="w-4 h-4 shrink-0" />
+                  Training rules are active for this website. Edit below to update them.
+                </div>
+              )}
+              {!hasRules && (
+                <div className="flex items-center gap-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-700">
+                  <Brain className="w-4 h-4 shrink-0" />
+                  No training rules yet — the crawler uses auto-discovery. Add a Listing Selector to enable trained extraction.
+                </div>
+              )}
+
+              <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide pt-1">
+                CSS Selector Configuration
+              </div>
+
+              <div className="grid gap-3">
+                {SELECTOR_FIELDS.map(({ key, label, hint }) => (
+                  <div key={key}>
+                    <label className="text-sm font-medium text-gray-700">
+                      {label}
+                    </label>
+                    <input
+                      className="input w-full mt-1 font-mono text-sm"
+                      placeholder={hint}
+                      value={form[key] ?? ""}
+                      onChange={(e) => set(key, e.target.value)}
+                    />
+                  </div>
+                ))}
+              </div>
+
+              {/* Quick reference */}
+              <details className="text-xs text-gray-500 border border-gray-200 rounded-lg p-3">
+                <summary className="cursor-pointer font-medium text-gray-600 select-none">
+                  CSS selector quick reference
+                </summary>
+                <ul className="mt-2 space-y-1 list-disc list-inside">
+                  <li><code className="bg-gray-100 px-1 rounded">.class-name</code> — element with a CSS class</li>
+                  <li><code className="bg-gray-100 px-1 rounded">#id</code> — element with an ID</li>
+                  <li><code className="bg-gray-100 px-1 rounded">div.card h2::text</code> — text inside h2 within div.card</li>
+                  <li><code className="bg-gray-100 px-1 rounded">a::attr(href)</code> — href attribute of an anchor</li>
+                  <li><code className="bg-gray-100 px-1 rounded">img::attr(src)</code> — src attribute of an image</li>
+                  <li><code className="bg-gray-100 px-1 rounded">img::attr(data-src)</code> — lazy-loaded image src</li>
+                  <li><code className="bg-gray-100 px-1 rounded">a[rel="next"]::attr(href)</code> — next-page link</li>
+                </ul>
+              </details>
+            </>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="flex items-center justify-between px-6 py-4 border-t border-gray-200 shrink-0">
+          <div>
+            {hasRules && (
+              <button
+                onClick={handleDelete}
+                className="flex items-center gap-1.5 text-sm text-red-500 hover:text-red-700"
+              >
+                <Trash2 className="w-4 h-4" /> Remove rules
+              </button>
+            )}
+          </div>
+          <div className="flex gap-3">
+            <button onClick={onClose} className="btn-secondary">Cancel</button>
+            <button
+              onClick={handleSave}
+              disabled={saving || loading}
+              className="btn-primary flex items-center gap-2"
+            >
+              <Brain className="w-4 h-4" />
+              {saving ? "Saving..." : "Save Training Rules"}
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -279,6 +477,7 @@ export default function AdminPage() {
   const [loading, setLoading] = useState(false);
   const [newSite, setNewSite] = useState({ name: "", url: "", description: "" });
   const [editWebsite, setEditWebsite] = useState<any | null>(null);
+  const [trainWebsite, setTrainWebsite] = useState<any | null>(null);
   const [expandedLog, setExpandedLog] = useState<number | null>(null);
 
   const searchDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -412,6 +611,13 @@ export default function AdminPage() {
         <EditWebsiteModal
           site={editWebsite}
           onClose={() => setEditWebsite(null)}
+          onSaved={() => listWebsites().then(setWebsites)}
+        />
+      )}
+      {trainWebsite && (
+        <TrainWebsiteModal
+          site={trainWebsite}
+          onClose={() => setTrainWebsite(null)}
           onSaved={() => listWebsites().then(setWebsites)}
         />
       )}
@@ -975,8 +1181,15 @@ export default function AdminPage() {
                           </td>
                           <td className="px-4 py-3">
                             <div className="flex gap-1">
-                              <button onClick={() => setEditWebsite(site)} className="p-1.5 hover:bg-blue-50 rounded text-blue-500"><Pencil className="w-4 h-4" /></button>
-                              <button onClick={() => handleDeleteWebsite(site.id)} className="p-1.5 hover:bg-red-50 rounded text-red-500"><Trash2 className="w-4 h-4" /></button>
+                              <button
+                                onClick={() => setTrainWebsite(site)}
+                                className="p-1.5 hover:bg-purple-50 rounded text-purple-500"
+                                title="Train scraper selectors"
+                              >
+                                <Brain className="w-4 h-4" />
+                              </button>
+                              <button onClick={() => setEditWebsite(site)} className="p-1.5 hover:bg-blue-50 rounded text-blue-500" title="Edit website"><Pencil className="w-4 h-4" /></button>
+                              <button onClick={() => handleDeleteWebsite(site.id)} className="p-1.5 hover:bg-red-50 rounded text-red-500" title="Delete website"><Trash2 className="w-4 h-4" /></button>
                             </div>
                           </td>
                         </tr>

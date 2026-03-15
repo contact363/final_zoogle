@@ -27,7 +27,10 @@ from app.models.website import Website
 from app.models.crawl_log import CrawlLog
 from app.models.user import User
 from app.models.search_log import SearchLog
-from app.schemas.website import WebsiteCreate, WebsiteRead, WebsiteUpdate
+from app.schemas.website import (
+    WebsiteCreate, WebsiteRead, WebsiteUpdate,
+    TrainingRulesCreate, TrainingRulesRead,
+)
 from app.schemas.machine import MachineRead, MachineUpdate
 from app.utils.security import require_admin
 
@@ -142,6 +145,70 @@ async def delete_website(
     await db.execute(sql_delete(Machine).where(Machine.website_id == website_id))
     await db.execute(sql_delete(CrawlLog).where(CrawlLog.website_id == website_id))
     await db.delete(website)
+
+
+# ── Training Rules ────────────────────────────────────────────────────────────
+
+@router.get("/websites/{website_id}/training", response_model=Optional[TrainingRulesRead])
+async def get_training_rules(
+    website_id: int,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Return the training rules for a website, or null if none exist yet."""
+    from app.models.training_rules import WebsiteTrainingRules
+    result = await db.execute(
+        select(WebsiteTrainingRules).where(WebsiteTrainingRules.website_id == website_id)
+    )
+    return result.scalar_one_or_none()
+
+
+@router.post("/websites/{website_id}/training", response_model=TrainingRulesRead)
+async def save_training_rules(
+    website_id: int,
+    payload: TrainingRulesCreate,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Create or update (upsert) training rules for a website."""
+    from app.models.training_rules import WebsiteTrainingRules
+
+    # Verify website exists
+    website = (await db.execute(select(Website).where(Website.id == website_id))).scalar_one_or_none()
+    if not website:
+        raise HTTPException(status_code=404, detail="Website not found")
+
+    result = await db.execute(
+        select(WebsiteTrainingRules).where(WebsiteTrainingRules.website_id == website_id)
+    )
+    rules = result.scalar_one_or_none()
+
+    if rules:
+        for field, value in payload.model_dump(exclude_unset=True).items():
+            setattr(rules, field, value)
+    else:
+        rules = WebsiteTrainingRules(website_id=website_id, **payload.model_dump())
+        db.add(rules)
+
+    await db.flush()
+    await db.refresh(rules)
+    return rules
+
+
+@router.delete("/websites/{website_id}/training", status_code=204)
+async def delete_training_rules(
+    website_id: int,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Remove all training rules for a website (revert to auto-discovery)."""
+    from app.models.training_rules import WebsiteTrainingRules
+    result = await db.execute(
+        select(WebsiteTrainingRules).where(WebsiteTrainingRules.website_id == website_id)
+    )
+    rules = result.scalar_one_or_none()
+    if rules:
+        await db.delete(rules)
 
 
 # ── Crawl Control ─────────────────────────────────────────────────────────────

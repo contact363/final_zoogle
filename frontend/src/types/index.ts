@@ -92,3 +92,20 @@ export interface AuthToken {
   token_type: string;
   user: User;
 }
+
+export interface TrainingRules {
+  id: number;
+  website_id: number;
+  listing_selector:     string | null;
+  title_selector:       string | null;
+  url_selector:         string | null;
+  description_selector: string | null;
+  image_selector:       string | null;
+  price_selector:       string | null;
+  category_selector:    string | null;
+  pagination_selector:  string | null;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export type TrainingRulesForm = Omit<TrainingRules, "id" | "website_id" | "created_at" | "updated_at">;

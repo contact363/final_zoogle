@@ -108,7 +108,8 @@ class GenericSpider(BaseZoogleSpider):
         },
     }
 
-    def __init__(self, website_id=None, start_url=None, crawl_log_id=None, *args, **kwargs):
+    def __init__(self, website_id=None, start_url=None, crawl_log_id=None,
+                 training_rules=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.website_id  = int(website_id)  if website_id   else None
         self.crawl_log_id = int(crawl_log_id) if crawl_log_id else None
@@ -130,6 +131,22 @@ class GenericSpider(BaseZoogleSpider):
             f"Crawler init — original domain: {self._original_domain!r}, "
             f"normalized base domain: {self._base_domain!r}"
         )
+
+        # ── Training rules ────────────────────────────────────────────────────
+        # Passed as a JSON string by crawl_tasks when the admin has configured
+        # per-website selectors.  Empty dict = auto-discovery (default).
+        self._rules: dict = {}
+        if training_rules:
+            try:
+                self._rules = json.loads(training_rules)
+                logger.info(
+                    f"Training rules active for {self._base_domain}: "
+                    + ", ".join(
+                        f"{k}={v!r}" for k, v in self._rules.items() if v
+                    )
+                )
+            except Exception as exc:
+                logger.warning(f"Could not parse training_rules JSON: {exc}")
 
         # Deque for O(1) insertion + ordered eviction
         self._visited_order: deque[str] = deque()
@@ -340,6 +357,13 @@ class GenericSpider(BaseZoogleSpider):
         self._update_base_domain(response)
         try:
             category = self._extract_category(response)
+
+            # ── If admin has configured a listing_selector, use trained extraction ──
+            if self._rules.get("listing_selector"):
+                yield from self._extract_trained_cards(response, category)
+                yield from self._follow_all_links(response)
+                yield from self._follow_pagination(response)
+                return
 
             # Try structured card extraction first
             # _extract_machine_cards yields both MachineItem objects and
@@ -1134,6 +1158,201 @@ class GenericSpider(BaseZoogleSpider):
         except Exception as exc:
             logger.debug(f"_schedule_machine_links error at {response.url}: {exc}")
 
+    # ── Trained extraction (uses admin-configured CSS selectors) ─────────────
+
+    def _extract_trained_cards(self, response: Response, category: str | None = None):
+        """
+        Use admin-configured CSS selectors to extract machine cards.
+
+        Called only when self._rules has a listing_selector.
+        Each matched card is:
+          1. Yielded as a partial MachineItem (for immediate indexing).
+          2. Its detail URL is scheduled for full extraction via _parse_detail_page.
+
+        Unknown / unmatched selectors are logged as warnings so the admin
+        can diagnose and correct them without touching the crawler code.
+        """
+        listing_sel = self._rules.get("listing_selector", "")
+        cards = response.css(listing_sel)
+
+        if not cards:
+            logger.warning(
+                f"[trained] listing_selector {listing_sel!r} matched 0 elements at {response.url} "
+                f"— check selector in Admin → Web Sources → Train"
+            )
+            # Fall through to generic extraction so the crawl isn't wasted
+            yield from self._extract_machine_cards(response, category)
+            return
+
+        logger.info(f"[trained] {len(cards)} cards via {listing_sel!r} at {response.url}")
+
+        title_sel    = self._rules.get("title_selector")
+        url_sel      = self._rules.get("url_selector")
+        price_sel    = self._rules.get("price_selector")
+        desc_sel     = self._rules.get("description_selector")
+        image_sel    = self._rules.get("image_selector")
+        category_sel = self._rules.get("category_selector")
+
+        for card in cards:
+            # ── Link (required) ───────────────────────────────────────────────
+            link = None
+            if url_sel:
+                link = card.css(url_sel).get()
+                if not link:
+                    logger.debug(f"[trained] url_selector {url_sel!r} matched nothing in card")
+            if not link:
+                link = card.css("a::attr(href)").get()
+            if not link:
+                continue
+
+            full_url = urljoin(response.url, link.strip()).split("#")[0]
+            if not same_domain(full_url, self._base_domain) or skip_url(full_url):
+                continue
+
+            # Schedule detail page
+            if not self._is_visited(full_url):
+                self._mark_visited(full_url)
+                yield scrapy.Request(
+                    full_url,
+                    callback=self._parse_trained_detail,
+                    errback=self._errback,
+                    meta={"referer": response.url, "trained": True},
+                )
+
+            # ── Title ─────────────────────────────────────────────────────────
+            title = None
+            if title_sel:
+                title = self.clean_text(card.css(title_sel).getall())
+                if not title:
+                    logger.debug(f"[trained] title_selector {title_sel!r} matched nothing in card")
+            if not title:
+                for sel in CARD_TITLE_SELECTORS:
+                    title = self.clean_text(card.css(sel).getall())
+                    if title:
+                        break
+            if not title:
+                continue
+
+            # ── Price ─────────────────────────────────────────────────────────
+            price_raw = None
+            if price_sel:
+                price_raw = self.clean_text(card.css(price_sel).getall())
+            price, currency = self.extract_price(price_raw or "")
+
+            # ── Description ───────────────────────────────────────────────────
+            description = None
+            if desc_sel:
+                description = self.clean_text(card.css(desc_sel).getall())
+
+            # ── Image ─────────────────────────────────────────────────────────
+            images: list[str] = []
+            if image_sel:
+                img = card.css(image_sel).get()
+                if img and not img.startswith("data:"):
+                    images = self.normalize_image_urls([img], response.url)
+            if not images:
+                for sel in CARD_IMAGE_SELECTORS:
+                    img = card.css(sel).get()
+                    if img and not img.startswith("data:"):
+                        images = self.normalize_image_urls([img], response.url)
+                        break
+
+            # ── Category ──────────────────────────────────────────────────────
+            cat = None
+            if category_sel:
+                cat = self.clean_text(card.css(category_sel).getall())
+            cat = cat or category
+
+            brand, model = self._split_brand_model(title)
+            machine_type = self._infer_machine_type_from_text(
+                f"{title} {cat or ''} {full_url}"
+            )
+
+            yield MachineItem(
+                machine_url=full_url,
+                website_id=self.website_id,
+                website_source=self._base_domain,
+                category=cat,
+                machine_type=machine_type,
+                brand=brand,
+                model=model,
+                price=price,
+                currency=currency,
+                location=None,
+                description=description,
+                images=images,
+                specs={},
+            )
+
+    def _parse_trained_detail(self, response: Response):
+        """
+        Detail page handler for trained crawls.
+        Uses trained detail selectors when present, otherwise falls back to
+        the standard CSS/JSON-LD/script pipeline.
+        """
+        self._update_base_domain(response)
+        try:
+            title_sel = self._rules.get("title_selector")
+            price_sel = self._rules.get("price_selector")
+            desc_sel  = self._rules.get("description_selector")
+            image_sel = self._rules.get("image_selector")
+
+            # Use trained selectors if any detail-page fields were configured
+            if title_sel or desc_sel or price_sel:
+                title = None
+                if title_sel:
+                    title = self.clean_text(response.css(title_sel).getall())
+                if not title:
+                    title = self.clean_text(response.css("h1 *::text, h1::text").getall())
+                if not title:
+                    # Last resort: <title> tag
+                    page_title = response.css("title::text").get("").strip()
+                    for sep in (" | ", " - ", " – ", " — "):
+                        if sep in page_title:
+                            page_title = page_title.split(sep)[0].strip()
+                            break
+                    title = page_title or None
+
+                if not title:
+                    logger.debug(f"[trained] no title found on detail page {response.url}")
+                    return
+
+                price_raw = self.clean_text(response.css(price_sel).getall()) if price_sel else None
+                price, currency = self.extract_price(price_raw or "")
+
+                description = self.clean_text(response.css(desc_sel).getall()) if desc_sel else None
+
+                images: list[str] = []
+                if image_sel:
+                    img_urls = response.css(image_sel).getall()
+                    images = self.normalize_image_urls(img_urls, response.url)
+
+                brand, model = self._split_brand_model(title)
+                machine_type = self._infer_machine_type(response)
+                category     = self._extract_category(response)
+
+                yield MachineItem(
+                    machine_url=response.url,
+                    website_id=self.website_id,
+                    website_source=self._base_domain,
+                    category=category,
+                    machine_type=machine_type,
+                    brand=brand,
+                    model=model,
+                    price=price,
+                    currency=currency,
+                    location=None,
+                    description=description[:2000] if description else None,
+                    images=images,
+                    specs={},
+                )
+            else:
+                # No detail-page trained selectors — use standard pipeline
+                yield from self._parse_detail_page(response)
+
+        except Exception as exc:
+            logger.error(f"_parse_trained_detail error at {response.url}: {exc}")
+
     # ── Link following ────────────────────────────────────────────────────────
 
     def _follow_all_links(self, response: Response):
@@ -1192,9 +1411,23 @@ class GenericSpider(BaseZoogleSpider):
         Follow pagination links on listing pages.
         Handles: rel=next links, .pagination links, ?page=N, ?offset=N,
         /page/N/ path segments, WooCommerce, and numeric page links.
+        When a trained pagination_selector is configured it is tried first.
         """
         seen: set[str] = set()
         current = response.url
+
+        # ── Admin-configured pagination selector (highest priority) ──────────
+        trained_pag = self._rules.get("pagination_selector")
+        if trained_pag:
+            for href in response.css(trained_pag).getall():
+                url = urljoin(current, href).split("#")[0]
+                if self._add_pagination_url(url, seen):
+                    logger.debug(f"[trained] pagination → {url}")
+                    yield response.follow(
+                        url, callback=self._parse_listing_page,
+                        errback=self._errback,
+                        meta={"referer": current},
+                    )
 
         # Standard CSS-based pagination selectors
         for sel in PAGINATION_SELECTORS:
