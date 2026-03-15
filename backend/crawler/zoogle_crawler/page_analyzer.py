@@ -24,8 +24,18 @@ MACHINE_WORDS: set[str] = {
     "press-brake", "pressbrake", "machinetools", "lathes",
     # German / European terms common on multi-language sites
     "maschine", "maschinen", "drehmaschine", "fraesmaschine", "schleifmaschine",
+    "bearbeitungszentrum", "drehzentrum", "bohrmaschine", "saege", "kreissaege",
+    "bandsaege", "schweissmaschine", "blechbearbeitung", "stanzmaschine",
+    "abkantpresse", "gesenkbiegepresse", "hydraulikpresse", "exzenterpresse",
+    "gebraucht", "occasion", "werkzeugmaschine", "werkzeugmaschinen",
+    "zerspanungsmaschine", "umformmaschine", "kunststoffmaschine",
+    "spritzguss", "spritzgiessmaschine", "extruder",
     # French
-    "machine-outil", "tour", "fraiseuse",
+    "machine-outil", "tour", "fraiseuse", "rectifieuse", "presse",
+    # Italian
+    "tornio", "fresatrice", "rettificatrice",
+    # Spanish
+    "torno", "fresadora", "rectificadora",
 }
 
 CATEGORY_WORDS: set[str] = {
@@ -254,9 +264,9 @@ CARD_SELECTORS: list[str] = [
     ".product-item", ".machine-item", ".listing-item", ".equipment-item",
     ".inventory-item", ".stock-item",
     ".used-machine-card", ".used-equipment-card",
-    # Article tags
+    # Article tags — SPECIFIC classes only (bare "article" is too broad)
     "article.product", "article.machine", "article.listing",
-    "article.equipment", "article.item", "article",
+    "article.equipment", "article.item",
     # Section tags
     "section.product", "section.machine", "section.listing",
     # Grid / list children
@@ -274,8 +284,22 @@ CARD_SELECTORS: list[str] = [
     ".card-deck .card", ".row .card",
     # Generic but matched only after specific ones
     "li.product", "li.listing", "li.machine", "li.item",
-    # Broad fallback: any <div> inside a list container that has a link + heading
+    # Broad fallback: any <div>/<li> inside common list/grid containers
     ".products > div", ".listings > div", ".machines > div",
+    ".products > li", ".listings > li", ".machines > li",
+    ".items > li", ".items > div",
+    ".offers > li", ".offers > div",
+    ".angebote > li", ".angebote > div",
+    # Common German/European CMS patterns
+    "[class*='machine'] > div", "[class*='maschine'] > div",
+    "[class*='product'] > li", "[class*='listing'] > li",
+    "[class*='equipment'] > div", "[class*='equipment'] > li",
+    # Table-based layouts (older sites)
+    "table.products tr", "table.machines tr", "table.listings tr",
+    # Very generic: any <div> with class containing common patterns
+    "div[class*='card']", "div[class*='item']", "div[class*='result']",
+    # Last resort: article without class constraint
+    "article",
 ]
 
 # Within a card — title

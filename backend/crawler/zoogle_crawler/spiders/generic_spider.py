@@ -50,6 +50,7 @@ from zoogle_crawler.spiders.base_spider import BaseZoogleSpider
 from zoogle_crawler.page_analyzer import (
     skip_url, score_url, is_detail_url, is_listing_url, is_worth_following,
     same_domain, looks_like_pagination_url, build_page_url,
+    MACHINE_WORDS,
     NAV_SELECTORS, CARD_SELECTORS,
     CARD_TITLE_SELECTORS, CARD_PRICE_SELECTORS, CARD_LOCATION_SELECTORS,
     CARD_LINK_SELECTORS, CARD_IMAGE_SELECTORS,
@@ -179,11 +180,23 @@ class GenericSpider(BaseZoogleSpider):
             "/angebote", "/angebote/", "/produkte", "/produkte/",
             "/gebraucht", "/gebraucht/", "/occasion", "/occasion/",
             "/haendler", "/haendler/",
+            "/maschinenpark", "/maschinenpark/",
+            "/verkauf", "/verkauf/",
+            "/lagerbestand", "/lagerbestand/",
+            "/bestand", "/bestand/",
+            "/werkzeugmaschinen", "/werkzeugmaschinen/",
+            "/zerspanung", "/zerspanung/",
+            "/drehen", "/fraesen", "/schleifen",
             # French paths
             "/occasions", "/occasions/", "/annonces", "/annonces/",
+            # Italian paths
+            "/macchine", "/usato",
             # Generic English variants
             "/for-sale", "/used-equipment", "/second-hand",
             "/pre-owned", "/available-machines",
+            "/used", "/sale", "/buy",
+            # Common category/filter paths
+            "/category", "/categories", "/tag", "/type",
         ):
             url = base + path
             if not self._is_visited(url):
@@ -263,8 +276,7 @@ class GenericSpider(BaseZoogleSpider):
     def _parse_listing_page(self, response: Response):
         """
         Extract machine cards, follow detail links, follow pagination.
-        Falls back to detail-page extraction when no card containers match
-        (e.g. a machine detail page routed here due to low URL score).
+        Falls back to detail-page extraction when no card containers match.
         Wrapped in try/except so one bad listing page never halts the crawl.
         """
         try:
@@ -278,13 +290,17 @@ class GenericSpider(BaseZoogleSpider):
             jsonld_items = list(self._extract_jsonld(response))
             yield from jsonld_items
 
-            # If no cards AND no JSON-LD were found and the page looks like a
-            # detail page (has an h1 + some content), attempt CSS detail extraction.
-            # This handles machine detail pages that scored too low to be routed
-            # to _parse_detail_page (e.g. /produkt/cnc-maschine-abc on German sites).
-            if not cards_found and not jsonld_items and self._looks_like_detail(response):
-                logger.debug(f"No cards/JSON-LD on {response.url} — trying detail CSS extraction")
-                yield from self._parse_detail_css(response)
+            if not cards_found and not jsonld_items:
+                if self._looks_like_detail(response):
+                    # Page has an h1 — try CSS detail extraction (handles machine
+                    # detail pages that scored too low to reach _parse_detail_page)
+                    logger.debug(f"No cards/JSON-LD on {response.url} — trying detail CSS extraction")
+                    yield from self._parse_detail_css(response)
+                else:
+                    # No structured content found at all — do link-based machine
+                    # discovery: find links whose text/URL contains machine keywords
+                    # and schedule them as detail page requests.
+                    yield from self._schedule_machine_links(response)
 
             yield from self._follow_all_links(response)
             yield from self._follow_pagination(response)
@@ -340,6 +356,14 @@ class GenericSpider(BaseZoogleSpider):
                 if not cards:
                     continue
 
+                # Skip selectors that match only 1 element AND it's a page wrapper
+                # (e.g. bare "article" matches the single <article> body wrapper)
+                if len(cards) == 1 and container_sel in ("article", "section"):
+                    # Only use single-article if it looks like a product detail, not a wrapper
+                    wrapper_text_len = len(cards[0].css("::text").getall())
+                    if wrapper_text_len > 50:  # too many text nodes → page wrapper
+                        continue
+
                 extracted_any = False
                 for card in cards:
                     try:
@@ -369,6 +393,61 @@ class GenericSpider(BaseZoogleSpider):
                 logger.debug(f"Card selector '{container_sel}' error: {exc}")
                 continue
 
+        # ── Generic XPath fallback: detect repeated div/li elements with img+link ──
+        # This catches custom CMS layouts where no known CSS class is used.
+        yield from self._extract_generic_cards(response, category)
+
+    def _extract_generic_cards(self, response: Response, category: str | None):
+        """
+        Last-resort card detection via XPath pattern matching.
+        Finds any <li> or <div> elements that each contain both a link and an image,
+        and share the same parent — indicating a machine listing grid/list.
+        """
+        try:
+            # Find all <li> or <div> nodes that contain both an <a> and an <img>
+            candidates = response.xpath(
+                "//*[self::li or self::div][.//a[@href] and .//img]"
+            )
+            if len(candidates) < 2:
+                return  # Need at least 2 to indicate a list pattern
+
+            # Group by parent XPath to find sibling groups
+            parent_groups: dict[str, list] = {}
+            for node in candidates:
+                parent_path = node.xpath("..").xpath("name()").get("unknown")
+                parent_class = node.xpath("../@class").get("") or ""
+                group_key = f"{parent_path}::{parent_class[:40]}"
+                parent_groups.setdefault(group_key, []).append(node)
+
+            # Only process groups with 2+ siblings (true listing patterns)
+            for group_key, nodes in parent_groups.items():
+                if len(nodes) < 2:
+                    continue
+
+                extracted_any = False
+                for card in nodes:
+                    try:
+                        item = self._extract_card(card, response, category)
+                        if item:
+                            extracted_any = True
+                            yield item
+                            detail_url = item["machine_url"]
+                            if not self._is_visited(detail_url):
+                                self._mark_visited(detail_url)
+                                yield response.follow(
+                                    detail_url,
+                                    callback=self._parse_detail_page,
+                                    errback=self._errback,
+                                    meta={"referer": response.url},
+                                )
+                    except Exception as exc:
+                        logger.debug(f"Generic card extraction error: {exc}")
+
+                if extracted_any:
+                    return  # Found a working pattern
+        except Exception as exc:
+            logger.debug(f"_extract_generic_cards error: {exc}")
+
     def _extract_card(self, card, response: Response, category: str | None) -> MachineItem | None:
         """Extract a MachineItem from a single card element."""
         # Link is required to identify the machine
@@ -384,12 +463,24 @@ class GenericSpider(BaseZoogleSpider):
         if not same_domain(full_url, self._base_domain) or skip_url(full_url):
             return None
 
-        # Title is required
+        # Title — try specific selectors, then any heading, then link text
         title = None
         for sel in CARD_TITLE_SELECTORS:
             title = self.clean_text(card.css(sel).getall())
             if title and len(title) > 2:
                 break
+        if not title:
+            # Try ALL text within any heading tag inside this card
+            for hsel in ("h1 *::text", "h2 *::text", "h3 *::text", "h4 *::text",
+                         "h1::text", "h2::text", "h3::text", "h4::text"):
+                title = self.clean_text(card.css(hsel).getall())
+                if title and len(title) > 2:
+                    break
+        if not title:
+            # Last resort: use the link anchor text if it's descriptive enough
+            link_text = self.clean_text(card.css("a *::text, a::text").getall())
+            if link_text and len(link_text) > 4:
+                title = link_text
         if not title:
             return None
 
@@ -496,10 +587,8 @@ class GenericSpider(BaseZoogleSpider):
             logger.warning(f"JS render pipeline error at {response.url}: {exc}")
 
     def _looks_like_detail(self, response: Response) -> bool:
-        has_h1    = bool(response.css("h1").get())
-        has_price = any(response.css(s).get() for s in PRICE_SELECTORS[:6])
-        has_image = bool(response.css("img[src]").get())
-        return has_h1 and (has_price or has_image)
+        """A page 'looks like a detail page' if it has any h1 heading."""
+        return bool(response.css("h1").get())
 
     # ── JSON-LD extraction ────────────────────────────────────────────────────
 
@@ -736,12 +825,33 @@ class GenericSpider(BaseZoogleSpider):
 
     def _parse_detail_css_inner(self, response: Response):
         """Inner implementation — separated so _parse_detail_css can wrap with try/except."""
-        # Title is required
+        # Title — try specific selectors first (most reliable)
         title = None
         for sel in TITLE_SELECTORS:
             title = self.clean_text(response.css(sel).getall())
             if title and len(title) > 2:
                 break
+
+        # Aggressive fallback: get ALL text within h1, including nested spans/em/strong
+        if not title:
+            h1_parts = response.css("h1 *::text, h1::text").getall()
+            title = self.clean_text([t for t in h1_parts if t.strip()])
+
+        # Try h2 if still nothing
+        if not title:
+            h2_parts = response.css("h2 *::text, h2::text").getall()
+            title = self.clean_text([t for t in h2_parts if t.strip()])
+
+        # Use <title> tag as last resort (strip site name suffix)
+        if not title:
+            page_title = response.css("title::text").get("").strip()
+            for sep in (" | ", " - ", " – ", " — ", " :: ", " : "):
+                if sep in page_title:
+                    page_title = page_title.split(sep)[0].strip()
+                    break
+            if len(page_title) > 2:
+                title = page_title
+
         if not title:
             return
 
@@ -779,7 +889,7 @@ class GenericSpider(BaseZoogleSpider):
         for attr in ("data-src", "data-lazy", "data-lazy-src", "data-original",
                      "data-image", "data-zoom-image", "data-full"):
             image_urls.extend(
-                u for u in response.css(f"img::{attr}").getall()
+                u for u in response.css(f"img::attr({attr})").getall()
                 if u and not u.startswith("data:")
             )
         image_urls = self.normalize_image_urls(image_urls, response.url)
@@ -828,6 +938,55 @@ class GenericSpider(BaseZoogleSpider):
             images=image_urls,
             specs=specs,
         )
+
+    # ── Machine link discovery fallback ──────────────────────────────────────
+
+    def _schedule_machine_links(self, response: Response):
+        """
+        Fallback discovery: scan all <a> tags on the page.
+        Any link whose anchor text OR href contains a machine keyword is
+        scheduled as a detail-page request.  This handles sites where the
+        card/grid HTML doesn't match any known CSS pattern.
+        """
+        try:
+            seen: set[str] = set()
+
+            for a_el in response.css("a[href]"):
+                href = (a_el.css("::attr(href)").get() or "").strip()
+                if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                    continue
+
+                # Check anchor text AND all descendant text (for icon-font links)
+                anchor_text = " ".join(
+                    t.strip() for t in a_el.css("*::text, ::text").getall() if t.strip()
+                ).lower()
+                href_lower = href.lower()
+
+                has_machine_word = (
+                    any(w in anchor_text for w in MACHINE_WORDS)
+                    or any(w in href_lower for w in MACHINE_WORDS)
+                )
+                if not has_machine_word:
+                    continue
+
+                full_url = urljoin(response.url, href).split("#")[0]
+                if not same_domain(full_url, self._base_domain) or skip_url(full_url):
+                    continue
+                if self._is_visited(full_url) or full_url in seen:
+                    continue
+
+                seen.add(full_url)
+                self._mark_visited(full_url)
+                # Use score to decide callback — high-score URLs → detail, rest → listing
+                s = score_url(full_url)
+                cb = self._parse_detail_page if s >= 5 else self._parse_listing_page
+                yield response.follow(
+                    full_url, callback=cb,
+                    errback=self._errback,
+                    meta={"referer": response.url},
+                )
+        except Exception as exc:
+            logger.debug(f"_schedule_machine_links error at {response.url}: {exc}")
 
     # ── Link following ────────────────────────────────────────────────────────
 
