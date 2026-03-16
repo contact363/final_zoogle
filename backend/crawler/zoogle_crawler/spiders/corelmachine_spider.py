@@ -594,7 +594,12 @@ class CoreMachineSpider(GenericSpider):
         #   <div class="py-2">
         #     <span class="font-bold">Label text </span> plain text value
         #   </div>
-        stock_number  = self._corel_label(response, "Refrence No")   # site typo
+        stock_number  = self._corel_label(response, "Refrence No") or self._corel_label(response, "Reference No")   # site typo
+        # Fallback: extract trailing numeric ID from URL slug (e.g. "mazak-qt28n-311234" → "311234")
+        if not stock_number:
+            m_sn = re.search(r'(\d{4,})(?:-\d+)?$', url.rstrip("/").split("/")[-1])
+            if m_sn:
+                stock_number = m_sn.group(1)
         capacity      = self._corel_label(response, "Capacity")
         year_raw      = self._corel_label(response, "Year of construction")
         condition     = self._corel_label(response, "Condition")
@@ -743,6 +748,15 @@ class CoreMachineSpider(GenericSpider):
         image_raw = get("image", "imageUrl", "thumbnail", "photo")
         images    = [image_raw] if image_raw and image_raw.startswith("http") else []
 
+        # Extract reference/stock number: try API fields first, then parse from URL slug
+        stock_number = get("reference_no", "refrence_no", "ref_no", "stock_number",
+                           "sku", "product_id", "_id", "id")
+        if not stock_number and url_slug:
+            # URL slugs end with a numeric ID e.g. "0-5-ton-coffing-hoist-311126"
+            m = re.search(r'(\d{4,})(?:-\d+)?$', url_slug.split("/")[-1])
+            if m:
+                stock_number = m.group(1)
+
         brand, model = self._split_brand_model_corel(title)
         machine_type = self._infer_machine_type_from_text(f"{title} {category}")
 
@@ -754,6 +768,7 @@ class CoreMachineSpider(GenericSpider):
             machine_type=machine_type,
             brand=brand,
             model=model,
+            stock_number=stock_number,
             price=None,
             currency="INR",
             location="Nashik, India",
