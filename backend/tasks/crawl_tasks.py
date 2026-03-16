@@ -1191,14 +1191,47 @@ def _collect_urls(start_url: str, target_count: int = 0) -> tuple[list[str], str
             "apikey": _ZATPAT_SUPABASE_KEY,
             "Authorization": f"Bearer {_ZATPAT_SUPABASE_KEY}",
         })
+
+        # Priority order for URL-identifier columns (first found wins)
+        _URL_FIELDS = ("url", "slug", "page_url", "product_url", "machine_url",
+                       "listing_url", "link", "permalink", "source_url")
+        _ID_FIELDS  = ("sku_number", "id_prefix", "sku", "product_code",
+                       "reference_no", "id")
+
         for table in sb_tables:
+            # ── Step A: probe one row to discover actual columns ──────────────
+            probe = _safe_get(
+                session,
+                f"{_ZATPAT_SUPABASE_URL}/rest/v1/{table}?select=*&limit=1",
+                timeout=timeout,
+            )
+            if not probe or probe.status_code != 200:
+                continue
+            try:
+                probe_rows = probe.json()
+            except Exception:
+                continue
+            if not isinstance(probe_rows, list) or not probe_rows:
+                continue
+
+            available = set(probe_rows[0].keys()) if isinstance(probe_rows[0], dict) else set()
+            url_cols = [c for c in _URL_FIELDS if c in available]
+            id_cols  = [c for c in _ID_FIELDS  if c in available]
+            if not url_cols and not id_cols:
+                continue
+
+            select_cols = ",".join(dict.fromkeys(url_cols + id_cols))
+            logger.info(f"[collect_urls] supabase table={table} select={select_cols}")
+
+            # ── Step B: paginate and collect all URLs ─────────────────────────
             offset = 0
             page_size = 1000
             table_urls: list[str] = []
             while True:
                 r = _safe_get(
                     session,
-                    f"{_ZATPAT_SUPABASE_URL}/rest/v1/{table}?select=url,slug,sku_number,id&limit={page_size}&offset={offset}",
+                    f"{_ZATPAT_SUPABASE_URL}/rest/v1/{table}"
+                    f"?select={select_cols}&limit={page_size}&offset={offset}",
                     timeout=timeout,
                 )
                 if not r or r.status_code not in (200, 206):
@@ -1209,22 +1242,39 @@ def _collect_urls(start_url: str, target_count: int = 0) -> tuple[list[str], str
                     break
                 if not isinstance(rows, list) or not rows:
                     break
+
                 for row in rows:
-                    slug = (row.get("url") or row.get("slug") or "").strip()
-                    uid  = row.get("sku_number") or row.get("id", "")
-                    if slug and slug.startswith("http"):
-                        table_urls.append(slug)
-                    elif slug and not str(slug).isdigit():
-                        table_urls.append(f"{base}/{slug.lstrip('/')}")
-                    elif uid:
-                        table_urls.append(f"{base}/machine/{uid}")
+                    # Try explicit URL/slug fields first
+                    url_built = None
+                    for uf in url_cols:
+                        val = str(row.get(uf) or "").strip()
+                        if val and val.lower() not in ("none", "null", ""):
+                            if val.startswith("http"):
+                                url_built = val
+                            elif not val.isdigit():
+                                url_built = f"{base}/{val.lstrip('/')}"
+                            break
+                    if not url_built:
+                        # Fall back to ID-based URL construction
+                        for idf in id_cols:
+                            uid = str(row.get(idf) or "").strip()
+                            if uid and uid.lower() not in ("none", "null", ""):
+                                url_built = f"{base}/machine/{uid}"
+                                break
+                    if url_built:
+                        table_urls.append(url_built)
+
                 if len(rows) < page_size:
                     break
                 offset += page_size
+
             if table_urls:
                 for h in ("apikey", "Authorization"):
                     session.headers.pop(h, None)
-                return table_urls, f"supabase:{table}"
+                deduped = list(dict.fromkeys(table_urls))
+                logger.info(f"[collect_urls] supabase:{table} → {len(deduped)} URLs")
+                return deduped, f"supabase:{table}"
+
         for h in ("apikey", "Authorization"):
             session.headers.pop(h, None)
 
@@ -1308,7 +1358,176 @@ def _collect_urls(start_url: str, target_count: int = 0) -> tuple[list[str], str
         if wp_urls:
             return wp_urls, f"wordpress:{wp_type}"
 
-    # ── 5. Sitemap — collect all product URLs ─────────────────────────────────
+    # ── 5. Generic JSON API probe ─────────────────────────────────────────────
+    # Try common REST API paths for sites that serve machine data via JSON.
+    # For each endpoint: extract items, build URLs from slug/id fields,
+    # and follow pagination via "next", "page", or offset patterns.
+    _GENERIC_API_PATHS = (
+        "/api/machines", "/api/products", "/api/inventory", "/api/items",
+        "/api/stock", "/api/listings", "/api/catalog",
+        "/api/v1/machines", "/api/v1/products", "/api/v2/machines",
+        "/machines.json", "/products.json",
+        "/rest/v1/machines", "/rest/v1/products",
+    )
+    _API_URL_FIELDS = ("url", "slug", "permalink", "link", "machine_url",
+                       "product_url", "listing_url", "page_url", "source_url")
+    _API_ID_FIELDS  = ("sku_number", "sku", "id_prefix", "reference_no",
+                       "product_code", "id")
+    _API_WRAPPER_KEYS = ("data", "results", "items", "products", "machines",
+                         "listings", "records", "inventory")
+
+    def _build_url_from_row(row: dict, site_base: str) -> str | None:
+        """Extract or construct a URL from a JSON row dict."""
+        for uf in _API_URL_FIELDS:
+            val = str(row.get(uf) or "").strip()
+            if val and val.lower() not in ("none", "null", ""):
+                if val.startswith("http"):
+                    return val
+                if not val.isdigit():
+                    return f"{site_base}/{val.lstrip('/')}"
+        for idf in _API_ID_FIELDS:
+            uid = str(row.get(idf) or "").strip()
+            if uid and uid.lower() not in ("none", "null", ""):
+                return f"{site_base}/machine/{uid}"
+        return None
+
+    for api_path in _GENERIC_API_PATHS:
+        r = _safe_get(session, f"{base}{api_path}", timeout=timeout, json_mode=True)
+        if not r or r.status_code != 200:
+            continue
+        try:
+            data = r.json()
+        except Exception:
+            continue
+
+        # Unwrap common envelope keys
+        total_available = None
+        if isinstance(data, dict):
+            total_available = (data.get("total") or data.get("count")
+                               or data.get("total_count") or data.get("totalCount"))
+            for wk in _API_WRAPPER_KEYS:
+                if isinstance(data.get(wk), list):
+                    data = data[wk]
+                    break
+
+        if not isinstance(data, list) or not data:
+            continue
+
+        # Check the first item looks like a machine record (has price/year/id/model)
+        first = data[0] if isinstance(data[0], dict) else {}
+        machine_signals = ("price", "year", "model", "brand", "condition",
+                           "id", "sku", "sku_number", "reference_no", "machine_type")
+        if not any(k in first for k in machine_signals):
+            continue
+
+        api_urls: list[str] = []
+        for row in data:
+            if isinstance(row, dict):
+                u = _build_url_from_row(row, base)
+                if u:
+                    api_urls.append(u)
+
+        if not api_urls:
+            continue
+
+        # Follow pagination — try offset/page patterns up to target_count
+        page_size = len(data)
+        offset = page_size
+        max_pages = 500
+        for _ in range(max_pages):
+            if total_available and len(api_urls) >= int(total_available):
+                break
+            if target_count > 0 and len(api_urls) >= target_count:
+                break
+            sep = "&" if "?" in api_path else "?"
+            next_url = f"{base}{api_path}{sep}offset={offset}&limit={page_size}"
+            rp = _safe_get(session, next_url, timeout=timeout, json_mode=True)
+            if not rp or rp.status_code != 200:
+                break
+            try:
+                pdata = rp.json()
+            except Exception:
+                break
+            if isinstance(pdata, dict):
+                for wk in _API_WRAPPER_KEYS:
+                    if isinstance(pdata.get(wk), list):
+                        pdata = pdata[wk]
+                        break
+            if not isinstance(pdata, list) or not pdata:
+                break
+            for row in pdata:
+                if isinstance(row, dict):
+                    u = _build_url_from_row(row, base)
+                    if u:
+                        api_urls.append(u)
+            if len(pdata) < page_size:
+                break
+            offset += page_size
+
+        if api_urls:
+            deduped = list(dict.fromkeys(api_urls))
+            logger.info(f"[collect_urls] json-api:{api_path} → {len(deduped)} URLs")
+            return deduped, f"json-api:{api_path}"
+
+    # ── 5b. JavaScript data extraction ────────────────────────────────────────
+    # Many SPA/Next.js sites embed all product data in the initial HTML as JSON
+    # blobs: __NEXT_DATA__, window.__INITIAL_STATE__, Apollo cache, etc.
+    if homepage_html_cached:
+        js_urls: list[str] = []
+
+        # Pattern 1: Next.js SSR payload (<script id="__NEXT_DATA__">)
+        m = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+                      homepage_html_cached, re.DOTALL)
+        if m:
+            try:
+                nd = json.loads(m.group(1))
+                # Walk the props tree looking for arrays of machine objects
+                def _walk_nd(obj, depth=0):
+                    if depth > 8 or not isinstance(obj, (dict, list)):
+                        return
+                    if isinstance(obj, list) and len(obj) > 2:
+                        for item in obj:
+                            if isinstance(item, dict):
+                                u = _build_url_from_row(item, base)
+                                if u:
+                                    js_urls.append(u)
+                        return
+                    if isinstance(obj, dict):
+                        for v in obj.values():
+                            _walk_nd(v, depth + 1)
+                _walk_nd(nd)
+            except Exception:
+                pass
+
+        # Pattern 2: window.__DATA__ = {...} or window.INITIAL_STATE = {...}
+        for js_pat in (r'window\.__(?:DATA|INITIAL_STATE|APP_STATE|STATE)__\s*=\s*(\{.*?\});',
+                       r'var\s+__PRELOADED_STATE__\s*=\s*(\{.*?\});'):
+            for m in re.finditer(js_pat, homepage_html_cached, re.DOTALL):
+                try:
+                    obj = json.loads(m.group(1))
+                    def _walk_state(o, depth=0):
+                        if depth > 6 or not isinstance(o, (dict, list)):
+                            return
+                        if isinstance(o, list):
+                            for item in o:
+                                if isinstance(item, dict):
+                                    u = _build_url_from_row(item, base)
+                                    if u:
+                                        js_urls.append(u)
+                            return
+                        if isinstance(o, dict):
+                            for v in o.values():
+                                _walk_state(v, depth + 1)
+                    _walk_state(obj)
+                except Exception:
+                    pass
+
+        if js_urls:
+            deduped = list(dict.fromkeys(js_urls))
+            logger.info(f"[collect_urls] js-data-extraction → {len(deduped)} URLs")
+            return deduped, "js-data-extraction"
+
+    # ── 6. Sitemap — collect all product URLs ─────────────────────────────────
     sitemap_urls: list[str] = []
     for sitemap_path in ("/sitemap.xml", "/sitemap_index.xml",
                          "/product-sitemap.xml", "/sitemap-products.xml"):
@@ -1474,6 +1693,7 @@ def _execute_url_collection(website_id: int, db: Session) -> None:
 
         is_blocked = "blocked" in method or "site-up-but-blocked" in method
         is_unreachable = method == "site-unreachable"
+        is_no_urls = method == "no-urls-found"
         log.status = "success" if urls else "error"
         log.machines_found = url_count
 
@@ -1481,14 +1701,34 @@ def _execute_url_collection(website_id: int, db: Session) -> None:
             status_note = "Site could not be reached (connection refused, timeout, or DNS failure)"
         elif is_blocked and not urls:
             status_note = "Site is online but blocking automated requests (WAF/Cloudflare) — try training rules or manual crawl"
+        elif is_no_urls:
+            status_note = (
+                "No product URLs detected. Site may use JavaScript rendering or "
+                "a non-standard API. Consider adding a dedicated spider."
+            )
         else:
             status_note = None
 
+        coverage_pct = f"{int(url_count/target*100)}%" if target > 0 else "?"
+        # Determine the human-readable method name for the log
+        if method.startswith("supabase:"):
+            method_label = f"Supabase API ({method.split(':', 1)[1]} table)"
+        elif method.startswith("json-api:"):
+            method_label = f"JSON API endpoint ({method.split(':', 1)[1]})"
+        elif method.startswith("js-data"):
+            method_label = "JavaScript data extraction"
+        elif method.startswith("html-scan"):
+            method_label = f"HTML pagination scan"
+        elif method.startswith("corelmachine"):
+            method_label = "CoreMachine JSON API"
+        else:
+            method_label = method
+
         log.log_output = (
-            f"URL collection method: {method}\n"
+            f"URL collection method: {method_label}\n"
             f"URLs collected: {url_count}\n"
             f"Target count:   {target or 'unknown'}\n"
-            f"Coverage:       {int(url_count/target*100) if target > 0 else '?'}%\n"
+            f"Coverage:       {coverage_pct}\n"
         )
         log.error_details = status_note if not urls else None
         log.finished_at = datetime.now(timezone.utc)
