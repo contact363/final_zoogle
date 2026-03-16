@@ -413,6 +413,7 @@ class ZatPatMachinesSpider(BaseZoogleSpider):
             machine_type=machine_type,
             brand=brand.strip() or None,
             model=model or None,
+            stock_number=sku,
             price=price,
             currency=currency,
             location=location,
