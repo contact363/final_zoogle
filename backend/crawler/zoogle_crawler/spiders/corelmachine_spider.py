@@ -87,7 +87,7 @@ class CoreMachineSpider(GenericSpider):
 
     custom_settings = {
         "DEPTH_LIMIT":                     5,
-        "CLOSESPIDER_ITEMCOUNT":           1000,
+        "CLOSESPIDER_ITEMCOUNT":           0,       # 0 = no limit
         "DOWNLOAD_DELAY":                  1.0,
         "RANDOMIZE_DOWNLOAD_DELAY":        True,
         "CONCURRENT_REQUESTS_PER_DOMAIN":  3,
@@ -157,12 +157,36 @@ class CoreMachineSpider(GenericSpider):
     def start_requests(self):
         """
         Seed the queue with:
-          1. /api/subcategory/all  (JSON API — primary discovery)
-          2. /usedmachinestocklist (SSR subcategory index — backup link scan)
+          1. /api/product/all  (global product dump — fastest path to all machines)
+          2. /api/subcategory/all  (JSON API — per-subcategory discovery)
+          3. /usedmachinestocklist (SSR subcategory index — backup link scan)
         Deliberately skips the generic spider's path-blasting to avoid
         the 140+ 404s that pollute the crawl stats.
         """
         logger.info(f"[CoreMachineSpider v={SPIDER_VERSION}] start_requests")
+
+        # 0. Probe global "all products" API endpoints — if any of these return
+        #    a full product list we get everything in one shot.
+        _global_api_probes = [
+            f"{BASE_URL}/api/product/all",
+            f"{BASE_URL}/api/product",
+            f"{BASE_URL}/api/products",
+            f"{BASE_URL}/api/products/all",
+            f"{BASE_URL}/api/products?status=true",
+            f"{BASE_URL}/api/products?status=active",
+            f"{BASE_URL}/api/machine/all",
+            f"{BASE_URL}/api/machines",
+        ]
+        for probe_url in _global_api_probes:
+            self._visit(probe_url)
+            yield scrapy.Request(
+                probe_url,
+                callback=self._parse_product_api,
+                headers={"Accept": "application/json"},
+                errback=self._errback,
+                meta={"category": "", "subcategory_slug": ""},
+                dont_filter=True,
+            )
 
         # 1. JSON subcategory API — probe both non-www and www so whichever
         #    the server resolves returns valid JSON (non-www is the working one).
