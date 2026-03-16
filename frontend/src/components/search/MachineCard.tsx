@@ -44,7 +44,9 @@ export default function MachineCard({ machine }: Props) {
 
   return (
     <a
-      href={`/machine/${machine.id}`}
+      href={machine.machine_url || `/machine/${machine.id}`}
+      target="_blank"
+      rel="noopener noreferrer"
       className="card group hover:shadow-md hover:border-brand-200 transition-all block"
     >
       {/* Image */}

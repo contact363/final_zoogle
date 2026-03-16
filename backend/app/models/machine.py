@@ -48,9 +48,10 @@ class Machine(Base):
     # PostgreSQL tsvector, updated by DB trigger
     search_vector = Column(Text, nullable=True)
 
-    is_active  = Column(Boolean, default=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    is_active       = Column(Boolean, default=True)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at      = Column(DateTime(timezone=True), onupdate=func.now())
+    last_crawled_at = Column(DateTime(timezone=True), nullable=True)  # set on every crawl touch
 
     website  = relationship("Website", back_populates="machines")
     images   = relationship("MachineImage", back_populates="machine", cascade="all, delete-orphan")

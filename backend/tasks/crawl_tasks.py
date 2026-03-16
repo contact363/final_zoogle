@@ -133,6 +133,20 @@ def _load_training_rules(db: Session, website_id: int) -> str | None:
 # Run scrapy subprocess — always uses the "generic" spider
 # ─────────────────────────────────────────────────────────────────────────────
 
+_DEDICATED_SPIDERS = {
+    "zatpatmachines.com": "zatpatmachines",
+    "corelmachine.com":   "corelmachine",
+}
+
+
+def _spider_for_url(url: str) -> str:
+    """Return the dedicated spider name for known sites, else 'generic'."""
+    for domain, spider in _DEDICATED_SPIDERS.items():
+        if domain in url:
+            return spider
+    return "generic"
+
+
 def _run_scrapy(
     website_id: int,
     start_url: str,
@@ -140,22 +154,24 @@ def _run_scrapy(
     training_rules_json: str | None = None,
 ) -> subprocess.CompletedProcess:
     """
-    Launch: scrapy crawl generic -a website_id=N -a start_url=URL ...
+    Launch scrapy crawl <spider> -a website_id=N ...
 
-    Always uses the ONE generic spider.  Per-site behaviour is injected via
-    the training_rules argument (JSON string) which the spider reads at init.
+    Uses a dedicated spider for known sites (zatpatmachines, corelmachine),
+    falls back to the generic spider for all others.
+    No CLOSESPIDER_ITEMCOUNT cap — each spider controls its own limit.
     """
+    spider = _spider_for_url(start_url)
     cmd = [
-        sys.executable, "-m", "scrapy", "crawl", "generic",
+        sys.executable, "-m", "scrapy", "crawl", spider,
         "-a", f"website_id={website_id}",
         "-a", f"start_url={start_url}",
         "-a", f"crawl_log_id={crawl_log_id}",
         "--set", "LOG_LEVEL=INFO",
-        "--set", "CLOSESPIDER_ITEMCOUNT=5000",
     ]
-    if training_rules_json:
+    if training_rules_json and spider == "generic":
         cmd += ["-a", f"training_rules={training_rules_json}"]
 
+    logger.info(f"Running spider={spider!r} for website_id={website_id} url={start_url}")
     return subprocess.run(
         cmd,
         cwd=_CRAWLER_DIR,
@@ -306,8 +322,23 @@ def _execute_crawl(website_id: int, db: Session) -> None:
     crawl_log.finished_at     = datetime.now(timezone.utc)
     db.commit()
 
+    # ── Mark machines not seen in this crawl as inactive ───────────────────
+    # Any machine from this website whose last_crawled_at is older than
+    # when this crawl started is no longer listed on the supplier site.
+    if status == "success" and machines_found > 0:
+        stale_updated = db.query(Machine).filter(
+            Machine.website_id == website_id,
+            Machine.is_active == True,
+            (Machine.last_crawled_at == None) | (Machine.last_crawled_at < crawl_log.started_at),
+        ).update({"is_active": False}, synchronize_session=False)
+        if stale_updated:
+            logger.info(f"Marked {stale_updated} stale machines inactive for website={website_id}")
+        db.commit()
+
     # ── Update website ─────────────────────────────────────────────────────
-    count = db.query(func.count(Machine.id)).filter(Machine.website_id == website_id).scalar()
+    count = db.query(func.count(Machine.id)).filter(
+        Machine.website_id == website_id, Machine.is_active == True
+    ).scalar()
     website.machine_count   = count or 0
     website.crawl_status    = status
     website.last_crawled_at = crawl_log.finished_at

@@ -40,6 +40,7 @@ import os
 import re
 import hashlib
 import logging
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 import requests as _requests
@@ -431,6 +432,8 @@ class DatabasePipeline:
                     .first()
                 )
 
+            now = datetime.now(timezone.utc)
+
             # ── Update ────────────────────────────────────────────────────────
             if existing:
                 changed = False
@@ -449,6 +452,9 @@ class DatabasePipeline:
                 # Ensure dedup_key is set even if it wasn't previously stored
                 if not existing.dedup_key and dedup_key:
                     existing.dedup_key = dedup_key; changed = True
+                # Always mark as seen and active in this crawl
+                existing.last_crawled_at = now
+                existing.is_active = True
                 if changed:
                     self._updated += 1
 
@@ -471,6 +477,7 @@ class DatabasePipeline:
                     type_normalized  = adapter.get("machine_type"),
                     content_hash     = content_hash,
                     dedup_key        = dedup_key,
+                    last_crawled_at  = now,
                 )
                 db.add(machine)
                 db.flush()
