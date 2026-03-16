@@ -302,59 +302,116 @@ def _max_page_number(html: str) -> int:
     return max_page
 
 
+def _make_session():
+    """
+    Build a requests.Session that mimics a real browser:
+    - Real Chrome User-Agent
+    - SSL verification disabled (many supplier sites have expired/self-signed certs)
+    - Warnings suppressed
+    - Follow redirects
+    """
+    try:
+        import requests as _req
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        return None, None
+
+    s = _req.Session()
+    s.verify = False
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+    return s, _req
+
+
+def _safe_get(session, url: str, timeout: int = 15, json_mode: bool = False):
+    """Fetch a URL, return response or None. Never raises."""
+    try:
+        hdrs = {"Accept": "application/json"} if json_mode else {}
+        r = session.get(url, timeout=timeout, headers=hdrs, allow_redirects=True)
+        return r
+    except Exception:
+        return None
+
+
 def _discover_count(start_url: str) -> tuple[int, str]:
     """
-    Quick HTTP-based machine count. No Scrapy, no imports from zoogle_crawler.
+    HTTP-based machine count. No Scrapy, no imports from zoogle_crawler.
 
     Tries in order (fastest → slowest):
       1. Shopify   /products/count.json
       2. WooCommerce /wp-json/wc/v3/products  (X-WP-Total header)
-      3. Supabase  PostgREST count=exact      (Content-Range header)
-      4. JSON API  /api/subcategory/all etc.  (sum products across subcategories)
-      5. Sitemap   /sitemap.xml               (count product <loc> entries)
-      6. HTML scan homepage + listing pages  (collect product URLs + pagination)
+      3. WordPress  /wp-json/wp/v2/posts       (X-WP-Total — generic WP count)
+      4. Supabase  PostgREST count=exact      (Content-Range header)
+      5. JSON API  /api/subcategory/all etc.  (sum products across subcategories)
+      6. Sitemap   /sitemap.xml               (count product <loc> entries)
+      7. HTML scan homepage + nav links + listing pages + pagination estimation
 
-    Returns (count, method_name). count = -1 only if site unreachable.
-    Estimated counts are returned as positive integers with method="estimated:...".
+    Returns (count, method_name).
+      count = -1 ONLY when the site cannot be reached at all.
+      All other failures return estimated count or 0 with "html-scan" method.
     """
-    try:
-        import requests as _req
-    except ImportError:
+    session, _req = _make_session()
+    if session is None:
         return -1, "requests-unavailable"
 
+    # Normalise base URL — follow any www/https redirect by fetching homepage first
     base = start_url.rstrip("/")
     parsed = urlparse(start_url)
-    domain = parsed.netloc.lower()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; Zooglebot/1.0)",
-        "Accept": "text/html,application/json,*/*",
-    }
-    timeout = 12
+    domain = parsed.netloc.lower().lstrip("www.")
+    timeout = 15
 
     # ── 1. Shopify ───────────────────────────────────────────────────────────
-    try:
-        r = _req.get(f"{base}/products/count.json", headers=headers, timeout=timeout)
-        if r.status_code == 200:
+    r = _safe_get(session, f"{base}/products/count.json", timeout=timeout, json_mode=True)
+    if r and r.status_code == 200:
+        try:
             data = r.json()
             if isinstance(data, dict) and "count" in data:
                 return int(data["count"]), "shopify"
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     # ── 2. WooCommerce ───────────────────────────────────────────────────────
-    try:
-        r = _req.get(
-            f"{base}/wp-json/wc/v3/products?per_page=1",
-            headers=headers, timeout=timeout,
-        )
-        if r.status_code == 200:
-            total = r.headers.get("X-WP-Total")
-            if total and int(total) > 0:
-                return int(total), "woocommerce"
-    except Exception:
-        pass
+    r = _safe_get(session, f"{base}/wp-json/wc/v3/products?per_page=1", timeout=timeout, json_mode=True)
+    if r and r.status_code == 200:
+        total = r.headers.get("X-WP-Total")
+        if total:
+            try:
+                n = int(total)
+                if n > 0:
+                    return n, "woocommerce"
+            except Exception:
+                pass
 
-    # ── 3. Supabase (inline credentials — no zoogle_crawler import needed) ───
+    # ── 3. WordPress REST API (generic — works even without WooCommerce) ──────
+    #    /wp-json/wp/v2/posts?per_page=1 returns X-WP-Total for all published posts
+    #    Many machine dealer WordPress sites list products as custom post types
+    for wp_type in ("product", "machine", "equipment", "listing", "posts"):
+        r = _safe_get(
+            session,
+            f"{base}/wp-json/wp/v2/{wp_type}?per_page=1&status=publish",
+            timeout=timeout, json_mode=True,
+        )
+        if r and r.status_code == 200:
+            total = r.headers.get("X-WP-Total")
+            if total:
+                try:
+                    n = int(total)
+                    if n > 0:
+                        return n, f"wordpress:{wp_type}"
+                except Exception:
+                    pass
+
+    # ── 4. Supabase (inline credentials) ─────────────────────────────────────
     _ZATPAT_SUPABASE_URL = "https://aqhgorgilxwrhzleztby.supabase.co"
     _ZATPAT_SUPABASE_KEY = (
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
@@ -365,210 +422,206 @@ def _discover_count(start_url: str) -> tuple[int, str]:
     if "zatpat" in domain:
         sb_tables = ["machines", "products", "listings", "items",
                      "inventory", "estimates", "used_machines", "machine_listings"]
-        sb_hdrs = {
+        session.headers.update({
             "apikey": _ZATPAT_SUPABASE_KEY,
             "Authorization": f"Bearer {_ZATPAT_SUPABASE_KEY}",
             "Prefer": "count=exact",
             "Range": "0-0",
-        }
+        })
         for table in sb_tables:
-            try:
-                r = _req.get(
-                    f"{_ZATPAT_SUPABASE_URL}/rest/v1/{table}?select=id",
-                    headers=sb_hdrs, timeout=timeout,
-                )
-                if r.status_code in (200, 206):
-                    cr = r.headers.get("Content-Range", "")
-                    m = re.search(r"/(\d+)$", cr)
-                    if m and int(m.group(1)) > 0:
-                        return int(m.group(1)), f"supabase:{table}"
-            except Exception:
-                continue
-
-    # ── 4. JSON API probe — sum product counts across subcategories ───────────
-    #    Handles sites like corelmachine.com that expose /api/subcategory/all
-    for api_path in _JSON_API_PATHS:
-        try:
-            r = _req.get(
-                f"{base}{api_path}",
-                headers={**headers, "Accept": "application/json"},
+            r = _safe_get(
+                session,
+                f"{_ZATPAT_SUPABASE_URL}/rest/v1/{table}?select=id",
                 timeout=timeout,
             )
-            if r.status_code != 200:
-                continue
-            body = r.text.strip()
-            if not body or body[0] not in ("[", "{"):
-                continue
+            if r and r.status_code in (200, 206):
+                cr = r.headers.get("Content-Range", "")
+                m = re.search(r"/(\d+)$", cr)
+                if m and int(m.group(1)) > 0:
+                    return int(m.group(1)), f"supabase:{table}"
+        # Remove Supabase headers for subsequent requests
+        for h in ("apikey", "Authorization", "Prefer", "Range"):
+            session.headers.pop(h, None)
+
+    # ── 5. JSON API probe ─────────────────────────────────────────────────────
+    for api_path in _JSON_API_PATHS:
+        r = _safe_get(session, f"{base}{api_path}", timeout=timeout, json_mode=True)
+        if not r or r.status_code != 200:
+            continue
+        body = r.text.strip()
+        if not body or body[0] not in ("[", "{"):
+            continue
+        try:
             data = r.json()
-
-            # Unwrap envelope
-            if isinstance(data, dict):
-                for key in ("data", "results", "items", "products", "machines"):
-                    if isinstance(data.get(key), list):
-                        data = data[key]
-                        break
-
-            if not isinstance(data, list) or not data:
-                continue
-
-            first = data[0] if data else {}
-            # If it's a subcategory list (has url/slug but no price), fetch each subcategory
-            is_subcategory = (
-                isinstance(first, dict)
-                and ("url" in first or "slug" in first)
-                and "price" not in first
-                and len(data) <= 200
-            )
-            if is_subcategory:
-                logger.info(f"[discovery] JSON subcategory list at {api_path}: {len(data)} categories")
-                total = 0
-                sampled = 0
-                for entry in data:
-                    slug = entry.get("url") or entry.get("slug") or entry.get("id")
-                    if not slug:
-                        continue
-                    try:
-                        pr = _req.get(
-                            f"{base}/api/product/{slug}",
-                            headers={**headers, "Accept": "application/json"},
-                            timeout=timeout,
-                        )
-                        if pr.status_code == 200:
-                            pdata = pr.json()
-                            if isinstance(pdata, dict):
-                                for k in ("data", "results", "products", "machines"):
-                                    if isinstance(pdata.get(k), list):
-                                        pdata = pdata[k]
-                                        break
-                            if isinstance(pdata, list):
-                                total += len(pdata)
-                                sampled += 1
-                    except Exception:
-                        pass
-                if sampled > 0:
-                    # Extrapolate if we couldn't fetch all subcategories
-                    if sampled < len(data):
-                        total = int(total / sampled * len(data))
-                        return total, f"json-api:subcategories(estimated,{sampled}/{len(data)} sampled)"
-                    return total, f"json-api:subcategories({sampled} categories)"
-            else:
-                # It's a direct product list
-                count = len(data)
-                if count > 0:
-                    return count, f"json-api:{api_path}"
         except Exception:
             continue
 
-    # ── 5. Sitemap — count product <loc> entries ─────────────────────────────
-    #    Inline URL filter — no zoogle_crawler import needed
-    try:
-        for sitemap_path in ("/sitemap.xml", "/sitemap_index.xml",
-                             "/product-sitemap.xml", "/page-sitemap.xml"):
-            try:
-                r = _req.get(f"{base}{sitemap_path}", headers=headers, timeout=timeout)
-            except Exception:
-                continue
-            if r.status_code != 200 or "<loc>" not in r.text:
-                continue
+        if isinstance(data, dict):
+            for key in ("data", "results", "items", "products", "machines"):
+                if isinstance(data.get(key), list):
+                    data = data[key]
+                    break
 
-            # Handle sitemap index — recurse into first product sitemap
-            child_sitemaps = re.findall(r"<sitemap>\s*<loc>(.*?)</loc>", r.text, re.DOTALL)
-            if child_sitemaps:
-                for child_url in child_sitemaps[:3]:
+        if not isinstance(data, list) or not data:
+            continue
+
+        first = data[0]
+        is_subcategory = (
+            isinstance(first, dict)
+            and ("url" in first or "slug" in first)
+            and "price" not in first
+            and len(data) <= 300
+        )
+        if is_subcategory:
+            logger.info(f"[discovery] JSON subcategory list at {api_path}: {len(data)} categories")
+            total = 0
+            sampled = 0
+            for entry in data:
+                slug = entry.get("url") or entry.get("slug") or entry.get("id")
+                if not slug:
+                    continue
+                pr = _safe_get(
+                    session,
+                    f"{base}/api/product/{slug}",
+                    timeout=timeout, json_mode=True,
+                )
+                if pr and pr.status_code == 200:
                     try:
-                        cr = _req.get(child_url.strip(), headers=headers, timeout=timeout)
-                        if cr.status_code == 200 and "<loc>" in cr.text:
-                            urls = re.findall(r"<loc>(.*?)</loc>", cr.text, re.DOTALL)
-                            count = sum(1 for u in urls if _is_product_url(u.strip()))
-                            if count > 0:
-                                return count, "sitemap"
+                        pdata = pr.json()
+                        if isinstance(pdata, dict):
+                            for k in ("data", "results", "products", "machines"):
+                                if isinstance(pdata.get(k), list):
+                                    pdata = pdata[k]
+                                    break
+                        if isinstance(pdata, list):
+                            total += len(pdata)
+                            sampled += 1
                     except Exception:
-                        continue
+                        pass
+            if sampled > 0:
+                if sampled < len(data):
+                    total = int(total / sampled * len(data))
+                    return total, f"json-api:subcategories(~estimated,{sampled}/{len(data)})"
+                return total, f"json-api:subcategories({sampled})"
+        else:
+            if len(data) > 0:
+                return len(data), f"json-api:{api_path}"
 
-            urls = re.findall(r"<loc>(.*?)</loc>", r.text, re.DOTALL)
-            count = sum(1 for u in urls if _is_product_url(u.strip()))
-            if count > 0:
-                return count, "sitemap"
-    except Exception:
-        pass
+    # ── 6. Sitemap ────────────────────────────────────────────────────────────
+    for sitemap_path in ("/sitemap.xml", "/sitemap_index.xml",
+                         "/product-sitemap.xml", "/page-sitemap.xml",
+                         "/sitemap-products.xml"):
+        r = _safe_get(session, f"{base}{sitemap_path}", timeout=timeout)
+        if not r or r.status_code != 200 or "<loc>" not in r.text:
+            continue
 
-    # ── 6. HTML scan — homepage + listing pages + pagination estimation ───────
-    all_product_urls: set = set()
+        child_sitemaps = re.findall(r"<sitemap>\s*<loc>(.*?)</loc>", r.text, re.DOTALL)
+        if child_sitemaps:
+            best = 0
+            for child_url in child_sitemaps[:5]:
+                cr = _safe_get(session, child_url.strip(), timeout=timeout)
+                if cr and cr.status_code == 200 and "<loc>" in cr.text:
+                    urls = re.findall(r"<loc>(.*?)</loc>", cr.text, re.DOTALL)
+                    cnt = sum(1 for u in urls if _is_product_url(u.strip()))
+                    best += cnt
+            if best > 0:
+                return best, "sitemap"
+            continue
+
+        urls = re.findall(r"<loc>(.*?)</loc>", r.text, re.DOTALL)
+        cnt = sum(1 for u in urls if _is_product_url(u.strip()))
+        if cnt > 0:
+            return cnt, "sitemap"
+
+    # ── 7. HTML scan ──────────────────────────────────────────────────────────
+    # Fetch homepage — try the original URL; if it fails, try www variant
     homepage_html = ""
+    actual_base = base
 
-    try:
-        r = _req.get(start_url, headers=headers, timeout=timeout)
-        if r.status_code != 200:
-            return -1, "site-unreachable"
-        homepage_html = r.text
-    except Exception:
+    r = _safe_get(session, start_url, timeout=timeout)
+    if r is None or r.status_code not in (200, 301, 302):
+        # Try www variant
+        alt = start_url.replace("://www.", "://") if "://www." in start_url \
+              else start_url.replace("://", "://www.")
+        r = _safe_get(session, alt, timeout=timeout)
+
+    if r is None or r.status_code not in (200, 301, 302):
         return -1, "site-unreachable"
 
-    # 6a. Collect product URLs directly on homepage
-    all_product_urls.update(_extract_product_links(homepage_html, base))
+    # Use the final redirected URL as the real base
+    actual_base = f"{urlparse(r.url).scheme}://{urlparse(r.url).netloc}"
+    actual_netloc = urlparse(r.url).netloc.lower()
+    homepage_html = r.text or ""
 
-    # 6b. Find category/listing page links on homepage
+    all_product_urls: set = set()
+    all_product_urls.update(_extract_product_links(homepage_html, actual_base))
+
+    # Collect ALL internal links from homepage for nav/category discovery
     category_urls: list = []
+    seen_cat: set = set()
+
+    def _add_cat(url):
+        clean = url.split("?")[0].split("#")[0].rstrip("/")
+        if clean not in seen_cat:
+            seen_cat.add(clean)
+            category_urls.append(clean)
+
     for href in re.findall(r'href=["\']([^"\'#][^"\']*)["\']', homepage_html):
         try:
-            full = href if href.startswith("http") else f"{base.rstrip('/')}/{href.lstrip('/')}"
-            if urlparse(full).netloc != parsed.netloc:
+            full = href if href.startswith("http") else f"{actual_base}/{href.lstrip('/')}"
+            fu = urlparse(full)
+            if fu.netloc.lower().lstrip("www.") != actual_netloc.lstrip("www."):
                 continue
-            path = urlparse(full).path.lower().rstrip("/")
-            if any(path == lp or path.endswith(lp) for lp in _LISTING_PATHS):
-                if full not in category_urls:
-                    category_urls.append(full)
+            path = fu.path.lower().rstrip("/")
+            # Listing-like path?
+            if any(path == lp or path.endswith(lp) or lp.rstrip("/") in path
+                   for lp in _LISTING_PATHS):
+                _add_cat(full)
         except Exception:
             pass
 
-    # Also probe standard listing paths that might not be linked from homepage
-    for lp in _LISTING_PATHS[:10]:
-        url = f"{base}{lp}"
-        if url not in category_urls:
-            category_urls.append(url)
+    # Also blind-probe standard listing paths (might not appear in nav)
+    for lp in _LISTING_PATHS:
+        _add_cat(f"{actual_base}{lp}")
 
-    # 6c. Crawl category pages — collect product links + detect pagination
-    pages_checked = 0
+    # Crawl category/listing pages
     total_estimated = 0
     methods_used = []
 
-    for cat_url in category_urls[:8]:
-        try:
-            r = _req.get(cat_url, headers=headers, timeout=timeout)
-            if r.status_code != 200:
-                continue
-            cat_html = r.text
-            page_products = _extract_product_links(cat_html, base)
-            if not page_products:
-                continue
-
-            pages_checked += 1
-            all_product_urls.update(page_products)
-            products_per_page = len(page_products)
-
-            # Detect pagination to estimate total for this category
-            max_page = _max_page_number(cat_html)
-            if max_page > 1:
-                estimated = products_per_page * max_page
-                total_estimated += estimated
-                methods_used.append(f"{urlparse(cat_url).path}(~{estimated})")
-                logger.info(f"[discovery] {cat_url}: {products_per_page}/page × {max_page} pages = ~{estimated}")
-            else:
-                total_estimated += products_per_page
-                methods_used.append(f"{urlparse(cat_url).path}({products_per_page})")
-        except Exception:
+    for cat_url in category_urls[:12]:
+        r = _safe_get(session, cat_url, timeout=timeout)
+        if not r or r.status_code != 200:
+            continue
+        cat_html = r.text
+        page_products = _extract_product_links(cat_html, actual_base)
+        if not page_products:
             continue
 
-    direct_count = len(all_product_urls)
-    final_count = max(direct_count, total_estimated)
+        all_product_urls.update(page_products)
+        per_page = len(page_products)
+        max_page = _max_page_number(cat_html)
 
-    if final_count > 0:
-        method_detail = ", ".join(methods_used[:3]) if methods_used else "url-scan"
-        is_estimated = total_estimated > direct_count
-        method = f"estimated:html-scan({method_detail})" if is_estimated else f"html-scan({method_detail})"
-        return final_count, method
+        if max_page > 1:
+            est = per_page * max_page
+            total_estimated += est
+            methods_used.append(f"{urlparse(cat_url).path}(~{est})")
+            logger.info(f"[discovery] {cat_url}: {per_page}/page × {max_page} pages ≈ {est}")
+        else:
+            total_estimated += per_page
+            methods_used.append(f"{urlparse(cat_url).path}({per_page})")
 
-    return -1, "unknown"
+    direct = len(all_product_urls)
+    final  = max(direct, total_estimated)
+
+    if final > 0:
+        detail     = ", ".join(methods_used[:3]) if methods_used else "url-scan"
+        is_est     = total_estimated > direct
+        method_tag = f"html-scan~estimated({detail})" if is_est else f"html-scan({detail})"
+        return final, method_tag
+
+    # Site was reachable but no products found — return 0 with html-scan method
+    # so it's not treated as an error
+    return 0, "html-scan(no-products-detected)"
 
 
 def _execute_discovery(website_id: int, db: Session) -> None:
@@ -601,28 +654,28 @@ def _execute_discovery(website_id: int, db: Session) -> None:
         count, method = _discover_count(website.url)
         logger.info(f"Discovery: website={website_id} count={count} method={method}")
 
-        site_unreachable = count == -1 and method in ("site-unreachable", "requests-unavailable", "unknown")
-        is_estimated = "estimated" in method
+        # count == -1 means the site itself could not be reached
+        # count == 0  means reachable but no products detected
+        # count > 0   means we found machines (exact or estimated)
+        site_unreachable = count == -1
+        is_estimated = "estimated" in method or "~" in method
 
-        if count >= 0:
-            count_label = f"{count} (estimated)" if is_estimated else str(count)
+        if not site_unreachable:
+            count_label = f"{count} (estimated)" if (is_estimated and count > 0) else str(count)
             log.status = "success"
-            log.machines_found = count
+            log.machines_found = max(count, 0)
             log.log_output = (
                 f"Discovery method: {method}\n"
                 f"Machines found on site: {count_label}\n"
             )
             log.error_details = None
-            website.discovered_count = count
+            website.discovered_count = count if count > 0 else None
             website.discovery_status = "done"
         else:
             log.status = "error"
             log.machines_found = 0
-            log.log_output = f"Discovery method: {method}\nMachines found on site: unknown"
-            log.error_details = (
-                "Website could not be reached" if site_unreachable
-                else f"Could not determine count (method={method})"
-            )
+            log.log_output = f"Discovery method: {method}\nMachines found on site: unreachable"
+            log.error_details = "Website could not be reached (connection refused, timeout, or DNS failure)"
             website.discovered_count = None
             website.discovery_status = "error"
 
