@@ -69,8 +69,10 @@ async def auto_migrate():
         "ALTER TABLE crawl_logs ADD COLUMN IF NOT EXISTS machines_updated INTEGER DEFAULT 0",
         "ALTER TABLE crawl_logs ADD COLUMN IF NOT EXISTS machines_skipped INTEGER DEFAULT 0",
         # 0003 — stock number and cross-language dedup key
-        "ALTER TABLE machines ADD COLUMN IF NOT EXISTS stock_number VARCHAR(100)",
-        "ALTER TABLE machines ADD COLUMN IF NOT EXISTS dedup_key    VARCHAR(64)",
+        "ALTER TABLE machines ADD COLUMN IF NOT EXISTS stock_number     VARCHAR(100)",
+        "ALTER TABLE machines ADD COLUMN IF NOT EXISTS dedup_key        VARCHAR(64)",
+        # 0004 — staleness tracking for inactive-machine cleanup
+        "ALTER TABLE machines ADD COLUMN IF NOT EXISTS last_crawled_at  TIMESTAMPTZ",
     ]
 
     index_migrations = [
