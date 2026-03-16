@@ -612,7 +612,8 @@ def _discover_count(start_url: str) -> tuple[int, str]:
                 except Exception:
                     pass
 
-    # ── 3b. corelmachine.com — count via /api/subcategory/all + /api/product/{slug} ──
+    # ── 3b. corelmachine.com — count via /api/subcategory/all + sample 3 slugs ──
+    # We only sample 3 subcategories to avoid hitting rate-limits before URL collection.
     if "corelmachine.com" in domain:
         _COREL_BASE = "https://corelmachine.com"
         _NON_CAT_D = {"", "selltous", "aboutus", "contactus", "blogs",
@@ -623,29 +624,42 @@ def _discover_count(start_url: str) -> tuple[int, str]:
             try:
                 subcats = r.json()
                 if isinstance(subcats, list):
-                    total_corel = 0
-                    sampled = 0
-                    for entry in subcats:
-                        slug = (entry.get("url") or entry.get("slug") or "").strip()
-                        if not slug or slug in _NON_CAT_D:
-                            continue
-                        pr = _safe_get(session, f"{_COREL_BASE}/api/product/{slug}",
-                                       timeout=timeout, json_mode=True)
-                        if pr and pr.status_code == 200:
-                            try:
-                                products = pr.json()
-                                if isinstance(products, dict):
-                                    for k in ("data", "results", "products"):
-                                        if isinstance(products.get(k), list):
-                                            products = products[k]
-                                            break
-                                if isinstance(products, list):
-                                    total_corel += len(products)
-                                    sampled += 1
-                            except Exception:
-                                pass
-                    if total_corel > 0:
-                        return total_corel, f"corelmachine-api({sampled} subcategories)"
+                    valid_slugs = [
+                        (entry.get("url") or entry.get("slug") or "").strip()
+                        for entry in subcats
+                        if (entry.get("url") or entry.get("slug") or "").strip()
+                        and (entry.get("url") or entry.get("slug") or "").strip() not in _NON_CAT_D
+                    ]
+                    total_cats = len(valid_slugs)
+                    if total_cats > 0:
+                        # Sample at most 3 subcategories to estimate total count
+                        _SAMPLE_SIZE = 3
+                        sample_slugs = valid_slugs[:_SAMPLE_SIZE]
+                        total_corel = 0
+                        sampled = 0
+                        for slug in sample_slugs:
+                            pr = _safe_get(session, f"{_COREL_BASE}/api/product/{slug}",
+                                           timeout=timeout, json_mode=True)
+                            if pr and pr.status_code == 200:
+                                try:
+                                    products = pr.json()
+                                    if isinstance(products, dict):
+                                        for k in ("data", "results", "products"):
+                                            if isinstance(products.get(k), list):
+                                                products = products[k]
+                                                break
+                                    if isinstance(products, list):
+                                        total_corel += len(products)
+                                        sampled += 1
+                                except Exception:
+                                    pass
+                        if sampled > 0:
+                            # Extrapolate to all categories if we only sampled a subset
+                            if sampled < total_cats:
+                                avg = total_corel / sampled
+                                estimated = int(avg * total_cats)
+                                return estimated, f"corelmachine-api(~estimated,{sampled}/{total_cats} subcategories)"
+                            return total_corel, f"corelmachine-api({sampled} subcategories)"
             except Exception:
                 pass
 
@@ -1085,19 +1099,15 @@ def _collect_urls(start_url: str, target_count: int = 0) -> tuple[list[str], str
         return [], "requests-unavailable"
 
     timeout = 20
-    # Resolve the real base URL (handles www/non-www, redirects, SSL)
-    actual_base, actual_netloc, homepage_html_cached = _resolve_base(session, start_url, timeout=timeout)
-    base = actual_base
-    domain = actual_netloc.lstrip("www.")
-    urls: list[str] = []
 
-    # ── 0. Site-specific API collectors (dedicated spider sites) ─────────────
-    # These sites have custom spiders that use internal JSON APIs.
-    # We mirror the same API approach here so URL collection works even when
-    # the homepage/HTML is blocked by a WAF.
+    # ── 0. Fast-path: site-specific API collectors BEFORE _resolve_base ───────
+    # For known API-backed sites we skip the homepage fetch entirely — it saves
+    # a request and avoids burning through rate-limit budget before the real work.
+    parsed_start = urlparse(start_url)
+    domain_early = parsed_start.netloc.lower().lstrip("www.")
 
     # corelmachine.com — Next.js App Router, JSON API at /api/subcategory/all
-    if "corelmachine.com" in domain:
+    if "corelmachine.com" in domain_early:
         _COREL_BASE = "https://corelmachine.com"  # non-www — API 404s on www variant
         _NON_CAT = {"", "selltous", "aboutus", "contactus", "blogs",
                     "privacy-policy", "terms-conditions", "cookie-policy",
@@ -1159,6 +1169,12 @@ def _collect_urls(start_url: str, target_count: int = 0) -> tuple[list[str], str
                         return deduped, "corelmachine-api"
             except Exception as e:
                 logger.warning(f"[collect_urls] corelmachine API error: {e}")
+
+    # ── Resolve real base URL for all other methods ───────────────────────────
+    actual_base, actual_netloc, homepage_html_cached = _resolve_base(session, start_url, timeout=timeout)
+    base = actual_base
+    domain = actual_netloc.lstrip("www.")
+    urls: list[str] = []
 
     # ── 1. Supabase (zatpatmachines / zatpatestimate) ─────────────────────────
     _ZATPAT_SUPABASE_URL = "https://aqhgorgilxwrhzleztby.supabase.co"
