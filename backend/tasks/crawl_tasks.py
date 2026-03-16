@@ -311,7 +311,7 @@ def _max_page_number(html: str) -> int:
 def _make_session():
     """
     Build a requests.Session that mimics a real browser:
-    - Real Chrome User-Agent
+    - Real Chrome User-Agent + full browser headers (avoids Cloudflare/bot detection)
     - SSL verification disabled (many supplier sites have expired/self-signed certs)
     - Warnings suppressed
     - Follow redirects
@@ -329,24 +329,82 @@ def _make_session():
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
+            "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+        "DNT": "1",
     })
     return s, _req
 
 
-def _safe_get(session, url: str, timeout: int = 15, json_mode: bool = False):
+def _safe_get(session, url: str, timeout: int = 20, json_mode: bool = False):
     """Fetch a URL, return response or None. Never raises."""
     try:
-        hdrs = {"Accept": "application/json"} if json_mode else {}
+        hdrs = {"Accept": "application/json", "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors"} if json_mode else {}
         r = session.get(url, timeout=timeout, headers=hdrs, allow_redirects=True)
         return r
     except Exception:
         return None
+
+
+def _resolve_base(session, start_url: str, timeout: int = 20) -> tuple[str, str, str | None]:
+    """
+    Resolve the real base URL for a website, trying both www and non-www variants.
+    Returns (actual_base, actual_netloc, homepage_html_or_None).
+
+    A site is considered "reachable" if we get ANY HTTP response (even 403/429/503),
+    because those mean the server is UP — it's just blocking our request.
+    Only a connection error (None) or DNS failure means truly unreachable.
+
+    Strategy:
+      1. Try original URL
+      2. Try www/non-www alternate
+      3. Try http:// if https:// failed
+    """
+    parsed = urlparse(start_url)
+    base = start_url.rstrip("/")
+
+    # Build list of URLs to try
+    candidates = [start_url]
+    if "://www." in start_url:
+        candidates.append(start_url.replace("://www.", "://"))
+    else:
+        candidates.append(start_url.replace("://", "://www."))
+    # Also try http if https
+    if start_url.startswith("https://"):
+        candidates.append(start_url.replace("https://", "http://"))
+
+    best_r = None
+    for candidate in candidates:
+        r = _safe_get(session, candidate, timeout=timeout)
+        if r is None:
+            continue
+        # Any HTTP response (even 4xx/5xx) means site is reachable
+        if best_r is None:
+            best_r = r
+        # Prefer 200 over error codes
+        if r.status_code == 200:
+            best_r = r
+            break
+
+    if best_r is None:
+        return base, parsed.netloc.lower(), None
+
+    final_url = getattr(best_r, "url", start_url)
+    fp = urlparse(final_url)
+    actual_base = f"{fp.scheme}://{fp.netloc}"
+    actual_netloc = fp.netloc.lower()
+    html = best_r.text if best_r.status_code == 200 else None
+    return actual_base, actual_netloc, html
 
 
 def _discover_count(start_url: str) -> tuple[int, str]:
@@ -370,11 +428,20 @@ def _discover_count(start_url: str) -> tuple[int, str]:
     if session is None:
         return -1, "requests-unavailable"
 
-    # Normalise base URL — follow any www/https redirect by fetching homepage first
-    base = start_url.rstrip("/")
-    parsed = urlparse(start_url)
-    domain = parsed.netloc.lower().lstrip("www.")
-    timeout = 15
+    timeout = 20
+
+    # ── Resolve real base URL first (handles www/non-www, http/https, redirects)
+    # Any HTTP response (even 403) means site is UP; only None means truly unreachable.
+    actual_base, actual_netloc, homepage_html_cached = _resolve_base(session, start_url, timeout=timeout)
+    if actual_base == start_url.rstrip("/") and homepage_html_cached is None:
+        # _resolve_base got no response at all → site is completely unreachable
+        # But don't give up yet — try one more time with a longer timeout
+        actual_base, actual_netloc, homepage_html_cached = _resolve_base(session, start_url, timeout=30)
+
+    base = actual_base
+    domain = actual_netloc.lstrip("www.")
+
+    logger.info(f"[discovery] Resolved base: {base} (domain={domain})")
 
     # ── 1. Shopify ───────────────────────────────────────────────────────────
     r = _safe_get(session, f"{base}/products/count.json", timeout=timeout, json_mode=True)
@@ -540,27 +607,28 @@ def _discover_count(start_url: str) -> tuple[int, str]:
             return cnt, "sitemap"
 
     # ── 7. HTML scan ──────────────────────────────────────────────────────────
-    # Fetch homepage — try the original URL; if it fails, try www variant
-    homepage_html = ""
-    actual_base = base
+    # We already resolved the base URL at the top of this function via _resolve_base.
+    # homepage_html_cached is the HTML if status was 200, else None (site blocked us).
+    # base / actual_netloc are already set correctly.
 
-    r = _safe_get(session, start_url, timeout=timeout)
-    if r is None or r.status_code not in (200, 301, 302):
-        # Try www variant
-        alt = start_url.replace("://www.", "://") if "://www." in start_url \
-              else start_url.replace("://", "://www.")
-        r = _safe_get(session, alt, timeout=timeout)
+    # If _resolve_base got no response at all → truly unreachable
+    if homepage_html_cached is None:
+        # One more attempt with a very long timeout
+        r_final = _safe_get(session, base, timeout=40)
+        if r_final is None:
+            # Try the original URL too
+            r_final = _safe_get(session, start_url, timeout=40)
+        if r_final is None:
+            return -1, "site-unreachable"
+        if r_final.status_code != 200:
+            # Site is reachable (we got a response) but blocking us (403/503/etc)
+            return 0, f"html-scan(site-up-but-blocked:{r_final.status_code})"
+        homepage_html_cached = r_final.text or ""
 
-    if r is None or r.status_code not in (200, 301, 302):
-        return -1, "site-unreachable"
-
-    # Use the final redirected URL as the real base
-    actual_base = f"{urlparse(r.url).scheme}://{urlparse(r.url).netloc}"
-    actual_netloc = urlparse(r.url).netloc.lower()
-    homepage_html = r.text or ""
+    homepage_html = homepage_html_cached or ""
 
     all_product_urls: set = set()
-    all_product_urls.update(_extract_product_links(homepage_html, actual_base))
+    all_product_urls.update(_extract_product_links(homepage_html, base))
 
     # Collect ALL internal links from homepage for nav/category discovery
     category_urls: list = []
@@ -574,7 +642,7 @@ def _discover_count(start_url: str) -> tuple[int, str]:
 
     for href in re.findall(r'href=["\']([^"\'#][^"\']*)["\']', homepage_html):
         try:
-            full = href if href.startswith("http") else f"{actual_base}/{href.lstrip('/')}"
+            full = href if href.startswith("http") else f"{base}/{href.lstrip('/')}"
             fu = urlparse(full)
             if fu.netloc.lower().lstrip("www.") != actual_netloc.lstrip("www."):
                 continue
@@ -588,7 +656,7 @@ def _discover_count(start_url: str) -> tuple[int, str]:
 
     # Also blind-probe standard listing paths (might not appear in nav)
     for lp in _LISTING_PATHS:
-        _add_cat(f"{actual_base}{lp}")
+        _add_cat(f"{base}{lp}")
 
     # Crawl category/listing pages
     total_estimated = 0
@@ -599,7 +667,7 @@ def _discover_count(start_url: str) -> tuple[int, str]:
         if not r or r.status_code != 200:
             continue
         cat_html = r.text
-        page_products = _extract_product_links(cat_html, actual_base)
+        page_products = _extract_product_links(cat_html, base)
         if not page_products:
             continue
 
@@ -742,10 +810,11 @@ def _collect_urls(start_url: str, target_count: int = 0) -> tuple[list[str], str
     if session is None:
         return [], "requests-unavailable"
 
-    base = start_url.rstrip("/")
-    parsed = urlparse(start_url)
-    domain = parsed.netloc.lower().lstrip("www.")
-    timeout = 15
+    timeout = 20
+    # Resolve the real base URL (handles www/non-www, redirects, SSL)
+    actual_base, actual_netloc, homepage_html_cached = _resolve_base(session, start_url, timeout=timeout)
+    base = actual_base
+    domain = actual_netloc.lstrip("www.")
     urls: list[str] = []
 
     # ── 1. Supabase (zatpatmachines / zatpatestimate) ─────────────────────────
@@ -911,21 +980,22 @@ def _collect_urls(start_url: str, target_count: int = 0) -> tuple[list[str], str
         return sitemap_urls, "sitemap"
 
     # ── 6. HTML pagination scan — follow ALL listing pages ───────────────────
-    # Start from the homepage to discover the real base after redirects
-    r = _safe_get(session, start_url, timeout=timeout)
-    if not r:
-        # Couldn't reach the site — return whatever sitemap gave us
-        if sitemap_urls:
+    # Use the homepage HTML already fetched by _resolve_base
+    if homepage_html_cached is None:
+        # Site might be blocking us — try one more time
+        r_home = _safe_get(session, base, timeout=30)
+        if r_home and r_home.status_code == 200:
+            homepage_html_cached = r_home.text or ""
+        elif sitemap_urls:
             return sitemap_urls, "sitemap(partial)"
-        return [], "site-unreachable"
+        else:
+            return [], "site-unreachable"
 
-    actual_base   = f"{urlparse(r.url).scheme}://{urlparse(r.url).netloc}"
-    actual_netloc = urlparse(r.url).netloc.lower()
-    homepage_html = r.text or ""
+    homepage_html = homepage_html_cached or ""
 
     collected: set = set()
     # Add any product URLs found directly on homepage
-    collected.update(_extract_product_links(homepage_html, actual_base))
+    collected.update(_extract_product_links(homepage_html, base))
 
     # Discover all listing/category pages from homepage navigation
     listing_queue: list = []
@@ -940,7 +1010,7 @@ def _collect_urls(start_url: str, target_count: int = 0) -> tuple[list[str], str
     # From homepage links
     for href in re.findall(r'href=["\']([^"\'#][^"\']*)["\']', homepage_html):
         try:
-            full = href if href.startswith("http") else f"{actual_base}/{href.lstrip('/')}"
+            full = href if href.startswith("http") else f"{base}/{href.lstrip('/')}"
             if urlparse(full).netloc.lower().lstrip("www.") != actual_netloc.lstrip("www."):
                 continue
             path = urlparse(full).path.lower().rstrip("/")
@@ -951,7 +1021,7 @@ def _collect_urls(start_url: str, target_count: int = 0) -> tuple[list[str], str
 
     # Probe standard listing paths
     for lp in _LISTING_PATHS:
-        _enqueue(f"{actual_base}{lp}")
+        _enqueue(f"{base}{lp}")
 
     # For each listing page, collect product URLs and follow ALL pagination
     pages_crawled = 0
@@ -968,7 +1038,7 @@ def _collect_urls(start_url: str, target_count: int = 0) -> tuple[list[str], str
             if not r or r.status_code != 200:
                 break
 
-            page_products = _extract_product_links(r.text, actual_base)
+            page_products = _extract_product_links(r.text, base)
             if not page_products:
                 break
 
