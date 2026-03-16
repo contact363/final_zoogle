@@ -242,10 +242,12 @@ def _extract_error_summary(output: str) -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _PRODUCT_URL_KEYWORDS = (
-    "/machine/", "/product/", "/equipment/", "/item/", "/listing/",
-    "/crane/", "/lathe/", "/mill/", "/grinder/", "/press/", "/robot/",
-    "/hoist/", "/compressor/", "/conveyor/", "/machinetools/",
-    "/used-", "/second-hand/", "/gebraucht/", "/occasion/",
+    "/machine/", "/machines/", "/product/", "/products/", "/equipment/",
+    "/item/", "/listing/", "/crane/", "/lathe/", "/mill/", "/grinder/",
+    "/press/", "/robot/", "/hoist/", "/compressor/", "/conveyor/",
+    "/machinetools/", "/machine-tools/", "/used-", "/second-hand/",
+    "/gebraucht/", "/occasion/", "/catalog/", "/stock/", "/inventory/",
+    "/usedmachine/", "/usedmachines/", "/usedmachinestocklist/",
 )
 
 _LISTING_PATHS = (
@@ -254,6 +256,19 @@ _LISTING_PATHS = (
     "/used-machines", "/used-equipment", "/cranes", "/lathes", "/mills",
     "/hoists", "/compressors", "/robots", "/grinders", "/presses",
     "/maschinen", "/occasions", "/gebrauchtmaschinen",
+    # Additional category paths
+    "/product-category", "/product-categories", "/categories",
+    "/machine-category", "/machine-categories", "/all-machines",
+    "/all-products", "/buy", "/sale", "/items", "/tools",
+)
+
+# CSS class patterns indicating product card/grid structures
+_PRODUCT_CARD_CLASSES = (
+    "product-card", "product-item", "product-grid", "product-listing",
+    "product-list", "products-grid", "item-card", "machine-card",
+    "machine-item", "machine-listing", "listing-item", "catalog-item",
+    "grid-item", "woocommerce-loop-product", "wc-block-grid__product",
+    "product_type_", "type-product", "post-type-archive-product",
 )
 
 _JSON_API_PATHS = (
@@ -306,6 +321,46 @@ def _max_page_number(html: str) -> int:
         except Exception:
             pass
     return max_page
+
+
+def _find_dominant_url_pattern(urls: set) -> tuple[str, int]:
+    """
+    Given a set of internal links, find the most repeated first-level path
+    prefix — signals a product listing pattern (e.g. '/product/' repeated 80×).
+    Returns (prefix, count) or ("", 0) if no dominant pattern found.
+    """
+    from collections import Counter
+    prefix_counter: Counter = Counter()
+    for url in urls:
+        path = urlparse(url).path
+        parts = [p for p in path.split("/") if p]
+        if len(parts) >= 2:
+            prefix_counter[f"/{parts[0]}/"] += 1
+    if not prefix_counter:
+        return "", 0
+    top_prefix, count = prefix_counter.most_common(1)[0]
+    return top_prefix, count
+
+
+def _collect_all_internal_links(html: str, base: str, netloc: str) -> set:
+    """Extract all same-domain non-asset links from an HTML page."""
+    netloc_norm = netloc.lstrip("www.")
+    links: set = set()
+    for href in re.findall(r'href=["\']([^"\'#?][^"\']*)["\']', html):
+        try:
+            full = href if href.startswith("http") else f"{base}/{href.lstrip('/')}"
+            fu = urlparse(full)
+            if fu.netloc.lower().lstrip("www.") != netloc_norm:
+                continue
+            path = fu.path.lower()
+            if re.search(r"\.(css|js|jpg|jpeg|png|gif|svg|ico|woff|pdf|zip)$", path):
+                continue
+            if re.search(r"/(login|register|cart|checkout|wp-admin|wp-content|wp-includes)/", path):
+                continue
+            links.add(full.split("?")[0].split("#")[0])
+        except Exception:
+            pass
+    return links
 
 
 _UA_POOL = [
@@ -734,11 +789,19 @@ def _discover_count(start_url: str) -> tuple[int, str]:
             return -1, "site-unreachable"
 
     homepage_html = homepage_html_cached or ""
+    netloc_norm = actual_netloc.lstrip("www.")
 
     all_product_urls: set = set()
     all_product_urls.update(_extract_product_links(homepage_html, base))
 
-    # Collect ALL internal links from homepage for nav/category discovery
+    # ── [Enhancement 3] HTML Structure Detection ─────────────────────────────
+    # Detect product card/grid CSS patterns even before crawling listing pages.
+    product_card_detected = any(cls in homepage_html for cls in _PRODUCT_CARD_CLASSES)
+    if product_card_detected:
+        logger.info("[discovery] Product card structure detected on homepage HTML")
+
+    # ── [Enhancement 1] Category Page Detection ───────────────────────────────
+    # Scan nav/menu links + blind-probe all known listing paths.
     category_urls: list = []
     seen_cat: set = set()
 
@@ -752,33 +815,41 @@ def _discover_count(start_url: str) -> tuple[int, str]:
         try:
             full = href if href.startswith("http") else f"{base}/{href.lstrip('/')}"
             fu = urlparse(full)
-            if fu.netloc.lower().lstrip("www.") != actual_netloc.lstrip("www."):
+            if fu.netloc.lower().lstrip("www.") != netloc_norm:
                 continue
             path = fu.path.lower().rstrip("/")
-            # Listing-like path?
             if any(path == lp or path.endswith(lp) or lp.rstrip("/") in path
                    for lp in _LISTING_PATHS):
                 _add_cat(full)
         except Exception:
             pass
 
-    # Also blind-probe standard listing paths (might not appear in nav)
+    # Blind-probe all known listing paths (may not appear in nav)
     for lp in _LISTING_PATHS:
         _add_cat(f"{base}{lp}")
 
-    # Crawl category/listing pages
+    # ── Crawl category/listing pages ─────────────────────────────────────────
     total_estimated = 0
     methods_used = []
+    cat_pages_checked = 0
+    cat_pages_with_products = 0
 
-    for cat_url in category_urls[:12]:
+    for cat_url in category_urls[:20]:
         r = _safe_get(session, cat_url, timeout=timeout)
         if not r or r.status_code != 200:
             continue
+        cat_pages_checked += 1
         cat_html = r.text
+
+        # Check for product card structures on category pages too
+        if any(cls in cat_html for cls in _PRODUCT_CARD_CLASSES):
+            product_card_detected = True
+
         page_products = _extract_product_links(cat_html, base)
         if not page_products:
             continue
 
+        cat_pages_with_products += 1
         all_product_urls.update(page_products)
         per_page = len(page_products)
         max_page = _max_page_number(cat_html)
@@ -792,17 +863,88 @@ def _discover_count(start_url: str) -> tuple[int, str]:
             total_estimated += per_page
             methods_used.append(f"{urlparse(cat_url).path}({per_page})")
 
+    # ── [Enhancement 2] Product Link Pattern Detection ────────────────────────
+    # Collect all internal links from homepage and detect repeating URL prefixes
+    # (e.g. /product/ appearing 80× signals a product listing pattern).
+    homepage_internal = _collect_all_internal_links(homepage_html, base, actual_netloc)
+    dominant_pattern, pattern_count = _find_dominant_url_pattern(homepage_internal)
+    if dominant_pattern and pattern_count >= 5:
+        logger.info(f"[discovery] Dominant URL pattern: {dominant_pattern} (×{pattern_count})")
+        # Count those internal links as product URLs if they match product keywords
+        if any(kw in dominant_pattern for kw in ("/product", "/machine", "/equipment",
+                                                   "/item", "/listing", "/catalog",
+                                                   "/stock", "/used", "/tool")):
+            for link in homepage_internal:
+                if dominant_pattern in urlparse(link).path.lower():
+                    all_product_urls.add(link)
+
     direct = len(all_product_urls)
     final  = max(direct, total_estimated)
 
+    # ── [Enhancement 4] Fallback Depth-2 Scan ────────────────────────────────
+    # If still no products found, scan first-level internal links (depth=2).
+    if final == 0:
+        logger.info("[discovery] No products found on surface scan — starting depth-2 fallback")
+        depth2_candidates = list(homepage_internal)[:15]
+        depth2_products: set = set()
+        depth2_cat_found: list = []
+
+        for d2_url in depth2_candidates:
+            r = _safe_get(session, d2_url, timeout=timeout)
+            if not r or r.status_code != 200:
+                continue
+            d2_html = r.text
+
+            # Check for product card structures at depth-2
+            if any(cls in d2_html for cls in _PRODUCT_CARD_CLASSES):
+                product_card_detected = True
+
+            found = _extract_product_links(d2_html, base)
+            if found:
+                depth2_products.update(found)
+                depth2_cat_found.append(urlparse(d2_url).path)
+                # Check pagination on this depth-2 page
+                max_page = _max_page_number(d2_html)
+                if max_page > 1:
+                    est = len(found) * max_page
+                    total_estimated += est
+                    methods_used.append(f"depth2:{urlparse(d2_url).path}(~{est})")
+                else:
+                    methods_used.append(f"depth2:{urlparse(d2_url).path}({len(found)})")
+
+            if len(depth2_products) >= 30:
+                break  # sufficient evidence
+
+        if depth2_products:
+            all_product_urls.update(depth2_products)
+            logger.info(f"[discovery] Depth-2 scan found {len(depth2_products)} product links on: {depth2_cat_found}")
+
+        direct = len(all_product_urls)
+        final  = max(direct, total_estimated)
+
+    # ── Return result ─────────────────────────────────────────────────────────
     if final > 0:
         detail     = ", ".join(methods_used[:3]) if methods_used else "url-scan"
         is_est     = total_estimated > direct
         method_tag = f"html-scan~estimated({detail})" if is_est else f"html-scan({detail})"
         return final, method_tag
 
-    # Site was reachable but no products found — return 0 with html-scan method
-    # so it's not treated as an error
+    # ── [Enhancement 5] Improved zero-result logging ──────────────────────────
+    # Even when count=0, log what was detected for debugging.
+    diag_parts = []
+    if cat_pages_checked:
+        diag_parts.append(f"checked {cat_pages_checked} category pages")
+    if dominant_pattern and pattern_count >= 3:
+        diag_parts.append(f"url-pattern:{dominant_pattern}(×{pattern_count})")
+    if product_card_detected:
+        diag_parts.append("product-card-html-detected")
+
+    if diag_parts:
+        diag = ", ".join(diag_parts)
+        logger.info(f"[discovery] 0 products found but signals detected: {diag}")
+        return 0, f"html-scan(0-found; {diag})"
+
+    # Site reachable but truly no product signals detected
     return 0, "html-scan(no-products-detected)"
 
 
@@ -851,12 +993,29 @@ def _execute_discovery(website_id: int, db: Session) -> None:
             else:
                 count_label = str(count)
 
+            # Build rich log output — include pattern/signal detail when count=0
+            log_lines = [f"Discovery method: html pattern scan"]
+            if "html-scan" in method:
+                # Extract any detected pattern info embedded in the method string
+                if "url-pattern:" in method:
+                    m_pat = re.search(r"url-pattern:([^\s,)]+)", method)
+                    if m_pat:
+                        log_lines.append(f"Product pattern detected: {m_pat.group(1)}")
+                if "product-card-html-detected" in method:
+                    log_lines.append("Product card HTML structures detected")
+                if "depth2:" in method:
+                    log_lines.append("Products found via depth-2 page scan")
+                # Underlying detection method for transparency
+                log_lines.append(f"Detection detail: {method}")
+            else:
+                log_lines[0] = f"Discovery method: {method}"
+
+            log_lines.append(f"Machines estimated: {count_label}")
+            log_output = "\n".join(log_lines) + "\n"
+
             log.status = "success"
             log.machines_found = max(count, 0)
-            log.log_output = (
-                f"Discovery method: {method}\n"
-                f"Machines found on site: {count_label}\n"
-            )
+            log.log_output = log_output
             log.error_details = None
             website.discovered_count = count if count > 0 else None
             website.discovery_status = "done"
