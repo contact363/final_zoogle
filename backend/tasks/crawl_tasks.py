@@ -557,6 +557,43 @@ def _discover_count(start_url: str) -> tuple[int, str]:
                 except Exception:
                     pass
 
+    # ── 3b. corelmachine.com — count via /api/subcategory/all + /api/product/{slug} ──
+    if "corelmachine.com" in domain:
+        _COREL_BASE = "https://corelmachine.com"
+        _NON_CAT_D = {"", "selltous", "aboutus", "contactus", "blogs",
+                      "privacy-policy", "terms-conditions", "cookie-policy",
+                      "marketing-opt-out", "sitemap"}
+        r = _safe_get(session, f"{_COREL_BASE}/api/subcategory/all", timeout=timeout, json_mode=True)
+        if r and r.status_code == 200:
+            try:
+                subcats = r.json()
+                if isinstance(subcats, list):
+                    total_corel = 0
+                    sampled = 0
+                    for entry in subcats:
+                        slug = (entry.get("url") or entry.get("slug") or "").strip()
+                        if not slug or slug in _NON_CAT_D:
+                            continue
+                        pr = _safe_get(session, f"{_COREL_BASE}/api/product/{slug}",
+                                       timeout=timeout, json_mode=True)
+                        if pr and pr.status_code == 200:
+                            try:
+                                products = pr.json()
+                                if isinstance(products, dict):
+                                    for k in ("data", "results", "products"):
+                                        if isinstance(products.get(k), list):
+                                            products = products[k]
+                                            break
+                                if isinstance(products, list):
+                                    total_corel += len(products)
+                                    sampled += 1
+                            except Exception:
+                                pass
+                    if total_corel > 0:
+                        return total_corel, f"corelmachine-api({sampled} subcategories)"
+            except Exception:
+                pass
+
     # ── 4. Supabase (inline credentials) ─────────────────────────────────────
     _ZATPAT_SUPABASE_URL = "https://aqhgorgilxwrhzleztby.supabase.co"
     _ZATPAT_SUPABASE_KEY = (
@@ -894,6 +931,75 @@ def _collect_urls(start_url: str, target_count: int = 0) -> tuple[list[str], str
     base = actual_base
     domain = actual_netloc.lstrip("www.")
     urls: list[str] = []
+
+    # ── 0. Site-specific API collectors (dedicated spider sites) ─────────────
+    # These sites have custom spiders that use internal JSON APIs.
+    # We mirror the same API approach here so URL collection works even when
+    # the homepage/HTML is blocked by a WAF.
+
+    # corelmachine.com — Next.js App Router, JSON API at /api/subcategory/all
+    if "corelmachine.com" in domain:
+        _COREL_BASE = "https://corelmachine.com"  # non-www — API 404s on www variant
+        _NON_CAT = {"", "selltous", "aboutus", "contactus", "blogs",
+                    "privacy-policy", "terms-conditions", "cookie-policy",
+                    "marketing-opt-out", "sitemap"}
+        r = _safe_get(session, f"{_COREL_BASE}/api/subcategory/all", timeout=timeout, json_mode=True)
+        if r and r.status_code == 200:
+            try:
+                subcats = r.json()
+                if isinstance(subcats, list):
+                    corel_urls: list[str] = []
+                    for entry in subcats:
+                        slug = (entry.get("url") or entry.get("slug") or "").strip()
+                        if not slug or slug in _NON_CAT:
+                            continue
+                        # Try multiple product API patterns (same as the spider)
+                        for api_path in (
+                            f"{_COREL_BASE}/api/product/{slug}",
+                            f"{_COREL_BASE}/api/product/subcategory/{slug}",
+                            f"{_COREL_BASE}/api/products/{slug}",
+                            f"{_COREL_BASE}/api/products?subcategory={slug}&status=true",
+                        ):
+                            pr = _safe_get(session, api_path, timeout=timeout, json_mode=True)
+                            if not pr or pr.status_code != 200:
+                                continue
+                            try:
+                                products = pr.json()
+                                if isinstance(products, dict):
+                                    for k in ("data", "results", "products", "machines", "items"):
+                                        if isinstance(products.get(k), list):
+                                            products = products[k]
+                                            break
+                                if not isinstance(products, list) or not products:
+                                    continue
+                                # Check it's a product list not a subcategory list
+                                first = products[0] if isinstance(products[0], dict) else {}
+                                if not any(f in first for f in ("price", "year", "reference_no",
+                                                                 "capacity", "product_status",
+                                                                 "stock_number", "condition", "url")) \
+                                        and len(products) <= 50:
+                                    continue
+                                for p in products:
+                                    if not isinstance(p, dict):
+                                        continue
+                                    url_slug = (p.get("url") or p.get("slug") or "").strip()
+                                    if url_slug:
+                                        if url_slug.startswith("http"):
+                                            corel_urls.append(url_slug)
+                                        else:
+                                            corel_urls.append(
+                                                f"{_COREL_BASE}/usedmachinestocklist/{slug}/{url_slug.lstrip('/')}"
+                                            )
+                                if corel_urls:
+                                    break  # found products for this slug, move to next
+                            except Exception:
+                                continue
+                    if corel_urls:
+                        deduped = list(dict.fromkeys(corel_urls))
+                        logger.info(f"[collect_urls] corelmachine API: {len(deduped)} URLs")
+                        return deduped, "corelmachine-api"
+            except Exception as e:
+                logger.warning(f"[collect_urls] corelmachine API error: {e}")
 
     # ── 1. Supabase (zatpatmachines / zatpatestimate) ─────────────────────────
     _ZATPAT_SUPABASE_URL = "https://aqhgorgilxwrhzleztby.supabase.co"
