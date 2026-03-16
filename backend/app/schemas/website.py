@@ -80,8 +80,10 @@ class WebsiteRead(BaseModel):
     machine_count:    int
     last_crawled_at:  Optional[datetime]
     crawl_status:     str
-    discovered_count: Optional[int] = None
-    discovery_status: Optional[str] = "pending"
-    created_at:       datetime
+    discovered_count:       Optional[int] = None
+    discovery_status:       Optional[str] = "pending"
+    urls_collected:         Optional[int] = None
+    url_collection_status:  Optional[str] = "pending"
+    created_at:             datetime
 
     model_config = {"from_attributes": True}

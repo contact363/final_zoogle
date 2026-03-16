@@ -136,6 +136,11 @@ export async function discoverWebsite(websiteId: number) {
   return data;
 }
 
+export async function collectUrlsWebsite(websiteId: number) {
+  const { data } = await api.post(`/api/admin/websites/${websiteId}/collect-urls`);
+  return data;
+}
+
 export async function startCrawl(websiteId: number) {
   const { data } = await api.post(`/api/admin/crawl/start/${websiteId}`);
   return data;

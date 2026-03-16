@@ -213,6 +213,33 @@ async def delete_training_rules(
 
 # ── Discovery (Phase 1) ───────────────────────────────────────────────────────
 
+@router.post("/websites/{website_id}/collect-urls")
+async def collect_urls_website(
+    website_id: int,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """
+    Phase 2 — URL Collection: gather all product/machine URLs from the website.
+    Runs in a background thread; poll GET /api/admin/websites to check
+    url_collection_status.  Called automatically after discovery, but can also
+    be triggered manually to refresh the URL list.
+    """
+    result = await db.execute(select(Website).where(Website.id == website_id))
+    website = result.scalar_one_or_none()
+    if not website:
+        raise HTTPException(status_code=404, detail="Website not found")
+
+    if website.url_collection_status == "running":
+        return {"status": "already_running", "message": "URL collection already in progress"}
+
+    import threading
+    from tasks.crawl_tasks import run_url_collection_direct
+    t = threading.Thread(target=run_url_collection_direct, args=(website_id,), daemon=True)
+    t.start()
+    return {"status": "started", "website_id": website_id}
+
+
 @router.post("/websites/{website_id}/discover")
 async def discover_website(
     website_id: int,
@@ -799,7 +826,7 @@ async def list_crawl_logs(
                 "website_name": name or f"Website #{c.website_id}",
                 "website_url": url,
                 "task_id": c.task_id,
-                "log_type": getattr(c, "log_type", "crawl") or "crawl",
+                "log_type": getattr(c, "log_type", None) or "crawl",
                 "status": c.status,
                 "machines_found": c.machines_found,
                 "machines_new": c.machines_new,

@@ -22,6 +22,10 @@ class Website(Base):
     discovered_count = Column(Integer, nullable=True)        # how many machines found on the site
     discovery_status = Column(String(50), default="pending") # pending, running, done, error
 
+    # URL Collection stats (Phase 2)
+    urls_collected          = Column(Integer, nullable=True)        # number of product URLs gathered
+    url_collection_status   = Column(String(50), default="pending") # pending, running, done, error
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

@@ -113,10 +113,11 @@ class GenericSpider(BaseZoogleSpider):
     }
 
     def __init__(self, website_id=None, start_url=None, crawl_log_id=None,
-                 training_rules=None, *args, **kwargs):
+                 training_rules=None, url_file=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.website_id  = int(website_id)  if website_id   else None
+        self.website_id   = int(website_id)   if website_id   else None
         self.crawl_log_id = int(crawl_log_id) if crawl_log_id else None
+        self._url_file    = url_file  # path to pre-collected URL list (Phase 2)
 
         # Ensure the URL has a scheme — Scrapy raises ValueError otherwise.
         # Websites are sometimes stored as "www.example.com" without https://.
@@ -282,6 +283,31 @@ class GenericSpider(BaseZoogleSpider):
         start_url = self.start_urls[0] if self.start_urls else None
         if not start_url:
             return
+
+        # ── URL-file mode (Phase 2 pre-collected URLs) ────────────────────────
+        # If the URL collection phase wrote a file of product URLs for this
+        # website, skip all discovery and go straight to detail-page extraction.
+        import os as _os
+        if self._url_file and _os.path.exists(self._url_file):
+            try:
+                with open(self._url_file, encoding="utf-8") as fh:
+                    file_urls = [ln.strip() for ln in fh if ln.strip()]
+                logger.info(
+                    f"[SPIDER url-file] loading {len(file_urls)} pre-collected URLs "
+                    f"from {self._url_file!r} — skipping discovery"
+                )
+                for fu in file_urls:
+                    if not self._is_visited(fu):
+                        self._mark_visited(fu)
+                        yield scrapy.Request(
+                            fu,
+                            callback=self._parse_detail_page,
+                            errback=self._errback,
+                            meta={"url_file_mode": True},
+                        )
+                return   # do NOT do any homepage/sitemap/listing crawl
+            except Exception as exc:
+                logger.warning(f"[SPIDER url-file] failed to load {self._url_file!r}: {exc} — falling back to normal crawl")
 
         logger.info(
             f"[SPIDER v={SPIDER_VERSION}] start_requests — url={start_url!r} "

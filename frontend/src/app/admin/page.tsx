@@ -6,6 +6,7 @@ import {
   recalculateMachineCounts, fixWebsiteNames,
   startCrawl, startAllCrawls, fixStuckCrawls, getCrawlLogs,
   discoverWebsite,
+  collectUrlsWebsite,
   getAdminMachines, updateMachine, deleteMachine, createMachine,
   exportMachinesExcelUrl, fillMachineTypes,
   getTrainingRules, saveTrainingRules, deleteTrainingRules,
@@ -1154,8 +1155,9 @@ export default function AdminPage() {
                       <tr className="text-gray-500 text-left">
                         <th className="px-4 py-3 font-semibold">Name / URL</th>
                         <th className="px-4 py-3 font-semibold">Status</th>
-                        <th className="px-4 py-3 font-semibold">Discovered</th>
-                        <th className="px-4 py-3 font-semibold">Extracted</th>
+                        <th className="px-4 py-3 font-semibold">① Discovered</th>
+                        <th className="px-4 py-3 font-semibold">② URLs</th>
+                        <th className="px-4 py-3 font-semibold">③ Extracted</th>
                         <th className="px-4 py-3 font-semibold">Last Crawl</th>
                         <th className="px-4 py-3 font-semibold">Actions</th>
                       </tr>
@@ -1171,11 +1173,11 @@ export default function AdminPage() {
                             <CrawlStatusBadge status={site.crawl_status} />
                             {!site.is_active && <span className="ml-1 text-xs text-red-400">(inactive)</span>}
                           </td>
-                          {/* Discovered column */}
+                          {/* ① Discovered column */}
                           <td className="px-4 py-3">
                             <div className="flex flex-col gap-1">
                               {site.discovery_status === "running" ? (
-                                <span className="text-xs text-blue-500 flex items-center gap-1"><RefreshCw className="w-3 h-3 animate-spin" /> Scanning...</span>
+                                <span className="text-xs text-blue-500 flex items-center gap-1"><RefreshCw className="w-3 h-3 animate-spin" /> Scanning…</span>
                               ) : site.discovered_count != null ? (
                                 <span className="text-sm font-bold text-indigo-600">{site.discovered_count.toLocaleString()}</span>
                               ) : (
@@ -1185,33 +1187,75 @@ export default function AdminPage() {
                                 onClick={async () => {
                                   try {
                                     await discoverWebsite(site.id);
-                                    toast.success("Discovery started!");
-                                    setTimeout(async () => setWebsites(await listWebsites()), 2000);
+                                    toast.success("Discovery started — URL collection will follow automatically");
+                                    const poll = setInterval(async () => {
+                                      const fresh = await listWebsites();
+                                      setWebsites(fresh);
+                                      const s = fresh.find((w: any) => w.id === site.id);
+                                      if (s && s.discovery_status !== "running" && s.url_collection_status !== "running") {
+                                        clearInterval(poll);
+                                      }
+                                    }, 3000);
+                                    setTimeout(() => clearInterval(poll), 120000);
                                   } catch { toast.error("Discovery failed"); }
                                 }}
-                                disabled={site.discovery_status === "running"}
+                                disabled={site.discovery_status === "running" || site.url_collection_status === "running"}
                                 className="text-xs text-indigo-500 hover:text-indigo-700 disabled:opacity-40 flex items-center gap-1 w-fit"
-                                title="Discover how many machines are on this site"
+                                title="Phase 1: Discover count → Phase 2: Collect URLs (automatic)"
                               >
                                 <Search className="w-3 h-3" /> Discover
                               </button>
                             </div>
                           </td>
-                          {/* Extracted column */}
+                          {/* ② URLs collected column */}
+                          <td className="px-4 py-3">
+                            <div className="flex flex-col gap-1">
+                              {site.url_collection_status === "running" ? (
+                                <span className="text-xs text-blue-500 flex items-center gap-1"><RefreshCw className="w-3 h-3 animate-spin" /> Collecting…</span>
+                              ) : site.urls_collected != null ? (
+                                <span className={`text-sm font-bold ${
+                                  site.discovered_count && site.urls_collected >= site.discovered_count * 0.9
+                                    ? "text-green-600" : "text-yellow-600"
+                                }`}>
+                                  {site.urls_collected.toLocaleString()}
+                                  {site.discovered_count ? ` / ${site.discovered_count.toLocaleString()}` : ""}
+                                </span>
+                              ) : (
+                                <span className="text-xs text-gray-400">—</span>
+                              )}
+                              {site.discovery_status === "done" && site.url_collection_status !== "running" && (
+                                <button
+                                  onClick={async () => {
+                                    try {
+                                      await collectUrlsWebsite(site.id);
+                                      toast.success("URL collection started!");
+                                      setTimeout(async () => setWebsites(await listWebsites()), 3000);
+                                    } catch { toast.error("URL collection failed"); }
+                                  }}
+                                  className="text-xs text-yellow-600 hover:text-yellow-800 flex items-center gap-1 w-fit"
+                                  title="Phase 2: Collect all machine URLs"
+                                >
+                                  <RefreshCw className="w-3 h-3" /> Re-collect
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                          {/* ③ Extracted column */}
                           <td className="px-4 py-3">
                             <div className="flex flex-col gap-1">
                               <span className="text-sm font-medium text-gray-700">
                                 {site.machine_count?.toLocaleString()}
-                                {site.discovered_count != null && site.discovered_count > 0 && (
-                                  <span className={`ml-1 text-xs ${site.machine_count >= site.discovered_count ? "text-green-500" : "text-orange-400"}`}>
-                                    / {site.discovered_count.toLocaleString()}
+                                {site.urls_collected != null && site.urls_collected > 0 && (
+                                  <span className={`ml-1 text-xs font-semibold ${site.machine_count >= site.urls_collected * 0.9 ? "text-green-500" : "text-orange-400"}`}>
+                                    / {site.urls_collected.toLocaleString()}
                                   </span>
                                 )}
                               </span>
                               <button
                                 onClick={() => handleStartCrawl(site.id)}
-                                className="text-xs text-green-600 hover:text-green-800 flex items-center gap-1 w-fit"
-                                title="Start full crawl to extract all machines"
+                                disabled={site.url_collection_status === "running" || site.crawl_status === "running"}
+                                className="text-xs text-green-600 hover:text-green-800 disabled:opacity-40 flex items-center gap-1 w-fit"
+                                title="Phase 3: Extract all machines from collected URLs"
                               >
                                 <Play className="w-3 h-3" /> Extract
                               </button>
@@ -1299,7 +1343,7 @@ export default function AdminPage() {
                         <>
                           <tr
                             key={log.id}
-                            className={`hover:bg-gray-50 ${log.log_type === "discovery" ? "bg-indigo-50/40" : ""} ${hasDetail ? "cursor-pointer" : ""}`}
+                            className={`hover:bg-gray-50 ${log.log_type === "discovery" ? "bg-indigo-50/40" : log.log_type === "url_collection" ? "bg-yellow-50/40" : ""} ${hasDetail ? "cursor-pointer" : ""}`}
                             onClick={() => hasDetail && setExpandedLog(isExpanded ? null : log.id)}
                           >
                             <td className="px-4 py-3 text-gray-400">
@@ -1314,6 +1358,10 @@ export default function AdminPage() {
                                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-100 text-indigo-700">
                                   <Search className="w-3 h-3" /> Discovery
                                 </span>
+                              ) : log.log_type === "url_collection" ? (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-700">
+                                  <RefreshCw className="w-3 h-3" /> URL Collect
+                                </span>
                               ) : (
                                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700">
                                   <Play className="w-3 h-3" /> Crawl
@@ -1324,9 +1372,11 @@ export default function AdminPage() {
                             <td className="px-4 py-3 font-medium">
                               {log.log_type === "discovery" && log.status === "success" ? (
                                 <span className="text-indigo-600 font-bold">{(log.machines_found ?? 0).toLocaleString()} on site</span>
+                              ) : log.log_type === "url_collection" && log.status === "success" ? (
+                                <span className="text-yellow-700 font-bold">{(log.machines_found ?? 0).toLocaleString()} URLs</span>
                               ) : (log.machines_found ?? 0).toLocaleString()}
                             </td>
-                            <td className="px-4 py-3 text-green-600 font-medium">{log.log_type === "discovery" ? "—" : (log.machines_new ?? 0)}</td>
+                            <td className="px-4 py-3 text-green-600 font-medium">{(log.log_type === "discovery" || log.log_type === "url_collection") ? "—" : (log.machines_new ?? 0)}</td>
                             <td className="px-4 py-3 text-red-500">{log.errors_count ?? 0}</td>
                             <td className="px-4 py-3 text-gray-400 text-xs">{new Date(log.started_at).toLocaleString()}</td>
                             <td className="px-4 py-3 text-gray-400">{duration}</td>

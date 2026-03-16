@@ -159,9 +159,9 @@ def _run_scrapy(
     """
     Launch scrapy crawl <spider> -a website_id=N ...
 
-    Uses a dedicated spider for known sites (zatpatmachines, corelmachine),
-    falls back to the generic spider for all others.
-    No CLOSESPIDER_ITEMCOUNT cap — each spider controls its own limit.
+    If a URL file from Phase 2 URL Collection exists for this website,
+    it is passed to the generic spider via -a url_file=... so the spider
+    crawls exactly those pre-collected URLs instead of re-discovering them.
     """
     spider = _spider_for_url(start_url)
     cmd = [
@@ -173,6 +173,12 @@ def _run_scrapy(
     ]
     if training_rules_json and spider == "generic":
         cmd += ["-a", f"training_rules={training_rules_json}"]
+
+    # Pass pre-collected URL file to generic spider (Phase 2 output)
+    fpath = url_file_path(website_id)
+    if spider == "generic" and os.path.exists(fpath) and os.path.getsize(fpath) > 0:
+        cmd += ["-a", f"url_file={fpath}"]
+        logger.info(f"URL-file mode: passing {fpath} to spider")
 
     logger.info(f"Running spider={spider!r} for website_id={website_id} url={start_url}")
     return subprocess.run(
@@ -690,14 +696,379 @@ def _execute_discovery(website_id: int, db: Session) -> None:
 
     db.commit()
 
+    # ── Auto-chain Phase 2 — URL Collection ───────────────────────────────────
+    if website.discovery_status == "done":
+        logger.info(f"Discovery done for website={website_id} — auto-starting URL collection")
+        _execute_url_collection(website_id, db)
+
 
 def run_discovery_direct(website_id: int):
-    """Run Phase 1 discovery without Celery — called in a background thread."""
+    """Run Phase 1 → auto-chains Phase 2 URL collection."""
     db = get_sync_db()
     try:
         _execute_discovery(website_id, db)
     except Exception as exc:
         logger.exception(f"run_discovery_direct failed: website={website_id} error={exc}")
+    finally:
+        db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 — URL Collection: gather all machine/product URLs without full crawl
+# ─────────────────────────────────────────────────────────────────────────────
+
+_URL_FILE_DIR = "/tmp"
+
+
+def url_file_path(website_id: int) -> str:
+    return os.path.join(_URL_FILE_DIR, f"zoogle_urls_{website_id}.txt")
+
+
+def _collect_urls(start_url: str, target_count: int = 0) -> tuple[list[str], str]:
+    """
+    Collect all machine/product URLs from a website without a full Scrapy crawl.
+
+    Tries in order:
+      1. Supabase  — query the API for all slugs/urls
+      2. Shopify   — paginate /products.json
+      3. WooCommerce — paginate /wp-json/wc/v3/products
+      4. WordPress REST — paginate /wp-json/wp/v2/{product,machine,...}
+      5. Sitemap   — extract all product <loc> URLs
+      6. HTML scan — crawl listing pages + follow all pagination
+
+    Returns (urls: list[str], method: str).
+    """
+    session, _ = _make_session()
+    if session is None:
+        return [], "requests-unavailable"
+
+    base = start_url.rstrip("/")
+    parsed = urlparse(start_url)
+    domain = parsed.netloc.lower().lstrip("www.")
+    timeout = 15
+    urls: list[str] = []
+
+    # ── 1. Supabase (zatpatmachines / zatpatestimate) ─────────────────────────
+    _ZATPAT_SUPABASE_URL = "https://aqhgorgilxwrhzleztby.supabase.co"
+    _ZATPAT_SUPABASE_KEY = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        ".eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFxaGdvcmdpbHh3cmh6bGV6dGJ5Iiw"
+        "icm9sZSI6ImFub24iLCJpYXQiOjE3NjU0MjMxNDEsImV4cCI6MjA4MDk5OTE0MX0"
+        ".GD_HVD-98oUUM9RteG_DxPD3Deg8lyqLpq9d8tgYA5A"
+    )
+    if "zatpat" in domain:
+        sb_tables = ["machines", "products", "listings", "items",
+                     "inventory", "estimates", "used_machines", "machine_listings"]
+        session.headers.update({
+            "apikey": _ZATPAT_SUPABASE_KEY,
+            "Authorization": f"Bearer {_ZATPAT_SUPABASE_KEY}",
+        })
+        for table in sb_tables:
+            offset = 0
+            page_size = 1000
+            table_urls: list[str] = []
+            while True:
+                r = _safe_get(
+                    session,
+                    f"{_ZATPAT_SUPABASE_URL}/rest/v1/{table}?select=url,slug,sku_number,id&limit={page_size}&offset={offset}",
+                    timeout=timeout,
+                )
+                if not r or r.status_code not in (200, 206):
+                    break
+                try:
+                    rows = r.json()
+                except Exception:
+                    break
+                if not isinstance(rows, list) or not rows:
+                    break
+                for row in rows:
+                    slug = (row.get("url") or row.get("slug") or "").strip()
+                    uid  = row.get("sku_number") or row.get("id", "")
+                    if slug and slug.startswith("http"):
+                        table_urls.append(slug)
+                    elif slug and not str(slug).isdigit():
+                        table_urls.append(f"{base}/{slug.lstrip('/')}")
+                    elif uid:
+                        table_urls.append(f"{base}/machine/{uid}")
+                if len(rows) < page_size:
+                    break
+                offset += page_size
+            if table_urls:
+                for h in ("apikey", "Authorization"):
+                    session.headers.pop(h, None)
+                return table_urls, f"supabase:{table}"
+        for h in ("apikey", "Authorization"):
+            session.headers.pop(h, None)
+
+    # ── 2. Shopify ────────────────────────────────────────────────────────────
+    page = 1
+    shopify_urls: list[str] = []
+    while True:
+        r = _safe_get(session, f"{base}/products.json?limit=250&page={page}", timeout=timeout)
+        if not r or r.status_code != 200:
+            break
+        try:
+            products = r.json().get("products", [])
+        except Exception:
+            break
+        if not products:
+            break
+        for p in products:
+            handle = p.get("handle")
+            if handle:
+                shopify_urls.append(f"{base}/products/{handle}")
+        if len(products) < 250:
+            break
+        page += 1
+    if shopify_urls:
+        return shopify_urls, "shopify"
+
+    # ── 3. WooCommerce ────────────────────────────────────────────────────────
+    page = 1
+    wc_urls: list[str] = []
+    while True:
+        r = _safe_get(
+            session,
+            f"{base}/wp-json/wc/v3/products?per_page=100&page={page}",
+            timeout=timeout, json_mode=True,
+        )
+        if not r or r.status_code != 200:
+            break
+        try:
+            products = r.json()
+        except Exception:
+            break
+        if not isinstance(products, list) or not products:
+            break
+        for p in products:
+            link = p.get("permalink") or p.get("link")
+            if link:
+                wc_urls.append(link)
+        total_pages = int(r.headers.get("X-WP-TotalPages", 1))
+        if page >= total_pages:
+            break
+        page += 1
+    if wc_urls:
+        return wc_urls, "woocommerce"
+
+    # ── 4. WordPress custom post types ────────────────────────────────────────
+    for wp_type in ("product", "machine", "equipment", "listing"):
+        page = 1
+        wp_urls: list[str] = []
+        while True:
+            r = _safe_get(
+                session,
+                f"{base}/wp-json/wp/v2/{wp_type}?per_page=100&page={page}&status=publish",
+                timeout=timeout, json_mode=True,
+            )
+            if not r or r.status_code != 200:
+                break
+            try:
+                items = r.json()
+            except Exception:
+                break
+            if not isinstance(items, list) or not items:
+                break
+            for item in items:
+                link = item.get("link") or item.get("permalink")
+                if link:
+                    wp_urls.append(link)
+            total_pages = int(r.headers.get("X-WP-TotalPages", 1))
+            if page >= total_pages:
+                break
+            page += 1
+        if wp_urls:
+            return wp_urls, f"wordpress:{wp_type}"
+
+    # ── 5. Sitemap — collect all product URLs ─────────────────────────────────
+    sitemap_urls: list[str] = []
+    for sitemap_path in ("/sitemap.xml", "/sitemap_index.xml",
+                         "/product-sitemap.xml", "/sitemap-products.xml"):
+        r = _safe_get(session, f"{base}{sitemap_path}", timeout=timeout)
+        if not r or r.status_code != 200 or "<loc>" not in r.text:
+            continue
+
+        # Sitemap index — fetch all child sitemaps
+        children = re.findall(r"<sitemap>\s*<loc>(.*?)</loc>", r.text, re.DOTALL)
+        if children:
+            for child_url in children:
+                cr = _safe_get(session, child_url.strip(), timeout=timeout)
+                if cr and cr.status_code == 200 and "<loc>" in cr.text:
+                    locs = re.findall(r"<loc>(.*?)</loc>", cr.text, re.DOTALL)
+                    sitemap_urls.extend(u.strip() for u in locs if _is_product_url(u.strip()))
+            if sitemap_urls:
+                break
+            continue
+
+        locs = re.findall(r"<loc>(.*?)</loc>", r.text, re.DOTALL)
+        sitemap_urls.extend(u.strip() for u in locs if _is_product_url(u.strip()))
+        if sitemap_urls:
+            break
+
+    # Deduplicate and check if sitemap coverage is sufficient
+    sitemap_urls = list(dict.fromkeys(sitemap_urls))
+    if sitemap_urls and (target_count <= 0 or len(sitemap_urls) >= target_count * 0.7):
+        return sitemap_urls, "sitemap"
+
+    # ── 6. HTML pagination scan — follow ALL listing pages ───────────────────
+    # Start from the homepage to discover the real base after redirects
+    r = _safe_get(session, start_url, timeout=timeout)
+    if not r:
+        # Couldn't reach the site — return whatever sitemap gave us
+        if sitemap_urls:
+            return sitemap_urls, "sitemap(partial)"
+        return [], "site-unreachable"
+
+    actual_base   = f"{urlparse(r.url).scheme}://{urlparse(r.url).netloc}"
+    actual_netloc = urlparse(r.url).netloc.lower()
+    homepage_html = r.text or ""
+
+    collected: set = set()
+    # Add any product URLs found directly on homepage
+    collected.update(_extract_product_links(homepage_html, actual_base))
+
+    # Discover all listing/category pages from homepage navigation
+    listing_queue: list = []
+    seen_listing: set = set()
+
+    def _enqueue(url: str):
+        clean = url.split("?")[0].split("#")[0].rstrip("/")
+        if clean not in seen_listing:
+            seen_listing.add(clean)
+            listing_queue.append(clean)
+
+    # From homepage links
+    for href in re.findall(r'href=["\']([^"\'#][^"\']*)["\']', homepage_html):
+        try:
+            full = href if href.startswith("http") else f"{actual_base}/{href.lstrip('/')}"
+            if urlparse(full).netloc.lower().lstrip("www.") != actual_netloc.lstrip("www."):
+                continue
+            path = urlparse(full).path.lower().rstrip("/")
+            if any(path == lp or lp.rstrip("/") in path for lp in _LISTING_PATHS):
+                _enqueue(full)
+        except Exception:
+            pass
+
+    # Probe standard listing paths
+    for lp in _LISTING_PATHS:
+        _enqueue(f"{actual_base}{lp}")
+
+    # For each listing page, collect product URLs and follow ALL pagination
+    pages_crawled = 0
+    for cat_url in listing_queue[:20]:           # max 20 categories
+        for page_num in range(1, 201):           # max 200 pages per category
+            if page_num == 1:
+                page_url = cat_url
+            else:
+                # Try common pagination patterns
+                sep   = "&" if "?" in cat_url else "?"
+                page_url = f"{cat_url}{sep}page={page_num}"
+
+            r = _safe_get(session, page_url, timeout=timeout)
+            if not r or r.status_code != 200:
+                break
+
+            page_products = _extract_product_links(r.text, actual_base)
+            if not page_products:
+                break
+
+            before = len(collected)
+            collected.update(page_products)
+            pages_crawled += 1
+
+            # Stop if no new URLs were added (we've seen all of these already)
+            if len(collected) == before and page_num > 1:
+                break
+
+            # Check /page/N/ style pagination exists in the page
+            if page_num == 1 and _max_page_number(r.text) == 1:
+                break  # single page category
+
+            # Stop if we've collected enough
+            if target_count > 0 and len(collected) >= target_count:
+                break
+
+        if target_count > 0 and len(collected) >= target_count:
+            break
+
+    # Merge with any partial sitemap results
+    for u in sitemap_urls:
+        collected.add(u)
+
+    result = list(dict.fromkeys(collected))   # deduplicated, order preserved
+    if result:
+        return result, f"html-scan({pages_crawled} pages)"
+    return [], "no-urls-found"
+
+
+def _execute_url_collection(website_id: int, db: Session) -> None:
+    """
+    Phase 2 full lifecycle:
+      load website → collect URLs → write to file → create log → update website
+    """
+    from app.models.website import Website
+    from app.models.crawl_log import CrawlLog
+
+    website = db.query(Website).filter(Website.id == website_id).first()
+    if not website:
+        return
+
+    website.url_collection_status = "running"
+    db.commit()
+
+    log = CrawlLog(
+        website_id=website_id,
+        task_id=f"urlcollect-{website_id}-{int(datetime.now().timestamp())}",
+        status="running",
+        log_type="url_collection",
+    )
+    db.add(log)
+    db.commit()
+
+    try:
+        target = website.discovered_count or 0
+        urls, method = _collect_urls(website.url, target_count=target)
+        url_count = len(urls)
+        logger.info(f"URL collection: website={website_id} count={url_count} method={method}")
+
+        # Write URLs to temp file for spider to consume
+        fpath = url_file_path(website_id)
+        if urls:
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write("\n".join(urls))
+            logger.info(f"Wrote {url_count} URLs to {fpath}")
+
+        log.status = "success" if urls else "error"
+        log.machines_found = url_count
+        log.log_output = (
+            f"URL collection method: {method}\n"
+            f"URLs collected: {url_count}\n"
+            f"Target count:   {target or 'unknown'}\n"
+            f"Coverage:       {int(url_count/target*100) if target > 0 else '?'}%\n"
+        )
+        log.error_details = None if urls else f"No URLs collected (method={method})"
+        log.finished_at = datetime.now(timezone.utc)
+
+        website.urls_collected          = url_count if urls else None
+        website.url_collection_status   = "done" if urls else "error"
+
+    except Exception as exc:
+        logger.exception(f"URL collection failed: website={website_id} error={exc}")
+        log.status = "error"
+        log.error_details = str(exc)
+        log.finished_at = datetime.now(timezone.utc)
+        website.url_collection_status = "error"
+
+    db.commit()
+
+
+def run_url_collection_direct(website_id: int):
+    """Run Phase 2 URL collection without Celery."""
+    db = get_sync_db()
+    try:
+        _execute_url_collection(website_id, db)
+    except Exception as exc:
+        logger.exception(f"run_url_collection_direct failed: website={website_id} error={exc}")
     finally:
         db.close()
 

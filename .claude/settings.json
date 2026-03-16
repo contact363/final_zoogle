@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s http://localhost:3000)",
+      "Bash(python -c \":*)",
+      "Bash(curl -s http://localhost:8000/)",
+      "Bash(curl -s -o /dev/null -w \"Docs: HTTP %{http_code}\" http://localhost:8000/docs)",
+      "Bash(ls /tmp/scrapy_*.log)"
+    ]
+  }
+}
