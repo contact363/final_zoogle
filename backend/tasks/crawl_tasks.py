@@ -20,7 +20,9 @@ import subprocess
 import sys
 import os
 import re
+import threading
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 from celery import shared_task
 from loguru import logger
@@ -227,6 +229,160 @@ def _extract_error_summary(output: str) -> str | None:
         return "\n".join(dict.fromkeys(error_lines))[:3000]
 
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 — Discovery: count machines without a full crawl
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _discover_count(start_url: str) -> tuple[int, str]:
+    """
+    Quick HTTP-based machine count — no Scrapy needed.
+
+    Tries in order:
+      1. Shopify  /products/count.json           → {"count": N}
+      2. WooCommerce /wp-json/wc/v3/products     → X-WP-Total header
+      3. Supabase PostgREST HEAD with count=exact → Content-Range: 0-0/N
+      4. Sitemap.xml — count product-looking URLs
+
+    Returns (count, method_name).  count = -1 means unknown.
+    """
+    try:
+        import requests as _req
+    except ImportError:
+        return -1, "requests-unavailable"
+
+    base = start_url.rstrip("/")
+    headers = {"User-Agent": "Zooglebot/1.0"}
+    timeout = 12
+
+    # ── 1. Shopify ───────────────────────────────────────────────────────────
+    try:
+        r = _req.get(f"{base}/products/count.json", headers=headers, timeout=timeout)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict) and "count" in data:
+                return int(data["count"]), "shopify"
+    except Exception:
+        pass
+
+    # ── 2. WooCommerce ───────────────────────────────────────────────────────
+    try:
+        r = _req.get(
+            f"{base}/wp-json/wc/v3/products?per_page=1",
+            headers=headers, timeout=timeout,
+        )
+        if r.status_code == 200:
+            total = r.headers.get("X-WP-Total")
+            if total:
+                return int(total), "woocommerce"
+    except Exception:
+        pass
+
+    # ── 3. Supabase (zatpatmachines / zatpatestimate) ────────────────────────
+    domain = urlparse(start_url).netloc.lower()
+    if "zatpat" in domain:
+        from zoogle_crawler.spiders.zatpatmachines_spider import (
+            _ZATPAT_SUPABASE_URL, _ZATPAT_SUPABASE_KEY, _TABLE_PROBES,
+        )
+        supabase_url = _ZATPAT_SUPABASE_URL
+        anon_key     = _ZATPAT_SUPABASE_KEY
+        sb_headers   = {
+            "apikey": anon_key,
+            "Authorization": f"Bearer {anon_key}",
+            "Prefer": "count=exact",
+            "Range": "0-0",
+        }
+        for table in _TABLE_PROBES:
+            try:
+                r = _req.get(
+                    f"{supabase_url}/rest/v1/{table}?select=id",
+                    headers=sb_headers, timeout=timeout,
+                )
+                if r.status_code in (200, 206):
+                    # Content-Range: 0-0/5003
+                    cr = r.headers.get("Content-Range", "")
+                    m = re.search(r"/(\d+)$", cr)
+                    if m:
+                        return int(m.group(1)), f"supabase:{table}"
+            except Exception:
+                continue
+
+    # ── 4. Sitemap — count product URLs ──────────────────────────────────────
+    try:
+        for sitemap_path in ("/sitemap.xml", "/sitemap_index.xml", "/product-sitemap.xml"):
+            r = _req.get(f"{base}{sitemap_path}", headers=headers, timeout=timeout)
+            if r.status_code == 200 and "<loc>" in r.text:
+                from zoogle_crawler.page_analyzer import is_detail_url
+                urls = re.findall(r"<loc>(.*?)</loc>", r.text)
+                count = sum(1 for u in urls if is_detail_url(u.strip()))
+                if count > 0:
+                    return count, "sitemap"
+                break
+    except Exception:
+        pass
+
+    return -1, "unknown"
+
+
+def _execute_discovery(website_id: int, db: Session) -> None:
+    """
+    Phase 1 full lifecycle:
+      load website → count machines → create discovery log → update website
+    """
+    from app.models.website import Website
+    from app.models.crawl_log import CrawlLog
+
+    website = db.query(Website).filter(Website.id == website_id).first()
+    if not website:
+        logger.error(f"Discovery: website {website_id} not found")
+        return
+
+    # Mark discovery running
+    website.discovery_status = "running"
+    db.commit()
+
+    log = CrawlLog(
+        website_id=website_id,
+        task_id=f"discovery-{website_id}-{int(datetime.now().timestamp())}",
+        status="running",
+        log_type="discovery",
+    )
+    db.add(log)
+    db.commit()
+
+    try:
+        count, method = _discover_count(website.url)
+        logger.info(f"Discovery: website={website_id} count={count} method={method}")
+
+        log.status = "success" if count >= 0 else "error"
+        log.machines_found = max(count, 0)
+        log.log_output = f"Discovery method: {method}\nMachines found on site: {count if count >= 0 else 'unknown'}"
+        log.error_details = None if count >= 0 else f"Could not determine count (method={method})"
+        log.finished_at = datetime.now(timezone.utc)
+
+        website.discovered_count = count if count >= 0 else None
+        website.discovery_status = "done" if count >= 0 else "error"
+
+    except Exception as exc:
+        logger.exception(f"Discovery failed: website={website_id} error={exc}")
+        log.status = "error"
+        log.error_details = str(exc)
+        log.finished_at = datetime.now(timezone.utc)
+        website.discovery_status = "error"
+
+    db.commit()
+
+
+def run_discovery_direct(website_id: int):
+    """Run Phase 1 discovery without Celery — called in a background thread."""
+    db = get_sync_db()
+    try:
+        _execute_discovery(website_id, db)
+    except Exception as exc:
+        logger.exception(f"run_discovery_direct failed: website={website_id} error={exc}")
+    finally:
+        db.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

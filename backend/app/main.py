@@ -73,6 +73,10 @@ async def auto_migrate():
         "ALTER TABLE machines ADD COLUMN IF NOT EXISTS dedup_key        VARCHAR(64)",
         # 0004 — staleness tracking for inactive-machine cleanup
         "ALTER TABLE machines ADD COLUMN IF NOT EXISTS last_crawled_at  TIMESTAMPTZ",
+        # 0005 — two-phase discovery
+        "ALTER TABLE websites    ADD COLUMN IF NOT EXISTS discovered_count  INTEGER",
+        "ALTER TABLE websites    ADD COLUMN IF NOT EXISTS discovery_status  VARCHAR(50) DEFAULT 'pending'",
+        "ALTER TABLE crawl_logs  ADD COLUMN IF NOT EXISTS log_type          VARCHAR(20) DEFAULT 'crawl'",
     ]
 
     index_migrations = [

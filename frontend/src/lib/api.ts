@@ -131,6 +131,11 @@ export async function fillMachineTypes(): Promise<{ updated: number; total_check
   return data;
 }
 
+export async function discoverWebsite(websiteId: number) {
+  const { data } = await api.post(`/api/admin/websites/${websiteId}/discover`);
+  return data;
+}
+
 export async function startCrawl(websiteId: number) {
   const { data } = await api.post(`/api/admin/crawl/start/${websiteId}`);
   return data;

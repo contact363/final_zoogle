@@ -211,6 +211,34 @@ async def delete_training_rules(
         await db.delete(rules)
 
 
+# ── Discovery (Phase 1) ───────────────────────────────────────────────────────
+
+@router.post("/websites/{website_id}/discover")
+async def discover_website(
+    website_id: int,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """
+    Phase 1 — Discovery: count how many machines exist on the website
+    without doing a full crawl.  Runs in a background thread and returns
+    immediately.  Poll GET /api/admin/websites to check discovery_status.
+    """
+    result = await db.execute(select(Website).where(Website.id == website_id))
+    website = result.scalar_one_or_none()
+    if not website:
+        raise HTTPException(status_code=404, detail="Website not found")
+
+    if website.discovery_status == "running":
+        return {"status": "already_running", "message": "Discovery already in progress"}
+
+    import threading
+    from tasks.crawl_tasks import run_discovery_direct
+    t = threading.Thread(target=run_discovery_direct, args=(website_id,), daemon=True)
+    t.start()
+    return {"status": "started", "website_id": website_id}
+
+
 # ── Crawl Control ─────────────────────────────────────────────────────────────
 
 @router.post("/crawl/start/{website_id}")
@@ -771,6 +799,7 @@ async def list_crawl_logs(
                 "website_name": name or f"Website #{c.website_id}",
                 "website_url": url,
                 "task_id": c.task_id,
+                "log_type": getattr(c, "log_type", "crawl") or "crawl",
                 "status": c.status,
                 "machines_found": c.machines_found,
                 "machines_new": c.machines_new,

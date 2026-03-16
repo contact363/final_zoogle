@@ -71,15 +71,17 @@ class WebsiteUpdate(BaseModel):
 
 
 class WebsiteRead(BaseModel):
-    id:              int
-    name:            str
-    url:             str
-    description:     Optional[str]
-    is_active:       bool
-    crawl_enabled:   bool
-    machine_count:   int
-    last_crawled_at: Optional[datetime]
-    crawl_status:    str
-    created_at:      datetime
+    id:               int
+    name:             str
+    url:              str
+    description:      Optional[str]
+    is_active:        bool
+    crawl_enabled:    bool
+    machine_count:    int
+    last_crawled_at:  Optional[datetime]
+    crawl_status:     str
+    discovered_count: Optional[int] = None
+    discovery_status: Optional[str] = "pending"
+    created_at:       datetime
 
     model_config = {"from_attributes": True}

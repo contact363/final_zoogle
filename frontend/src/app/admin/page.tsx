@@ -5,6 +5,7 @@ import {
   getAdminStats, listWebsites, addWebsite, updateWebsite, deleteWebsite,
   recalculateMachineCounts, fixWebsiteNames,
   startCrawl, startAllCrawls, fixStuckCrawls, getCrawlLogs,
+  discoverWebsite,
   getAdminMachines, updateMachine, deleteMachine, createMachine,
   exportMachinesExcelUrl, fillMachineTypes,
   getTrainingRules, saveTrainingRules, deleteTrainingRules,
@@ -1153,9 +1154,9 @@ export default function AdminPage() {
                       <tr className="text-gray-500 text-left">
                         <th className="px-4 py-3 font-semibold">Name / URL</th>
                         <th className="px-4 py-3 font-semibold">Status</th>
-                        <th className="px-4 py-3 font-semibold">Machines</th>
+                        <th className="px-4 py-3 font-semibold">Discovered</th>
+                        <th className="px-4 py-3 font-semibold">Extracted</th>
                         <th className="px-4 py-3 font-semibold">Last Crawl</th>
-                        <th className="px-4 py-3 font-semibold">Crawl</th>
                         <th className="px-4 py-3 font-semibold">Actions</th>
                       </tr>
                     </thead>
@@ -1170,14 +1171,54 @@ export default function AdminPage() {
                             <CrawlStatusBadge status={site.crawl_status} />
                             {!site.is_active && <span className="ml-1 text-xs text-red-400">(inactive)</span>}
                           </td>
-                          <td className="px-4 py-3 font-medium">{site.machine_count?.toLocaleString()}</td>
+                          {/* Discovered column */}
+                          <td className="px-4 py-3">
+                            <div className="flex flex-col gap-1">
+                              {site.discovery_status === "running" ? (
+                                <span className="text-xs text-blue-500 flex items-center gap-1"><RefreshCw className="w-3 h-3 animate-spin" /> Scanning...</span>
+                              ) : site.discovered_count != null ? (
+                                <span className="text-sm font-bold text-indigo-600">{site.discovered_count.toLocaleString()}</span>
+                              ) : (
+                                <span className="text-xs text-gray-400">—</span>
+                              )}
+                              <button
+                                onClick={async () => {
+                                  try {
+                                    await discoverWebsite(site.id);
+                                    toast.success("Discovery started!");
+                                    setTimeout(async () => setWebsites(await listWebsites()), 2000);
+                                  } catch { toast.error("Discovery failed"); }
+                                }}
+                                disabled={site.discovery_status === "running"}
+                                className="text-xs text-indigo-500 hover:text-indigo-700 disabled:opacity-40 flex items-center gap-1 w-fit"
+                                title="Discover how many machines are on this site"
+                              >
+                                <Search className="w-3 h-3" /> Discover
+                              </button>
+                            </div>
+                          </td>
+                          {/* Extracted column */}
+                          <td className="px-4 py-3">
+                            <div className="flex flex-col gap-1">
+                              <span className="text-sm font-medium text-gray-700">
+                                {site.machine_count?.toLocaleString()}
+                                {site.discovered_count != null && site.discovered_count > 0 && (
+                                  <span className={`ml-1 text-xs ${site.machine_count >= site.discovered_count ? "text-green-500" : "text-orange-400"}`}>
+                                    / {site.discovered_count.toLocaleString()}
+                                  </span>
+                                )}
+                              </span>
+                              <button
+                                onClick={() => handleStartCrawl(site.id)}
+                                className="text-xs text-green-600 hover:text-green-800 flex items-center gap-1 w-fit"
+                                title="Start full crawl to extract all machines"
+                              >
+                                <Play className="w-3 h-3" /> Extract
+                              </button>
+                            </div>
+                          </td>
                           <td className="px-4 py-3 text-gray-400 text-xs">
                             {site.last_crawled_at ? new Date(site.last_crawled_at).toLocaleDateString() : "Never"}
-                          </td>
-                          <td className="px-4 py-3">
-                            <button onClick={() => handleStartCrawl(site.id)} className="p-1.5 hover:bg-green-50 rounded text-green-600" title="Start crawl">
-                              <Play className="w-4 h-4" />
-                            </button>
                           </td>
                           <td className="px-4 py-3">
                             <div className="flex gap-1">
@@ -1195,7 +1236,7 @@ export default function AdminPage() {
                         </tr>
                       ))}
                       {websites.length === 0 && (
-                        <tr><td colSpan={6} className="px-4 py-10 text-center text-gray-400">No websites added yet.</td></tr>
+                        <tr><td colSpan={7} className="px-4 py-10 text-center text-gray-400">No websites added yet.</td></tr>
                       )}
                     </tbody>
                   </table>
@@ -1237,12 +1278,14 @@ export default function AdminPage() {
                     <tr className="text-gray-500 text-left">
                       <th className="px-4 py-3 w-8" />
                       <th className="px-4 py-3 font-semibold">Website</th>
+                      <th className="px-4 py-3 font-semibold">Type</th>
                       <th className="px-4 py-3 font-semibold">Status</th>
                       <th className="px-4 py-3 font-semibold">Found</th>
                       <th className="px-4 py-3 font-semibold">New</th>
                       <th className="px-4 py-3 font-semibold">Errors</th>
                       <th className="px-4 py-3 font-semibold">Started</th>
                       <th className="px-4 py-3 font-semibold">Duration</th>
+                      <th className="px-4 py-3 font-semibold">Action</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100">
@@ -1256,7 +1299,7 @@ export default function AdminPage() {
                         <>
                           <tr
                             key={log.id}
-                            className={`hover:bg-gray-50 ${hasDetail ? "cursor-pointer" : ""}`}
+                            className={`hover:bg-gray-50 ${log.log_type === "discovery" ? "bg-indigo-50/40" : ""} ${hasDetail ? "cursor-pointer" : ""}`}
                             onClick={() => hasDetail && setExpandedLog(isExpanded ? null : log.id)}
                           >
                             <td className="px-4 py-3 text-gray-400">
@@ -1266,16 +1309,47 @@ export default function AdminPage() {
                               <div className="font-medium text-gray-900">{log.website_name}</div>
                               {log.website_url && <div className="text-xs text-gray-400 truncate max-w-[160px]">{log.website_url}</div>}
                             </td>
+                            <td className="px-4 py-3">
+                              {log.log_type === "discovery" ? (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-100 text-indigo-700">
+                                  <Search className="w-3 h-3" /> Discovery
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700">
+                                  <Play className="w-3 h-3" /> Crawl
+                                </span>
+                              )}
+                            </td>
                             <td className="px-4 py-3"><CrawlStatusBadge status={log.status} /></td>
-                            <td className="px-4 py-3">{log.machines_found ?? 0}</td>
-                            <td className="px-4 py-3 text-green-600 font-medium">{log.machines_new ?? 0}</td>
+                            <td className="px-4 py-3 font-medium">
+                              {log.log_type === "discovery" && log.status === "success" ? (
+                                <span className="text-indigo-600 font-bold">{(log.machines_found ?? 0).toLocaleString()} on site</span>
+                              ) : (log.machines_found ?? 0).toLocaleString()}
+                            </td>
+                            <td className="px-4 py-3 text-green-600 font-medium">{log.log_type === "discovery" ? "—" : (log.machines_new ?? 0)}</td>
                             <td className="px-4 py-3 text-red-500">{log.errors_count ?? 0}</td>
                             <td className="px-4 py-3 text-gray-400 text-xs">{new Date(log.started_at).toLocaleString()}</td>
                             <td className="px-4 py-3 text-gray-400">{duration}</td>
+                            <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                              {log.log_type === "discovery" && log.status === "success" && log.machines_found > 0 ? (
+                                <button
+                                  onClick={async () => {
+                                    try {
+                                      await startCrawl(log.website_id);
+                                      toast.success(`Crawl started for ${log.website_name}!`);
+                                    } catch { toast.error("Failed to start crawl"); }
+                                  }}
+                                  className="flex items-center gap-1 px-2 py-1 bg-green-600 hover:bg-green-700 text-white text-xs rounded font-medium"
+                                  title={`Start full crawl to extract all ${log.machines_found} machines`}
+                                >
+                                  <Play className="w-3 h-3" /> Start Crawl
+                                </button>
+                              ) : null}
+                            </td>
                           </tr>
                           {isExpanded && (
                             <tr key={`${log.id}-detail`}>
-                              <td colSpan={8} className="p-0 bg-gray-900">
+                              <td colSpan={10} className="p-0 bg-gray-900">
                                 {log.error_details && (
                                   <div className="px-6 pt-3 pb-1">
                                     <p className="text-xs font-semibold text-red-400 mb-1">Error Summary</p>
@@ -1284,7 +1358,7 @@ export default function AdminPage() {
                                 )}
                                 {log.log_output && (
                                   <div className="px-6 pt-2 pb-3">
-                                    <p className="text-xs font-semibold text-green-400 mb-1">Scrapy Output</p>
+                                    <p className="text-xs font-semibold text-green-400 mb-1">{log.log_type === "discovery" ? "Discovery Output" : "Scrapy Output"}</p>
                                     <pre className="text-xs text-green-300 whitespace-pre-wrap font-mono bg-black/30 rounded p-3 max-h-64 overflow-auto">{log.log_output}</pre>
                                   </div>
                                 )}
@@ -1295,7 +1369,7 @@ export default function AdminPage() {
                       );
                     })}
                     {logs.items?.length === 0 && (
-                      <tr><td colSpan={8} className="px-4 py-10 text-center text-gray-400">No crawl logs yet.</td></tr>
+                      <tr><td colSpan={10} className="px-4 py-10 text-center text-gray-400">No crawl logs yet.</td></tr>
                     )}
                   </tbody>
                 </table>

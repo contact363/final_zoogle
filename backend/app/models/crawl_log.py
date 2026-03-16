@@ -10,6 +10,7 @@ class CrawlLog(Base):
     website_id = Column(Integer, ForeignKey("websites.id", ondelete="CASCADE"), nullable=True)
     task_id = Column(String(255), nullable=True, index=True)
 
+    log_type = Column(String(20), default="crawl")  # "crawl" or "discovery"
     status = Column(String(50), nullable=False)  # started, running, success, error, stopped
     machines_found = Column(Integer, default=0)
     machines_new = Column(Integer, default=0)

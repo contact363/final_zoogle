@@ -18,6 +18,10 @@ class Website(Base):
     last_crawled_at = Column(DateTime(timezone=True), nullable=True)
     crawl_status = Column(String(50), default="pending")  # pending, running, success, error
 
+    # Discovery stats (Phase 1)
+    discovered_count = Column(Integer, nullable=True)        # how many machines found on the site
+    discovery_status = Column(String(50), default="pending") # pending, running, done, error
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

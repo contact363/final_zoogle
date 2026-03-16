@@ -75,6 +75,8 @@ export interface Website {
   machine_count: number;
   last_crawled_at: string | null;
   crawl_status: string;
+  discovered_count: number | null;
+  discovery_status: string;
   created_at: string;
 }
 
