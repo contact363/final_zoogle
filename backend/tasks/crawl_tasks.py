@@ -308,13 +308,28 @@ def _max_page_number(html: str) -> int:
     return max_page
 
 
-def _make_session():
+_UA_POOL = [
+    # Chrome on Windows (most common)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Chrome on Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Firefox on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    # Safari on Mac
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    # Edge on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+]
+
+
+def _make_session(ua_index: int = 0):
     """
-    Build a requests.Session that mimics a real browser:
-    - Real Chrome User-Agent + full browser headers (avoids Cloudflare/bot detection)
+    Build a requests.Session that closely mimics a real browser:
+    - Rotatable User-Agent pool (ua_index 0..4)
+    - Full browser headers including Referer, Sec-Fetch-*, Cache-Control
+    - Cookie jar enabled (Cloudflare and many CDNs set cookies on first visit)
     - SSL verification disabled (many supplier sites have expired/self-signed certs)
     - Warnings suppressed
-    - Follow redirects
     """
     try:
         import requests as _req
@@ -323,88 +338,146 @@ def _make_session():
     except Exception:
         return None, None
 
+    ua = _UA_POOL[ua_index % len(_UA_POOL)]
     s = _req.Session()
     s.verify = False
+    # Cookie jar is enabled by default in requests.Session — nothing extra needed
     s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "none",
         "Sec-Fetch-User": "?1",
         "Cache-Control": "max-age=0",
-        "DNT": "1",
     })
     return s, _req
 
 
-def _safe_get(session, url: str, timeout: int = 20, json_mode: bool = False):
-    """Fetch a URL, return response or None. Never raises."""
-    try:
-        hdrs = {"Accept": "application/json", "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors"} if json_mode else {}
-        r = session.get(url, timeout=timeout, headers=hdrs, allow_redirects=True)
-        return r
-    except Exception:
-        return None
+def _safe_get(session, url: str, timeout: int = 20, json_mode: bool = False,
+              retries: int = 2, retry_delay: float = 2.5):
+    """
+    Fetch a URL and return the response. Never raises.
+
+    Retry logic:
+    - On 403 (bot-blocked) or 429 (rate-limited): wait retry_delay seconds,
+      swap to a different User-Agent, and retry up to `retries` times.
+    - On connection error / timeout: retry once immediately.
+    """
+    import time as _time
+
+    if json_mode:
+        extra_hdrs = {
+            "Accept": "application/json, text/plain, */*",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+    else:
+        extra_hdrs = {}
+
+    last_r = None
+    for attempt in range(retries + 1):
+        try:
+            r = session.get(url, timeout=timeout, headers=extra_hdrs, allow_redirects=True)
+            last_r = r
+            if r.status_code not in (403, 429, 503):
+                return r
+            # Blocked — rotate UA and wait before retry
+            if attempt < retries:
+                logger.debug(f"[_safe_get] {r.status_code} on {url} (attempt {attempt+1}) — rotating UA and retrying")
+                _time.sleep(retry_delay)
+                # Swap User-Agent
+                new_ua = _UA_POOL[(attempt + 1) % len(_UA_POOL)]
+                session.headers.update({
+                    "User-Agent": new_ua,
+                    "Referer": f"{url.split('/')[0]}//{url.split('/')[2]}/",
+                    "Sec-Fetch-Site": "same-origin",
+                })
+        except Exception as exc:
+            logger.debug(f"[_safe_get] Connection error on {url} (attempt {attempt+1}): {exc}")
+            if attempt < retries:
+                _time.sleep(1.0)
+            last_r = None
+    return last_r
 
 
 def _resolve_base(session, start_url: str, timeout: int = 20) -> tuple[str, str, str | None]:
     """
-    Resolve the real base URL for a website, trying both www and non-www variants.
+    Resolve the real base URL for a website and return the homepage HTML.
     Returns (actual_base, actual_netloc, homepage_html_or_None).
 
-    A site is considered "reachable" if we get ANY HTTP response (even 403/429/503),
-    because those mean the server is UP — it's just blocking our request.
-    Only a connection error (None) or DNS failure means truly unreachable.
+    'Reachable' = any HTTP response (even 403) — only None means truly down.
 
     Strategy:
-      1. Try original URL
+      1. Try original URL (with built-in _safe_get retry on 403/429)
       2. Try www/non-www alternate
       3. Try http:// if https:// failed
+      4. If homepage is blocked (403/429/503), try /sitemap.xml and common listing
+         paths to get any usable HTML from the same origin.
     """
+    import time as _time
+
     parsed = urlparse(start_url)
     base = start_url.rstrip("/")
 
-    # Build list of URLs to try
+    # Build list of candidates: original → www/non-www → http fallback
     candidates = [start_url]
     if "://www." in start_url:
         candidates.append(start_url.replace("://www.", "://"))
     else:
         candidates.append(start_url.replace("://", "://www."))
-    # Also try http if https
     if start_url.startswith("https://"):
         candidates.append(start_url.replace("https://", "http://"))
 
     best_r = None
     for candidate in candidates:
-        r = _safe_get(session, candidate, timeout=timeout)
+        r = _safe_get(session, candidate, timeout=timeout, retries=2, retry_delay=2.5)
         if r is None:
             continue
-        # Any HTTP response (even 4xx/5xx) means site is reachable
         if best_r is None:
             best_r = r
-        # Prefer 200 over error codes
         if r.status_code == 200:
             best_r = r
             break
 
     if best_r is None:
+        # Completely unreachable
         return base, parsed.netloc.lower(), None
 
     final_url = getattr(best_r, "url", start_url)
     fp = urlparse(final_url)
     actual_base = f"{fp.scheme}://{fp.netloc}"
     actual_netloc = fp.netloc.lower()
-    html = best_r.text if best_r.status_code == 200 else None
-    return actual_base, actual_netloc, html
+
+    if best_r.status_code == 200:
+        return actual_base, actual_netloc, best_r.text
+
+    # Homepage returned 4xx/5xx — site is UP but blocking us.
+    # Try alternative paths that are less likely to be Cloudflare-protected:
+    # static files, sitemaps, and plain listing pages often bypass WAF rules.
+    fallback_paths = [
+        "/sitemap.xml", "/sitemap_index.xml", "/robots.txt",
+        "/products", "/machines", "/machine-tools", "/equipment",
+        "/product-category", "/inventory", "/used-machines", "/catalog",
+    ]
+    for fp_path in fallback_paths:
+        r2 = _safe_get(session, f"{actual_base}{fp_path}", timeout=timeout, retries=1, retry_delay=1.5)
+        if r2 and r2.status_code == 200:
+            logger.info(f"[resolve_base] Homepage blocked ({best_r.status_code}) but {fp_path} returned 200")
+            # Return the fallback HTML; caller treats this as partial homepage
+            return actual_base, actual_netloc, r2.text
+
+    # All paths blocked — return None for html but keep actual_base correct
+    logger.info(f"[resolve_base] {actual_base} returned {best_r.status_code} on all paths — site is UP but heavily blocked")
+    return actual_base, actual_netloc, None
 
 
 def _discover_count(start_url: str) -> tuple[int, str]:
@@ -607,23 +680,21 @@ def _discover_count(start_url: str) -> tuple[int, str]:
             return cnt, "sitemap"
 
     # ── 7. HTML scan ──────────────────────────────────────────────────────────
-    # We already resolved the base URL at the top of this function via _resolve_base.
-    # homepage_html_cached is the HTML if status was 200, else None (site blocked us).
-    # base / actual_netloc are already set correctly.
+    # homepage_html_cached may already contain HTML from _resolve_base (which
+    # tried fallback paths like /sitemap.xml and /products if homepage was 403).
+    # If it's still None → the site was truly unreachable at this point.
 
-    # If _resolve_base got no response at all → truly unreachable
     if homepage_html_cached is None:
-        # One more attempt with a very long timeout
-        r_final = _safe_get(session, base, timeout=40)
-        if r_final is None:
-            # Try the original URL too
-            r_final = _safe_get(session, start_url, timeout=40)
-        if r_final is None:
+        # Last-ditch: try with a fresh session using a different UA
+        session2, _ = _make_session(ua_index=2)
+        if session2:
+            actual_base2, actual_netloc2, html2 = _resolve_base(session2, start_url, timeout=30)
+            if html2:
+                homepage_html_cached = html2
+                base = actual_base2
+                actual_netloc = actual_netloc2
+        if homepage_html_cached is None:
             return -1, "site-unreachable"
-        if r_final.status_code != 200:
-            # Site is reachable (we got a response) but blocking us (403/503/etc)
-            return 0, f"html-scan(site-up-but-blocked:{r_final.status_code})"
-        homepage_html_cached = r_final.text or ""
 
     homepage_html = homepage_html_cached or ""
 
@@ -733,9 +804,16 @@ def _execute_discovery(website_id: int, db: Session) -> None:
         # count > 0   means we found machines (exact or estimated)
         site_unreachable = count == -1
         is_estimated = "estimated" in method or "~" in method
+        is_blocked = "blocked" in method or "site-up-but-blocked" in method
 
         if not site_unreachable:
-            count_label = f"{count} (estimated)" if (is_estimated and count > 0) else str(count)
+            if count == 0 and is_blocked:
+                count_label = "blocked by server (WAF/Cloudflare)"
+            elif is_estimated and count > 0:
+                count_label = f"{count} (estimated)"
+            else:
+                count_label = str(count)
+
             log.status = "success"
             log.machines_found = max(count, 0)
             log.log_output = (
@@ -982,13 +1060,18 @@ def _collect_urls(start_url: str, target_count: int = 0) -> tuple[list[str], str
     # ── 6. HTML pagination scan — follow ALL listing pages ───────────────────
     # Use the homepage HTML already fetched by _resolve_base
     if homepage_html_cached is None:
-        # Site might be blocking us — try one more time
-        r_home = _safe_get(session, base, timeout=30)
-        if r_home and r_home.status_code == 200:
-            homepage_html_cached = r_home.text or ""
-        elif sitemap_urls:
-            return sitemap_urls, "sitemap(partial)"
-        else:
+        # Homepage was blocked — retry with a different UA
+        session2, _ = _make_session(ua_index=2)
+        if session2:
+            actual_base2, actual_netloc2, html2 = _resolve_base(session2, start_url, timeout=30)
+            if html2:
+                homepage_html_cached = html2
+                base = actual_base2
+                actual_netloc = actual_netloc2
+        if homepage_html_cached is None:
+            # Use whatever we got from sitemap, or give up
+            if sitemap_urls:
+                return sitemap_urls, "sitemap(partial)"
             return [], "site-unreachable"
 
     homepage_html = homepage_html_cached or ""
@@ -1108,15 +1191,25 @@ def _execute_url_collection(website_id: int, db: Session) -> None:
                 f.write("\n".join(urls))
             logger.info(f"Wrote {url_count} URLs to {fpath}")
 
+        is_blocked = "blocked" in method or "site-up-but-blocked" in method
+        is_unreachable = method == "site-unreachable"
         log.status = "success" if urls else "error"
         log.machines_found = url_count
+
+        if is_unreachable:
+            status_note = "Site could not be reached (connection refused, timeout, or DNS failure)"
+        elif is_blocked and not urls:
+            status_note = "Site is online but blocking automated requests (WAF/Cloudflare) — try training rules or manual crawl"
+        else:
+            status_note = None
+
         log.log_output = (
             f"URL collection method: {method}\n"
             f"URLs collected: {url_count}\n"
             f"Target count:   {target or 'unknown'}\n"
             f"Coverage:       {int(url_count/target*100) if target > 0 else '?'}%\n"
         )
-        log.error_details = None if urls else f"No URLs collected (method={method})"
+        log.error_details = status_note if not urls else None
         log.finished_at = datetime.now(timezone.utc)
 
         website.urls_collected          = url_count if urls else None
