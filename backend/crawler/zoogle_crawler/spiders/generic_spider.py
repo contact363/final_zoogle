@@ -374,6 +374,34 @@ class GenericSpider(BaseZoogleSpider):
                 headers={"Accept": "application/json"},
             )
 
+        # 5. Shopify — /products.json is always public, no auth required.
+        #    Returns {"products": [...]} with full product data.
+        #    Supports ?limit=250&page=N for pagination.
+        shopify_url = base + "/products.json?limit=250&page=1"
+        logger.info(f"[SPIDER v={SPIDER_VERSION}] scheduling Shopify probe: {shopify_url!r}")
+        yield scrapy.Request(
+            shopify_url,
+            callback=self._parse_shopify_api,
+            errback=self._errback,
+            dont_filter=True,
+            meta={"referer": start_url, "shopify_page": 1},
+            headers={"Accept": "application/json"},
+        )
+
+        # 6. WooCommerce REST API — /wp-json/wc/v3/products (public catalog read
+        #    works on many stores; 401 is silently ignored on non-WC sites).
+        #    Also probe /wp-json/wp/v2/ to detect WordPress presence.
+        wc_url = base + "/wp-json/wc/v3/products?per_page=100&page=1"
+        logger.info(f"[SPIDER v={SPIDER_VERSION}] scheduling WooCommerce probe: {wc_url!r}")
+        yield scrapy.Request(
+            wc_url,
+            callback=self._parse_woocommerce_api,
+            errback=self._errback,
+            dont_filter=True,
+            meta={"referer": start_url, "wc_page": 1},
+            headers={"Accept": "application/json"},
+        )
+
     def parse(self, response: Response):
         """
         Homepage entry point.
@@ -390,6 +418,7 @@ class GenericSpider(BaseZoogleSpider):
         yield from self._process_page(response)
         yield from self._try_extract_api_from_scripts(response)
         yield from self._probe_json_apis_from_homepage(response)
+        yield from self._detect_platform_from_homepage(response)
 
     # ── Phase 1a: Sitemap ─────────────────────────────────────────────────────
 
@@ -1739,6 +1768,62 @@ class GenericSpider(BaseZoogleSpider):
                     headers={"Accept": "application/json"},
                 )
 
+    def _detect_platform_from_homepage(self, response: Response):
+        """
+        Detect Shopify / WooCommerce from HTML meta tags and confirm API access.
+        Called from parse() — runs on the homepage only.
+
+        Shopify:  <meta name="shopify-checkout-api-token"> or
+                  window.Shopify in inline scripts or /cdn.shopify.com/ URLs
+        WooCommerce: <meta name="generator" content="WooCommerce ..."> or
+                     /wp-content/plugins/woocommerce/ in page HTML
+        """
+        parsed = urlparse(response.url)
+        if parsed.path.strip("/"):
+            return  # Not the homepage
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        body = response.text or ""
+
+        # ── Shopify detection ────────────────────────────────────────────────
+        is_shopify = (
+            "cdn.shopify.com" in body
+            or "window.Shopify" in body
+            or 'name="shopify-' in body
+            or "Shopify.theme" in body
+        )
+        if is_shopify:
+            logger.info(f"[platform] Shopify detected at {base} — scheduling /products.json")
+            url = f"{base}/products.json?limit=250&page=1"
+            if not self._is_visited(url):
+                self._mark_visited(url)
+                yield scrapy.Request(
+                    url,
+                    callback=self._parse_shopify_api,
+                    errback=self._errback,
+                    dont_filter=True,
+                    meta={"shopify_page": 1},
+                    headers={"Accept": "application/json"},
+                )
+
+        # ── WooCommerce detection ────────────────────────────────────────────
+        is_woocommerce = (
+            "woocommerce" in body.lower()
+            and ("wp-content" in body or "wordpress" in body.lower())
+        )
+        if is_woocommerce:
+            logger.info(f"[platform] WooCommerce detected at {base} — scheduling /wp-json/wc/v3/products")
+            url = f"{base}/wp-json/wc/v3/products?per_page=100&page=1"
+            if not self._is_visited(url):
+                self._mark_visited(url)
+                yield scrapy.Request(
+                    url,
+                    callback=self._parse_woocommerce_api,
+                    errback=self._errback,
+                    dont_filter=True,
+                    meta={"wc_page": 1},
+                    headers={"Accept": "application/json"},
+                )
+
     def _parse_json_api(self, response: Response):
         """
         Handle responses from probed JSON API endpoints.
@@ -2124,6 +2209,249 @@ class GenericSpider(BaseZoogleSpider):
             item = self._json_to_machine_item(row, response.url, base_url)
             if item:
                 yield item
+
+    # ── Shopify /products.json ────────────────────────────────────────────────
+
+    def _parse_shopify_api(self, response: Response):
+        """
+        Parse Shopify's public /products.json endpoint.
+        Shape: {"products": [{id, title, handle, vendor, product_type,
+                               variants:[{sku, price}], images:[{src}],
+                               body_html, tags}]}
+        Paginates via ?page=N until an empty products array is returned.
+        """
+        if response.status == 404:
+            # Not a Shopify store — silent skip
+            return
+        if response.status != 200:
+            logger.debug(f"[shopify] {response.url} → {response.status}")
+            return
+
+        try:
+            data = json.loads(response.text)
+        except Exception:
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        products = data.get("products", [])
+        if not products:
+            return  # empty page = done
+
+        page = response.meta.get("shopify_page", 1)
+        base_url = "{0.scheme}://{0.netloc}".format(urlparse(response.url))
+        logger.info(f"[shopify] page={page} found {len(products)} products at {base_url}")
+
+        for p in products:
+            item = self._shopify_product_to_item(p, base_url)
+            if item:
+                yield item
+
+        # Paginate if we got a full page
+        if len(products) == 250:
+            next_page = page + 1
+            next_url = f"{base_url}/products.json?limit=250&page={next_page}"
+            if not self._is_visited(next_url):
+                self._mark_visited(next_url)
+                yield scrapy.Request(
+                    next_url,
+                    callback=self._parse_shopify_api,
+                    errback=self._errback,
+                    meta={"shopify_page": next_page},
+                    headers={"Accept": "application/json"},
+                )
+
+    def _shopify_product_to_item(self, p: dict, base_url: str) -> "MachineItem | None":
+        """Convert a single Shopify product dict to MachineItem."""
+        title = (p.get("title") or "").strip()
+        if not title:
+            return None
+
+        handle = p.get("handle", "")
+        permalink = f"{base_url}/products/{handle}" if handle else base_url
+        product_type = p.get("product_type") or ""
+        vendor = (p.get("vendor") or "").strip()
+        body_html = p.get("body_html") or ""
+        # Strip HTML tags from description
+        description = re.sub(r"<[^>]+>", " ", body_html).strip()[:2000] if body_html else None
+
+        # Price + SKU from first variant
+        variants = p.get("variants") or []
+        price = None
+        currency = None
+        stock_number = None
+        if variants:
+            v = variants[0]
+            raw_price = v.get("price") or v.get("compare_at_price")
+            if raw_price:
+                try:
+                    price = float(str(raw_price).replace(",", ""))
+                    currency = "USD"
+                except ValueError:
+                    pass
+            stock_number = v.get("sku") or None
+
+        # Images
+        images = []
+        for img in (p.get("images") or []):
+            src = img.get("src") or img.get("url")
+            if src and not src.startswith("data:"):
+                images.append(src)
+
+        # Brand/model split — vendor is usually the brand
+        brand = vendor or None
+        model = title  # default: use full title as model
+        if vendor and title.lower().startswith(vendor.lower()):
+            model = title[len(vendor):].strip(" -–")
+
+        machine_type = self._infer_machine_type_from_text(
+            f"{title} {product_type}"
+        ) or product_type or None
+
+        item = MachineItem(
+            machine_url=permalink,
+            website_id=self.website_id,
+            website_source=self._base_domain,
+            category=product_type or None,
+            machine_type=machine_type,
+            brand=brand,
+            model=model,
+            stock_number=stock_number,
+            price=price,
+            currency=currency,
+            description=description,
+            images=images,
+            specs={},
+        )
+        if not self._validate_item(item):
+            return None
+        return item
+
+    # ── WooCommerce /wp-json/wc/v3/products ───────────────────────────────────
+
+    def _parse_woocommerce_api(self, response: Response):
+        """
+        Parse WooCommerce REST API v3 /products endpoint.
+        Shape: [{id, name, slug, permalink, sku, price, description,
+                 short_description, categories:[{name}],
+                 images:[{src}], attributes:[{name,options}]}]
+        Paginates via X-WP-TotalPages response header.
+        401/403 = auth required (no consumer key) → silent skip.
+        """
+        if response.status in (401, 403):
+            logger.debug(f"[woocommerce] auth required at {response.url} — skipping")
+            return
+        if response.status == 404:
+            return
+        if response.status != 200:
+            logger.debug(f"[woocommerce] {response.url} → {response.status}")
+            return
+
+        try:
+            data = json.loads(response.text)
+        except Exception:
+            return
+
+        if not isinstance(data, list) or not data:
+            return
+
+        page = response.meta.get("wc_page", 1)
+        base_url = "{0.scheme}://{0.netloc}".format(urlparse(response.url))
+        logger.info(f"[woocommerce] page={page} found {len(data)} products at {base_url}")
+
+        for p in data:
+            item = self._woocommerce_product_to_item(p, base_url)
+            if item:
+                yield item
+
+        # Check for more pages via header
+        total_pages_hdr = response.headers.get("X-WP-TotalPages", b"1")
+        try:
+            total_pages = int(total_pages_hdr)
+        except (ValueError, TypeError):
+            total_pages = 1
+
+        if page < total_pages:
+            next_page = page + 1
+            next_url = f"{base_url}/wp-json/wc/v3/products?per_page=100&page={next_page}"
+            if not self._is_visited(next_url):
+                self._mark_visited(next_url)
+                yield scrapy.Request(
+                    next_url,
+                    callback=self._parse_woocommerce_api,
+                    errback=self._errback,
+                    meta={"wc_page": next_page},
+                    headers={"Accept": "application/json"},
+                )
+
+    def _woocommerce_product_to_item(self, p: dict, base_url: str) -> "MachineItem | None":
+        """Convert a single WooCommerce product dict to MachineItem."""
+        name = (p.get("name") or "").strip()
+        if not name:
+            return None
+
+        permalink = p.get("permalink") or f"{base_url}/product/{p.get('slug', '')}"
+        sku = p.get("sku") or None
+        raw_price = p.get("price") or p.get("regular_price")
+        price = None
+        currency = None
+        if raw_price:
+            try:
+                price = float(str(raw_price).replace(",", ""))
+                currency = "USD"
+            except ValueError:
+                pass
+
+        # Description — prefer short_description, then strip HTML from description
+        desc_html = p.get("short_description") or p.get("description") or ""
+        description = re.sub(r"<[^>]+>", " ", desc_html).strip()[:2000] if desc_html else None
+
+        # Category
+        cats = p.get("categories") or []
+        category = cats[0]["name"] if cats and isinstance(cats[0], dict) else None
+
+        # Images
+        images = [img["src"] for img in (p.get("images") or [])
+                  if isinstance(img, dict) and img.get("src") and not img["src"].startswith("data:")]
+
+        # Brand/model from attributes (WooCommerce attributes like "Brand", "Model", "Manufacturer")
+        brand = None
+        model = name
+        attrs = p.get("attributes") or []
+        attr_map = {}
+        for attr in attrs:
+            aname = (attr.get("name") or "").lower()
+            options = attr.get("options") or []
+            if options:
+                attr_map[aname] = options[0] if isinstance(options[0], str) else str(options[0])
+        brand = attr_map.get("brand") or attr_map.get("manufacturer") or attr_map.get("make") or None
+        model_attr = attr_map.get("model") or attr_map.get("model number") or None
+        if model_attr:
+            model = model_attr
+
+        machine_type = self._infer_machine_type_from_text(
+            f"{name} {category or ''}"
+        ) or category or None
+
+        item = MachineItem(
+            machine_url=permalink,
+            website_id=self.website_id,
+            website_source=self._base_domain,
+            category=category,
+            machine_type=machine_type,
+            brand=brand,
+            model=model,
+            stock_number=sku,
+            price=price,
+            currency=currency,
+            description=description,
+            images=images,
+            specs=attr_map,
+        )
+        if not self._validate_item(item):
+            return None
+        return item
 
     # ═════════════════════════════════════════════════════════════════════════
     # SCALABLE RULE SYSTEM — added for 500-website architecture
