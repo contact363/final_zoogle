@@ -134,8 +134,9 @@ def _load_training_rules(db: Session, website_id: int) -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DEDICATED_SPIDERS = {
-    "zatpatmachines.com": "zatpatmachines",
-    "corelmachine.com":   "corelmachine",
+    "zatpatmachines.com":  "zatpatmachines",
+    "zatpatestimate.com":  "zatpatmachines",   # same Supabase spider, auto-discovers table
+    "corelmachine.com":    "corelmachine",
 }
 
 
