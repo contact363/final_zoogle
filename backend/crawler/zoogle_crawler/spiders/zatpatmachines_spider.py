@@ -287,12 +287,17 @@ class ZatPatMachinesSpider(BaseZoogleSpider):
     # =========================================================================
 
     def _fetch_page(self, offset: int):
-        # Use detailed zatpatmachines select for the machines table,
-        # generic select for all others
-        select = _ZATPAT_SELECT if self._active_table == "machines" else _GENERIC_SELECT
+        # Use the detailed select with joins ONLY for zatpatmachines.com machines table.
+        # All other sites (including zatpatestimate.com) use SELECT * so every
+        # available field — including url/slug/page_url — is returned.
+        is_zatpat_machines = (
+            "zatpatmachines.com" in self._site_domain
+            and self._active_table == "machines"
+        )
+        select = _ZATPAT_SELECT if is_zatpat_machines else _GENERIC_SELECT
 
-        # Try status filter for machines table; skip for unknown tables
-        status_filter = "&status=eq.active" if self._active_table == "machines" else ""
+        # Apply status=active filter only for the known zatpatmachines schema
+        status_filter = "&status=eq.active" if is_zatpat_machines else ""
 
         url = (
             f"{self._supabase_url}/rest/v1/{self._active_table}"
@@ -400,14 +405,18 @@ class ZatPatMachinesSpider(BaseZoogleSpider):
         ) or None
 
         # ── Machine URL ───────────────────────────────────────────────────────
-        # Use slug/url field if present, else build from site + uid
-        slug = get("url", "slug", "product_url", "machine_url")
+        # Try explicit URL fields first — many Supabase sites store the
+        # frontend page URL directly.  Fall back to /machine/{uid} which
+        # is the zatpatmachines.com convention.
+        slug = get("url", "slug", "page_url", "product_url", "machine_url",
+                   "listing_url", "link", "permalink")
         if slug and slug.startswith("http"):
             machine_url = slug
-        elif slug:
-            machine_url = f"{self._site_url}/{slug}"
+        elif slug and not slug.isdigit():
+            # Relative slug like "machines/kitamura-bridge-center"
+            machine_url = f"{self._site_url}/{slug.lstrip('/')}"
         else:
-            # zatpatmachines pattern
+            # Default pattern — works for zatpatmachines.com
             machine_url = f"{self._site_url}/machine/{uid}"
 
         # ── Images ────────────────────────────────────────────────────────────
