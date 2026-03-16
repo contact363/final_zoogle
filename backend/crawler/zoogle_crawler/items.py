@@ -30,3 +30,8 @@ class MachineItem(scrapy.Item):
 
     # ── Structured specifications ─────────────────────────────────────────────
     specs        = scrapy.Field()     # dict[str, str] of spec key→value pairs
+
+    # ── Internal pipeline fields (not stored in DB) ───────────────────────────
+    # Passed from DeduplicationPipeline → DatabasePipeline to avoid recomputing
+    _dedup_key    = scrapy.Field()
+    _content_hash = scrapy.Field()

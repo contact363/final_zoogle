@@ -90,15 +90,10 @@ class ValidationPipeline:
         if not has_identity:
             raise DropItem(f"No brand/model for {url!r} — likely not a machine page")
 
-        # Must have at least one content signal
-        has_content = bool(
-            (adapter.get("images") and len(adapter["images"]) > 0)
-            or (adapter.get("specs") and len(adapter["specs"]) > 0)
-            or adapter.get("description")
-            or adapter.get("price")
-        )
-        if not has_content:
-            raise DropItem(f"No content (images/specs/price/desc) for {url!r}")
+        # Must have at least one image (required for display)
+        has_image = bool(adapter.get("images") and len(adapter["images"]) > 0)
+        if not has_image:
+            raise DropItem(f"No image for {url!r} — skipping")
 
         return item
 
