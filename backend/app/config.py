@@ -26,9 +26,22 @@ class Settings(BaseSettings):
         return v
 
     # Redis / Celery
+    # On Render: set REDIS_URL env var to your Redis service URL.
+    # Fallback to localhost only for local dev — the URLQueue will
+    # detect connection failure and switch to in-memory automatically.
     REDIS_URL: str = "redis://localhost:6379/0"
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/1"
+
+    @field_validator("REDIS_URL", "CELERY_BROKER_URL", "CELERY_RESULT_BACKEND", mode="before")
+    @classmethod
+    def use_env_redis(cls, v: str) -> str:
+        """If REDIS_URL env var is set, prefer it over the default localhost URL."""
+        import os
+        env_redis = os.getenv("REDIS_URL")
+        if env_redis and "localhost" in str(v):
+            return env_redis
+        return v
 
     # Media storage
     MEDIA_DIR: str = "media/machines"

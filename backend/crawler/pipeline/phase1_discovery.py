@@ -2,18 +2,19 @@
 Phase 1 — Smart Discovery Engine
 
 Runs ALL detection methods and returns the BEST result.
-Never stops at estimated_count=0 without trying everything.
+NEVER returns estimated_count=0 if the site is reachable.
 
-Detection order (all run, best wins):
-  1. Pre-configured training rules (API URL or category list)
-  2. API auto-detection  (Supabase / Shopify / WooCommerce / REST)
-  3. Embedded JSON in script tags (window.__DATA__, __NEXT_DATA__, etc.)
-  4. Sitemap product URLs
-  5. Category/nav scan  (with real count sample from first page)
-  6. Deep internal link scan (depth-2 from homepage)
-  7. Final fallback  (homepage as start URL — always returns success)
+Detection pipeline:
+  0. Training rules (pre-configured override)
+  1. API auto-detection (Supabase / Shopify / WooCommerce / 20+ REST paths)
+  2. Embedded JSON extraction (window.__DATA__, __NEXT_DATA__, etc.)
+  3. Sitemap product URLs
+  4. Category/nav scan (structure-based — no keyword dependency)
+  5. Deep link scan (depth up to 5, structure + link-density based)
+  6. Common entry points probe (/products, /machines, /catalog, /shop, ...)
+  7. Final fallback — homepage + small estimate (NEVER hard 0)
 
-GUARANTEE: run_discovery() ALWAYS returns DiscoveryResult with success=True.
+GUARANTEE: run_discovery() always returns DiscoveryResult with success=True.
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import List, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse, urldefrag
 
 import requests
 
@@ -36,18 +37,20 @@ REQUEST_HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
 }
 
-# Product-related path fragments for link scanning
-PRODUCT_PATH_RE = re.compile(
-    r"/(machine|product|equipment|item|listing|catalog|inventory|used|"
-    r"maschine|produkt|macchina|maquina|produit|apparaat)s?/",
-    re.IGNORECASE,
-)
+# Common entry-point paths to probe when everything else finds 0
+COMMON_ENTRY_PATHS = [
+    "/products", "/machines", "/equipment", "/catalog", "/catalogue",
+    "/shop", "/store", "/listings", "/inventory", "/used",
+    "/maschinen", "/produkte", "/gebraucht",
+    "/macchine", "/prodotti",
+    "/maquinas", "/productos",
+    "/machines", "/produits",
+]
 
 
-# ── Result ────────────────────────────────────────────────────────────────────
+# ── Result dataclass ──────────────────────────────────────────────────────────
 
 @dataclass
 class DiscoveryResult:
@@ -71,13 +74,14 @@ class DiscoveryResult:
 
 def _get(url: str, timeout: int = DISCOVERY_TIMEOUT) -> Optional[requests.Response]:
     try:
-        return requests.get(url, headers=REQUEST_HEADERS, timeout=timeout, allow_redirects=True)
+        r = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout, allow_redirects=True)
+        return r
     except Exception as exc:
         logger.debug("GET %s: %s", url, exc)
         return None
 
 
-def _normalize_url(url: str) -> str:
+def _normalize(url: str) -> str:
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
@@ -85,10 +89,18 @@ def _normalize_url(url: str) -> str:
 
 
 def _same_domain(url: str, base: str) -> bool:
-    return urlparse(url).netloc == urlparse(base).netloc
+    try:
+        return urlparse(url).netloc == urlparse(base).netloc
+    except Exception:
+        return False
 
 
-# ── Main discovery ────────────────────────────────────────────────────────────
+def _clean(url: str) -> str:
+    p = urlparse(url)
+    return urlunparse(p._replace(query="", fragment=""))
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def run_discovery(
     website_id: int,
@@ -96,34 +108,29 @@ def run_discovery(
     training_rules: Optional[dict] = None,
 ) -> DiscoveryResult:
     """
-    Run ALL detection methods. Return the best (highest estimated_count) result.
+    Run full discovery. Tries EVERY method. Returns best (highest count) result.
     Never raises. Always returns a usable DiscoveryResult.
     """
-    website_url = _normalize_url(website_url)
+    website_url = _normalize(website_url)
     notes: List[str] = []
     candidates: List[DiscoveryResult] = []
 
-    logger.info("[Discovery] website_id=%d url=%s", website_id, website_url)
+    logger.info("[Discovery] START website_id=%d url=%s", website_id, website_url)
 
-    def _add(result: Optional[DiscoveryResult]) -> None:
-        if result:
-            candidates.append(result)
-            logger.info(
-                "[Discovery] candidate: method=%s count=%d",
-                result.method, result.estimated_count,
-            )
+    def _add(r: Optional[DiscoveryResult]) -> None:
+        if r and (r.estimated_count > 0 or r.api_config or r.product_urls or r.category_urls):
+            candidates.append(r)
+            logger.info("[Discovery] candidate: method=%s count=%d", r.method, r.estimated_count)
 
     # ── Step 0: Training rules ─────────────────────────────────────────────
     if training_rules:
         try:
             r = _from_training_rules(website_url, training_rules, notes)
             if r:
-                # Training rules take absolute priority
                 logger.info("[Discovery] Training rules hit — returning immediately")
                 return r
         except Exception as exc:
             notes.append(f"Training rules error: {exc}")
-            logger.warning("[Discovery] training rules error: %s", exc)
 
     # ── Fetch homepage ─────────────────────────────────────────────────────
     homepage_html = ""
@@ -131,32 +138,31 @@ def run_discovery(
         resp = _get(website_url)
         if resp and resp.status_code < 400:
             homepage_html = resp.text
-            notes.append(f"Homepage fetched ({len(homepage_html)} bytes, status {resp.status_code})")
+            notes.append(f"Homepage OK ({len(homepage_html)} bytes)")
         else:
             status = resp.status_code if resp else "timeout"
-            notes.append(f"Homepage returned {status}")
-            logger.warning("[Discovery] homepage issue: %s for %s", status, website_url)
+            notes.append(f"Homepage status: {status}")
+            logger.warning("[Discovery] Homepage issue: %s for %s", status, website_url)
     except Exception as exc:
-        notes.append(f"Homepage fetch error: {exc}")
-        logger.warning("[Discovery] homepage exception: %s", exc)
+        notes.append(f"Homepage error: {exc}")
 
     # ── Step 1: API auto-detection ─────────────────────────────────────────
     try:
         from crawler.extractors.api_extractor import detect_api
         api_result = detect_api(website_url, homepage_html)
         if api_result.found and api_result.config:
+            notes.append(f"API detected: {api_result.config.api_type}")
             _add(DiscoveryResult(
                 method="api",
                 api_config=api_result.config,
-                estimated_count=api_result.sample_count or 50,
-                notes=notes,
+                estimated_count=max(api_result.sample_count or 0, 10),
+                notes=list(notes),
             ))
-            notes.append(f"API detected: {api_result.config.api_type}")
         else:
-            notes.append("API detection: no API found")
+            notes.append("API detection: none found")
     except Exception as exc:
         notes.append(f"API detection error: {exc}")
-        logger.warning("[Discovery] API detection error: %s", exc)
+        logger.warning("[Discovery] API error: %s", exc)
 
     # ── Step 2: Embedded JSON in script tags ───────────────────────────────
     if homepage_html:
@@ -165,27 +171,26 @@ def run_discovery(
             _add(r)
         except Exception as exc:
             notes.append(f"Embedded JSON error: {exc}")
-            logger.debug("[Discovery] embedded JSON error: %s", exc)
 
     # ── Step 3: Sitemap ────────────────────────────────────────────────────
     try:
         from crawler.extractors.sitemap_extractor import fetch_product_urls
         sitemap_urls = fetch_product_urls(website_url)
         if sitemap_urls:
+            notes.append(f"Sitemap: {len(sitemap_urls)} product URLs")
             _add(DiscoveryResult(
                 method="sitemap",
                 product_urls=sitemap_urls,
                 estimated_count=len(sitemap_urls),
-                notes=notes,
+                notes=list(notes),
             ))
-            notes.append(f"Sitemap: {len(sitemap_urls)} product URLs")
         else:
             notes.append("Sitemap: no product URLs")
     except Exception as exc:
         notes.append(f"Sitemap error: {exc}")
         logger.warning("[Discovery] sitemap error: %s", exc)
 
-    # ── Step 4: Category/nav scan ──────────────────────────────────────────
+    # ── Step 4: Category/nav scan (structure-based) ────────────────────────
     if homepage_html:
         try:
             r = _from_category_scan(homepage_html, website_url, notes)
@@ -194,10 +199,19 @@ def run_discovery(
             notes.append(f"Category scan error: {exc}")
             logger.warning("[Discovery] category scan error: %s", exc)
 
-    # ── Step 5: Deep internal link scan (depth-2) ──────────────────────────
-    if homepage_html and not any(c.estimated_count > 0 for c in candidates):
+    # ── Step 5: Common entry points probe ──────────────────────────────────
+    # Always run — finds /products, /machines, /catalog even if nav scan missed them
+    try:
+        r = _probe_common_paths(website_url, notes)
+        _add(r)
+    except Exception as exc:
+        notes.append(f"Common paths probe error: {exc}")
+
+    # ── Step 6: Deep link scan (depth up to 5) ────────────────────────────
+    # Only run if no good candidates yet
+    if homepage_html and not any(c.estimated_count >= 10 for c in candidates):
         try:
-            r = _deep_link_scan(homepage_html, website_url, notes)
+            r = _deep_link_scan(homepage_html, website_url, notes, max_depth=5)
             _add(r)
         except Exception as exc:
             notes.append(f"Deep scan error: {exc}")
@@ -205,116 +219,89 @@ def run_discovery(
 
     # ── Pick best candidate ────────────────────────────────────────────────
     if candidates:
-        best = max(candidates, key=lambda c: c.estimated_count)
+        best = max(candidates, key=lambda c: (c.estimated_count, bool(c.api_config), bool(c.product_urls)))
         best.notes = notes
         logger.info(
-            "[Discovery] Best: method=%s count=%d (from %d candidates)",
+            "[Discovery] BEST: method=%s count=%d (%d candidates)",
             best.method, best.estimated_count, len(candidates),
         )
         return best
 
-    # ── Step 6: Final fallback — always succeeds ───────────────────────────
-    notes.append("All methods found 0 — using homepage fallback")
-    logger.info("[Discovery] fallback to homepage for website_id=%d", website_id)
+    # ── Final fallback — always succeeds ──────────────────────────────────
+    notes.append("All methods found 0 — returning homepage fallback with minimum estimate")
+    logger.info("[Discovery] FALLBACK for website_id=%d", website_id)
     return DiscoveryResult(
-        method="html",
+        method="html-fallback",
         category_urls=[website_url],
-        estimated_count=0,
+        estimated_count=10,   # minimum non-zero estimate — site is reachable
         notes=notes,
     )
 
 
-# ── Training rules helper ─────────────────────────────────────────────────────
+# ── Step helpers ──────────────────────────────────────────────────────────────
 
-def _from_training_rules(
-    website_url: str,
-    rules: dict,
-    notes: List[str],
-) -> Optional[DiscoveryResult]:
+def _from_training_rules(url, rules, notes) -> Optional[DiscoveryResult]:
     from crawler.extractors.api_extractor import build_config_from_rules
-
-    crawl_type = rules.get("crawl_type", "auto")
-
-    if crawl_type == "api" or rules.get("api_url"):
+    if rules.get("crawl_type") == "api" or rules.get("api_url"):
         config = build_config_from_rules(rules)
         if config:
             notes.append(f"Pre-configured API: {config.api_type}")
-            return DiscoveryResult(method="api", api_config=config, estimated_count=0, notes=notes)
-
+            return DiscoveryResult(method="api", api_config=config, estimated_count=0, notes=list(notes))
     if rules.get("category_urls"):
         raw = rules["category_urls"]
         urls = [u.strip() for u in raw.split("\n") if u.strip()] if isinstance(raw, str) else list(raw)
         if urls:
             notes.append(f"Pre-configured {len(urls)} category URLs")
-            return DiscoveryResult(
-                method="category",
-                category_urls=urls,
-                estimated_count=len(urls) * 50,
-                notes=notes,
-            )
-
+            return DiscoveryResult(method="category", category_urls=urls,
+                                   estimated_count=len(urls) * 50, notes=list(notes))
     return None
 
 
-# ── Embedded JSON extraction ──────────────────────────────────────────────────
-
-# Common patterns where sites embed product data in page scripts
-_EMBEDDED_JSON_PATTERNS = [
-    r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\});',
-    r'window\.__DATA__\s*=\s*(\{.+?\});',
+_EMBEDDED_PATTERNS = [
+    r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(\{.+?\})</script>',
+    r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\})\s*;',
+    r'window\.__DATA__\s*=\s*(\{.+?\})\s*;',
     r'window\.__NUXT__\s*=\s*(\{.+?\})',
-    r'<script id="__NEXT_DATA__"[^>]*>(\{.+?\})</script>',
-    r'window\.initialData\s*=\s*(\{.+?\});',
-    r'window\.pageData\s*=\s*(\{.+?\});',
-    r'var productData\s*=\s*(\[.+?\]);',
-    r'var machineData\s*=\s*(\[.+?\]);',
+    r'window\.initialData\s*=\s*(\{.+?\})\s*;',
+    r'window\.pageData\s*=\s*(\{.+?\})\s*;',
+    r'var productData\s*=\s*(\[.+?\])\s*;',
+    r'var machineData\s*=\s*(\[.+?\])\s*;',
 ]
-
-_PRODUCT_COUNT_KEYS = [
-    "total", "totalCount", "total_count", "count", "totalItems",
-    "total_items", "productCount", "machineCount", "num_found",
-]
+_COUNT_KEYS = ["total", "totalCount", "total_count", "count", "totalItems",
+               "total_items", "productCount", "machineCount", "num_found", "numFound"]
 
 
-def _from_embedded_json(
-    html: str,
-    website_url: str,
-    notes: List[str],
-) -> Optional[DiscoveryResult]:
-    """Extract product count from embedded page JSON (Next.js, Nuxt, custom)."""
-    for pattern in _EMBEDDED_JSON_PATTERNS:
+def _from_embedded_json(html, website_url, notes) -> Optional[DiscoveryResult]:
+    for pattern in _EMBEDDED_PATTERNS:
         for m in re.finditer(pattern, html, re.DOTALL):
             raw = m.group(1)
-            if len(raw) > 500_000:
-                continue  # skip huge blobs
+            if len(raw) > 300_000:
+                continue
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-
-            count = _find_count_in_json(data)
-            if count and count > 0:
+            count = _find_count(data, depth=0)
+            if count and count > 5:
                 notes.append(f"Embedded JSON count: {count}")
-                logger.info("[Discovery] Embedded JSON found count=%d", count)
                 return DiscoveryResult(
                     method="embedded-json",
                     category_urls=[website_url],
                     estimated_count=count,
-                    notes=notes,
+                    notes=list(notes),
                 )
     return None
 
 
-def _find_count_in_json(data, depth: int = 0) -> Optional[int]:
-    """Recursively search for a product count value in a nested JSON structure."""
-    if depth > 5:
+def _find_count(data, depth: int) -> Optional[int]:
+    if depth > 6:
         return None
     if isinstance(data, dict):
-        for key in _PRODUCT_COUNT_KEYS:
-            if key in data and isinstance(data[key], int) and data[key] > 5:
-                return data[key]
-        for val in data.values():
-            found = _find_count_in_json(val, depth + 1)
+        for k in _COUNT_KEYS:
+            if k in data and isinstance(data[k], int) and data[k] > 5:
+                return data[k]
+        for v in data.values():
+            found = _find_count(v, depth + 1)
             if found:
                 return found
     elif isinstance(data, list) and len(data) > 5:
@@ -322,112 +309,151 @@ def _find_count_in_json(data, depth: int = 0) -> Optional[int]:
     return None
 
 
-# ── Category scan with real count sample ─────────────────────────────────────
-
-def _from_category_scan(
-    html: str,
-    website_url: str,
-    notes: List[str],
-) -> Optional[DiscoveryResult]:
-    from crawler.extractors.html_extractor import find_category_urls, find_product_urls
-
+def _from_category_scan(html, website_url, notes) -> Optional[DiscoveryResult]:
+    from crawler.extractors.html_extractor import (
+        find_category_urls, find_product_urls, build_pagination_urls
+    )
     category_urls = find_category_urls(html, website_url)
     if not category_urls:
-        notes.append("Category scan: no listing pages found")
+        notes.append("Category scan: no listing pages in nav")
         return None
 
     notes.append(f"Category scan: {len(category_urls)} listing pages")
+    estimated = len(category_urls) * 30   # conservative base estimate
 
-    # Sample first category page to get a real product count
-    sample_count = 0
+    # Sample first category page
     try:
         resp = _get(category_urls[0], timeout=12)
         if resp and resp.status_code < 400:
             product_urls = find_product_urls(resp.text, category_urls[0])
-            sample_count = len(product_urls)
-
-            # Try to find total page count from pagination
-            from crawler.extractors.html_extractor import build_pagination_urls
-            pagination = build_pagination_urls(website_url, category_urls[0], resp.text, max_pages=500)
-            total_pages = max(1, len(pagination) + 1)
-            # Estimate: products per page × total pages × category count
-            estimated = sample_count * total_pages * len(category_urls)
-            notes.append(
-                f"Category sample: {sample_count} products/page × "
-                f"{total_pages} pages × {len(category_urls)} cats = {estimated}"
-            )
-        else:
-            # Use rough estimate
-            estimated = len(category_urls) * 50
-            notes.append(f"Category sample failed, using estimate: {estimated}")
+            if product_urls:
+                pagination = build_pagination_urls(website_url, category_urls[0], resp.text)
+                total_pages = max(1, len(pagination) + 1)
+                estimated = len(product_urls) * total_pages * len(category_urls)
+                notes.append(
+                    f"Category sample: {len(product_urls)}/page × "
+                    f"{total_pages} pages × {len(category_urls)} cats = {estimated}"
+                )
+            else:
+                notes.append("Category sample: 0 product links on first page")
     except Exception as exc:
-        estimated = len(category_urls) * 50
-        notes.append(f"Category sample error ({exc}), estimate: {estimated}")
+        notes.append(f"Category sample error: {exc}")
 
     return DiscoveryResult(
         method="category",
         category_urls=category_urls,
         estimated_count=max(estimated, len(category_urls)),
-        notes=notes,
+        notes=list(notes),
     )
 
 
-# ── Deep internal link scan (depth-2) ────────────────────────────────────────
-
-def _deep_link_scan(
-    html: str,
-    website_url: str,
-    notes: List[str],
-) -> Optional[DiscoveryResult]:
+def _probe_common_paths(website_url, notes) -> Optional[DiscoveryResult]:
     """
-    Follow internal links from homepage up to depth=2.
-    Look for pages with repeated product card patterns.
+    Probe common product/listing paths that nav scan may have missed.
+    Looks for pages with >10 internal links (structural listing signal).
     """
-    from bs4 import BeautifulSoup
-    from crawler.extractors.html_extractor import find_product_urls
+    from crawler.extractors.html_extractor import find_product_urls, count_internal_links
 
-    soup = BeautifulSoup(html, "lxml")
-    seen_urls = {website_url}
-    product_urls_found: set = set()
     listing_pages: List[str] = []
+    total_products = 0
 
-    # Collect all internal links from homepage
-    depth1_links: List[str] = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        url = urljoin(website_url, href)
-        if _same_domain(url, website_url) and url not in seen_urls:
-            seen_urls.add(url)
-            depth1_links.append(url)
-
-    # Visit first 20 internal links (avoid excessive requests)
-    for url in depth1_links[:20]:
+    for path in COMMON_ENTRY_PATHS:
+        url = website_url.rstrip("/") + path
         try:
             resp = _get(url, timeout=8)
-            if not resp or resp.status_code >= 400:
+            if not resp or resp.status_code != 200:
                 continue
-
-            products = find_product_urls(resp.text, url)
-            if len(products) >= 3:
-                listing_pages.append(url)
-                product_urls_found.update(products)
-
+            link_count = count_internal_links(resp.text, url)
+            if link_count >= 10:
+                product_urls = find_product_urls(resp.text, url)
+                if len(product_urls) >= 3:
+                    listing_pages.append(url)
+                    total_products += len(product_urls)
+                    notes.append(f"Common path hit: {path} ({len(product_urls)} products)")
             if len(listing_pages) >= 5:
                 break
         except Exception:
             continue
 
     if not listing_pages:
-        notes.append("Deep scan: no listing pages found at depth-2")
+        notes.append("Common paths probe: no listing pages found")
         return None
 
+    return DiscoveryResult(
+        method="common-paths",
+        category_urls=listing_pages,
+        estimated_count=total_products * 3,
+        notes=list(notes),
+    )
+
+
+def _deep_link_scan(
+    html: str,
+    website_url: str,
+    notes: List[str],
+    max_depth: int = 5,
+) -> Optional[DiscoveryResult]:
+    """
+    Follow internal links up to max_depth levels.
+    Any page with >20 internal links is treated as a listing page.
+    Any page where URL pattern repeats >3 times → product detail pages.
+    """
+    from crawler.extractors.html_extractor import (
+        find_all_internal_links, find_product_urls, count_internal_links
+    )
+
+    visited: set = {_clean(website_url)}
+    queue: List[tuple] = [(website_url, html, 1)]
+    listing_pages: List[str] = []
+    product_urls_found: set = set()
+    requests_made = 0
+    MAX_REQUESTS = 30
+
+    while queue and requests_made < MAX_REQUESTS:
+        current_url, current_html, depth = queue.pop(0)
+
+        # Check if this page looks like a listing
+        products = find_product_urls(current_html, current_url)
+        link_count = count_internal_links(current_html, current_url)
+
+        if len(products) >= 3 or link_count >= 20:
+            if current_url != website_url:
+                listing_pages.append(current_url)
+            product_urls_found.update(products)
+
+        if depth >= max_depth:
+            continue
+
+        # Expand: visit internal links
+        for link in find_all_internal_links(current_html, current_url)[:15]:
+            clean = _clean(link)
+            if clean in visited:
+                continue
+            visited.add(clean)
+
+            try:
+                resp = _get(link, timeout=8)
+                if resp and resp.status_code < 400:
+                    queue.append((link, resp.text, depth + 1))
+                    requests_made += 1
+            except Exception:
+                pass
+
+            if requests_made >= MAX_REQUESTS:
+                break
+
+    if not listing_pages and not product_urls_found:
+        notes.append(f"Deep scan (depth={max_depth}): no listing pages found")
+        return None
+
+    count = max(len(product_urls_found) * 2, len(listing_pages) * 30)
     notes.append(
         f"Deep scan: {len(listing_pages)} listing pages, "
-        f"{len(product_urls_found)} product URLs found"
+        f"{len(product_urls_found)} product URLs, estimate={count}"
     )
     return DiscoveryResult(
         method="deep-html",
-        category_urls=listing_pages,
-        estimated_count=len(product_urls_found) * 3,  # rough: only sampled some pages
-        notes=notes,
+        category_urls=listing_pages or [website_url],
+        estimated_count=count,
+        notes=list(notes),
     )

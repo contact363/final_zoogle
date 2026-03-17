@@ -1,11 +1,17 @@
 """
-HTML Extractor — used by Phase 1 (discovery) and Phase 3 (machine detail).
+HTML Extractor — Phase 1 discovery + Phase 3 machine data extraction.
 
-Responsibilities:
-  • Find category/listing page URLs from site navigation
-  • Detect product card patterns on listing pages
-  • Extract machine data from product detail pages
-  • Detect and build pagination URLs
+Detection is STRUCTURE-BASED, not keyword-based.
+
+Category detection uses:
+  • URL pattern frequency (if a pattern repeats >5 times → listing page)
+  • Link density (if a page has >20 internal links → treat as listing)
+  • Common path segments (/product/, /item/, /listing/, etc.)
+
+Machine extraction uses:
+  • JSON-LD schema.org/Product
+  • OpenGraph meta tags
+  • CSS heuristics (title, price, images, specs table)
 """
 from __future__ import annotations
 
@@ -13,62 +19,38 @@ import hashlib
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse, urlencode, parse_qs, urlunparse
+from collections import Counter
+from typing import Any, Dict, List, Optional
+from urllib.parse import (
+    urljoin, urlparse, urlencode, parse_qs,
+    urlunparse, urldefrag,
+)
 
 try:
     from bs4 import BeautifulSoup
-except ImportError as _bs4_err:
+except ImportError as _e:
     raise ImportError(
-        "BeautifulSoup not installed — HTML parsing unavailable. "
-        "Run: pip install beautifulsoup4 lxml"
-    ) from _bs4_err
+        "BeautifulSoup not installed — run: pip install beautifulsoup4 lxml"
+    ) from _e
 
 logger = logging.getLogger(__name__)
 
-# ── Multilingual product keywords ────────────────────────────────────────────
-PRODUCT_KEYWORDS = re.compile(
-    r"\b(machine|machinery|product|equipment|tool|device|catalog|catalogue|"
-    r"listing|inventory|stock|used|new|"
-    # German
-    r"maschine|produkt|werkzeug|geraet|ausruestung|gebraucht|"
-    # Italian
-    r"macchina|prodotto|attrezzatura|usato|"
-    # Spanish
-    r"maquina|producto|equipo|usado|"
-    # French
-    r"machine|produit|equipement|occasion|"
-    # Dutch
-    r"machine|product|apparaat|gebruikt)\b",
-    re.IGNORECASE,
-)
-
-# Category/listing path patterns
-CATEGORY_PATH_RE = re.compile(
-    r"/(machines?|products?|equipment|catalog|catalogue|inventory|listings?|"
-    r"used|new|stock|shop|store|category|categor[yi]|"
-    r"maschinen|produkte|werkzeuge|gebraucht|"
-    r"macchine|prodotti|usato|"
-    r"maquinas|productos|"
-    r"machines|produits|"
-    r"machines|producten)/?",
-    re.IGNORECASE,
-)
-
-# URLs to always skip
+# ── Paths to always skip ──────────────────────────────────────────────────────
 SKIP_PATH_RE = re.compile(
     r"/(cart|checkout|account|login|register|signin|signup|"
     r"password|reset|admin|api|wp-admin|wp-json|"
     r"contact|about|privacy|terms|faq|help|support|"
-    r"blog|news|press|media|events|jobs|careers|"
-    r"\.(pdf|jpg|jpeg|png|gif|svg|css|js|xml|zip))\b",
+    r"blog|news|press|media|events|jobs|careers|sitemap|"
+    r"feed|rss|tag|author|search)"
+    r"|\.(pdf|jpg|jpeg|png|gif|svg|css|js|xml|zip|webp|ico)(\?|$)",
     re.IGNORECASE,
 )
 
-# Product detail page URL signals
-PRODUCT_DETAIL_RE = re.compile(
-    r"/(product|machine|equipment|item|detail|listing|used|gebraucht|"
-    r"macchina|maquina|produit|produkt|apparaat)s?/[^/]+/?$",
+# Common URL segments that strongly indicate product/listing pages
+PRODUCT_SEGMENT_RE = re.compile(
+    r"/(product|machine|equipment|item|listing|catalog|catalogue|"
+    r"inventory|shop|store|used|new|stock|"
+    r"maschine|produkt|macchina|maquina|produit|apparaat)s?",
     re.IGNORECASE,
 )
 
@@ -78,63 +60,158 @@ def _soup(html: str) -> BeautifulSoup:
 
 
 def _abs(url: str, base: str) -> Optional[str]:
-    """Resolve relative URL against base. Returns None for non-HTTP URLs."""
-    if not url or url.startswith(("#", "javascript:", "mailto:", "tel:")):
+    """Resolve URL to absolute. Return None for non-HTTP or skip-worthy URLs."""
+    if not url:
         return None
-    abs_url = urljoin(base, url.strip())
-    parsed = urlparse(abs_url)
-    if parsed.scheme not in ("http", "https"):
+    url = url.strip()
+    if url.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
         return None
-    return abs_url
+    try:
+        abs_url, _ = urldefrag(urljoin(base, url))
+        parsed = urlparse(abs_url)
+        if parsed.scheme not in ("http", "https"):
+            return None
+        return abs_url
+    except Exception:
+        return None
 
 
 def _same_domain(url: str, base: str) -> bool:
-    return urlparse(url).netloc == urlparse(base).netloc
+    try:
+        return urlparse(url).netloc == urlparse(base).netloc
+    except Exception:
+        return False
+
+
+def _clean_url(url: str) -> str:
+    """Remove query params and fragments for pattern matching."""
+    p = urlparse(url)
+    return urlunparse(p._replace(query="", fragment=""))
+
+
+def _path_pattern(url: str) -> str:
+    """
+    Convert a URL path to a pattern by replacing variable segments with {slug}.
+    /machines/used-volvo-2022  →  /machines/{slug}
+    /product/123               →  /product/{slug}
+    """
+    path = urlparse(url).path.rstrip("/")
+    parts = path.split("/")
+    patterned = []
+    for part in parts:
+        # Variable segment: contains digits, dashes, or is long
+        if re.search(r"\d", part) or len(part) > 20 or "-" in part:
+            patterned.append("{slug}")
+        else:
+            patterned.append(part)
+    return "/".join(patterned)
 
 
 # ── Category URL discovery ────────────────────────────────────────────────────
 
 def find_category_urls(html: str, base_url: str) -> List[str]:
     """
-    Scan nav, header, footer, and sidebar for category/listing page links.
-    Returns deduplicated list of same-domain category URLs.
+    Find listing/category page URLs using STRUCTURE-BASED detection.
+
+    Strategy:
+    1. Collect all internal links.
+    2. Group by URL path pattern.
+    3. Any pattern repeated >5 times → listing page group.
+    4. Also include links with product path segments.
+    5. Links from nav/header/footer get priority.
+    Returns deduplicated list sorted by score.
     """
     soup = _soup(html)
-    candidates: Dict[str, int] = {}  # url → score
+    all_links: Dict[str, int] = {}   # url → score
 
-    # Priority zones: nav > header > footer > body
-    zones = [
-        ("nav", 3), ("header", 2), ("footer", 1),
-        ('[class*="menu"]', 2), ('[class*="nav"]', 2),
-        ('[class*="sidebar"]', 1), ("body", 0),
+    # Collect ALL internal links with zone-based scoring
+    zone_scores = [
+        (soup.select("nav"), 4),
+        (soup.select("header"), 3),
+        (soup.select('[class*="menu"]'), 3),
+        (soup.select('[class*="nav"]'), 3),
+        (soup.select("footer"), 2),
+        (soup.select('[class*="sidebar"]'), 2),
+        ([soup], 1),   # whole page as fallback
     ]
 
-    for selector, boost in zones:
-        for container in soup.select(selector)[:3]:
-            for a in container.find_all("a", href=True):
+    for elements, zone_score in zone_scores:
+        for el in elements:
+            for a in el.find_all("a", href=True):
                 url = _abs(a["href"], base_url)
                 if not url or not _same_domain(url, base_url):
                     continue
-                path = urlparse(url).path
-                if SKIP_PATH_RE.search(path):
+                if SKIP_PATH_RE.search(urlparse(url).path):
                     continue
-                text = (a.get_text(" ", strip=True) + " " + path).lower()
-                score = boost
-                if CATEGORY_PATH_RE.search(path):
+                if url == base_url or url == base_url + "/":
+                    continue
+                score = all_links.get(url, 0)
+                # Boost for product-related path segments
+                if PRODUCT_SEGMENT_RE.search(urlparse(url).path):
                     score += 5
-                if PRODUCT_KEYWORDS.search(text):
-                    score += 2
-                if score > 0:
-                    candidates[url] = max(candidates.get(url, 0), score)
+                score += zone_score
+                all_links[url] = score
 
-    # Return top URLs sorted by score
-    ranked = sorted(candidates.items(), key=lambda x: x[1], reverse=True)
-    return [url for url, _ in ranked if _[:1] or True][:30]
+    # Pattern frequency analysis: find repeating path patterns
+    pattern_counts: Counter = Counter()
+    url_to_pattern: Dict[str, str] = {}
+    for url in all_links:
+        pat = _path_pattern(url)
+        pattern_counts[pat] += 1
+        url_to_pattern[url] = pat
+
+    # Boost URLs whose pattern repeats frequently (structural listing signal)
+    for url, score in list(all_links.items()):
+        pat = url_to_pattern.get(url, "")
+        freq = pattern_counts.get(pat, 1)
+        if freq >= 5:
+            all_links[url] = score + freq * 2
+
+    # Filter: keep only URLs with score >= 3 (nav/product/pattern hit)
+    candidates = [(url, score) for url, score in all_links.items() if score >= 3]
+    candidates.sort(key=lambda x: x[1], reverse=True)
+
+    # Deduplicate preserving order
+    seen: set = set()
+    result: List[str] = []
+    for url, _ in candidates[:40]:
+        clean = _clean_url(url)
+        if clean not in seen:
+            seen.add(clean)
+            result.append(url)
+
+    return result
+
+
+def find_all_internal_links(html: str, base_url: str) -> List[str]:
+    """
+    Return ALL unique internal links from a page, filtered of skip-worthy URLs.
+    Used for deep scanning.
+    """
+    soup = _soup(html)
+    seen: set = set()
+    result: List[str] = []
+    for a in soup.find_all("a", href=True):
+        url = _abs(a["href"], base_url)
+        if not url or not _same_domain(url, base_url):
+            continue
+        if SKIP_PATH_RE.search(urlparse(url).path):
+            continue
+        clean = _clean_url(url)
+        if clean not in seen and clean != _clean_url(base_url):
+            seen.add(clean)
+            result.append(url)
+    return result
+
+
+def count_internal_links(html: str, base_url: str) -> int:
+    """Count unique internal links on a page (used to identify listing pages)."""
+    return len(find_all_internal_links(html, base_url))
 
 
 # ── Product URL extraction from listing pages ─────────────────────────────────
 
-# Common CSS selectors for product cards
+# Known product card CSS selectors
 PRODUCT_CARD_SELECTORS = [
     "article.product", ".product-item", ".product-card",
     ".machine-item", ".machine-card", ".listing-item",
@@ -149,64 +226,77 @@ PRODUCT_CARD_SELECTORS = [
 
 def find_product_urls(html: str, base_url: str, product_link_pattern: str = "") -> List[str]:
     """
-    Extract product/machine detail URLs from a listing/category page.
-    Uses CSS pattern matching + URL structure heuristics.
+    Extract product/machine URLs from a listing/category page.
+
+    Uses two strategies:
+    1. Known CSS product card selectors.
+    2. URL path pattern frequency — if a pattern repeats >3 times on the
+       same page, those URLs are product detail pages.
     """
     soup = _soup(html)
-    urls: Dict[str, int] = {}  # url → score
+    scores: Dict[str, int] = {}
 
-    # If custom pattern provided, use it
     custom_re = re.compile(product_link_pattern, re.IGNORECASE) if product_link_pattern else None
 
-    # Strategy 1: known product card selectors
+    # Strategy 1: CSS product card selectors
     for selector in PRODUCT_CARD_SELECTORS:
         for card in soup.select(selector):
             for a in card.find_all("a", href=True):
                 url = _abs(a["href"], base_url)
                 if url and _same_domain(url, base_url):
-                    urls[url] = urls.get(url, 0) + 3
+                    scores[url] = scores.get(url, 0) + 5
 
-    # Strategy 2: links that match product URL pattern
+    # Strategy 2: Pattern frequency on all links
+    all_urls: List[str] = []
     for a in soup.find_all("a", href=True):
         url = _abs(a["href"], base_url)
         if not url or not _same_domain(url, base_url):
             continue
         if SKIP_PATH_RE.search(urlparse(url).path):
             continue
+        all_urls.append(url)
+
+    pattern_counts: Counter = Counter(_path_pattern(u) for u in all_urls)
+    for url in all_urls:
+        pat = _path_pattern(url)
+        freq = pattern_counts[pat]
         if custom_re and custom_re.search(url):
-            urls[url] = urls.get(url, 0) + 5
+            scores[url] = scores.get(url, 0) + 10
+        elif freq >= 3:
+            scores[url] = scores.get(url, 0) + freq
+
+    # Filter and return
+    seen: set = set()
+    result: List[str] = []
+    for url, score in sorted(scores.items(), key=lambda x: x[1], reverse=True):
+        if score < 3:
             continue
-        if PRODUCT_DETAIL_RE.search(url):
-            urls[url] = urls.get(url, 0) + 2
+        clean = _clean_url(url)
+        if clean not in seen and url != base_url:
+            seen.add(clean)
+            result.append(url)
 
-    # Filter out listing/category pages themselves
-    result = []
-    for url, score in urls.items():
-        if score >= 2 and url != base_url:
-            path = urlparse(url).path
-            # Skip if it looks like a category page
-            if not re.search(r"/page/\d+", path):
-                result.append(url)
-
-    return list(dict.fromkeys(result))  # preserve order, deduplicate
+    return result
 
 
 # ── Pagination detection ──────────────────────────────────────────────────────
 
 def find_next_page_url(html: str, current_url: str) -> Optional[str]:
-    """Return the URL of the next page, or None if this is the last page."""
+    """Return the URL of the next page, or None if last page."""
     soup = _soup(html)
 
-    # 1. <a rel="next">
-    next_link = soup.find("a", rel=lambda r: r and "next" in r)
-    if next_link and next_link.get("href"):
-        return _abs(next_link["href"], current_url)
+    # <a rel="next">
+    nxt = soup.find("a", rel=lambda r: r and "next" in r)
+    if nxt and nxt.get("href"):
+        return _abs(nxt["href"], current_url)
 
-    # 2. Common "next page" button text/class patterns
+    # Text/class patterns
     for a in soup.find_all("a", href=True):
         text = a.get_text(strip=True).lower()
         cls  = " ".join(a.get("class") or []).lower()
-        if any(kw in text or kw in cls for kw in ("next", "weiter", "suivant", "volgende", "avanti", "siguiente")):
+        if any(kw in text or kw in cls for kw in (
+            "next", "weiter", "suivant", "volgende", "avanti", "siguiente", "›", "»"
+        )):
             url = _abs(a["href"], current_url)
             if url and url != current_url:
                 return url
@@ -215,22 +305,16 @@ def find_next_page_url(html: str, current_url: str) -> Optional[str]:
 
 
 def build_pagination_urls(base_url: str, current_url: str, html: str, max_pages: int = 200) -> List[str]:
-    """
-    Generate all pagination URLs for a listing page.
-    Detects ?page=N, /page/N/, ?offset=N, ?start=N patterns.
-    """
+    """Generate all pagination URLs for a listing page."""
     soup = _soup(html)
     urls: List[str] = []
-
-    # Find highest page number visible in pagination
     max_page = 1
+
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        # ?page=N
         m = re.search(r"[?&]page=(\d+)", href)
         if m:
             max_page = max(max_page, int(m.group(1)))
-        # /page/N/
         m = re.search(r"/page/(\d+)", href)
         if m:
             max_page = max(max_page, int(m.group(1)))
@@ -239,8 +323,6 @@ def build_pagination_urls(base_url: str, current_url: str, html: str, max_pages:
         return urls
 
     max_page = min(max_page, max_pages)
-
-    # Detect URL pattern from current_url
     parsed = urlparse(current_url)
     qs = parse_qs(parsed.query)
 
@@ -250,48 +332,38 @@ def build_pagination_urls(base_url: str, current_url: str, html: str, max_pages:
             new_parsed = parsed._replace(query=urlencode(new_qs, doseq=True))
             urls.append(urlunparse(new_parsed))
         elif re.search(r"/page/\d+", current_url):
-            new_url = re.sub(r"/page/\d+", f"/page/{page_num}", current_url)
-            urls.append(new_url)
+            urls.append(re.sub(r"/page/\d+", f"/page/{page_num}", current_url))
         else:
-            # Append ?page=N
             sep = "&" if "?" in current_url else "?"
             urls.append(f"{current_url}{sep}page={page_num}")
 
     return urls
 
 
-# ── Machine data extraction from product detail pages ─────────────────────────
+# ── Machine data extraction ───────────────────────────────────────────────────
 
 def extract_machine_data(html: str, url: str) -> Dict[str, Any]:
     """
     Extract structured machine data from a product detail page.
-
-    Tries in order:
-    1. JSON-LD (schema.org/Product)
-    2. OpenGraph meta tags
-    3. CSS heuristic patterns
+    Tries JSON-LD → OG meta → CSS heuristics in order.
     """
     result: Dict[str, Any] = {"source_url": url}
-
-    # 1. JSON-LD
     soup = _soup(html)
-    ld_data = _extract_json_ld(soup)
-    if ld_data:
-        result.update(ld_data)
 
-    # 2. OG meta
-    og_data = _extract_og_meta(soup)
-    for key, val in og_data.items():
-        if key not in result or not result[key]:
-            result[key] = val
+    ld = _extract_json_ld(soup)
+    if ld:
+        result.update(ld)
 
-    # 3. CSS heuristics (fill any remaining gaps)
-    css_data = _extract_css_heuristics(soup, url)
-    for key, val in css_data.items():
-        if key not in result or not result[key]:
-            result[key] = val
+    og = _extract_og_meta(soup)
+    for k, v in og.items():
+        if k not in result or not result[k]:
+            result[k] = v
 
-    # Compute content hash
+    css = _extract_css_heuristics(soup, url)
+    for k, v in css.items():
+        if k not in result or not result[k]:
+            result[k] = v
+
     brand = str(result.get("brand") or "")
     model = str(result.get("model") or "")
     result["content_hash"] = hashlib.sha256(
@@ -308,42 +380,33 @@ def _extract_json_ld(soup: BeautifulSoup) -> Dict[str, Any]:
             data = json.loads(tag.string or "{}")
             if isinstance(data, list):
                 data = next((d for d in data if "Product" in str(d.get("@type", ""))), {})
-            schema_type = str(data.get("@type", ""))
-            if "Product" not in schema_type and "Offer" not in schema_type:
+            if "Product" not in str(data.get("@type", "")):
                 continue
-
-            result["machine_name"] = data.get("name") or data.get("title")
+            result["machine_name"] = data.get("name")
             result["description"]  = data.get("description")
             result["brand"]        = (data.get("brand") or {}).get("name") if isinstance(data.get("brand"), dict) else data.get("brand")
             result["model"]        = data.get("model") or data.get("mpn")
             result["stock_number"] = data.get("sku") or data.get("productID")
-
-            # Price
             offer = data.get("offers") or {}
             if isinstance(offer, list):
                 offer = offer[0] if offer else {}
             result["price"]    = offer.get("price")
             result["currency"] = offer.get("priceCurrency", "USD")
-
-            # Images
             imgs = data.get("image") or []
             if isinstance(imgs, str):
                 imgs = [imgs]
             elif isinstance(imgs, dict):
                 imgs = [imgs.get("url") or imgs.get("contentUrl")]
             result["images"] = [i for i in imgs if i]
-
-            # Specs
             specs: Dict[str, str] = {}
             for prop in data.get("additionalProperty") or []:
                 if isinstance(prop, dict):
                     specs[prop.get("name", "")] = str(prop.get("value", ""))
             if specs:
                 result["specifications"] = specs
-
             if result.get("machine_name"):
                 break
-        except (json.JSONDecodeError, AttributeError):
+        except Exception:
             continue
     return {k: v for k, v in result.items() if v}
 
@@ -351,7 +414,7 @@ def _extract_json_ld(soup: BeautifulSoup) -> Dict[str, Any]:
 def _extract_og_meta(soup: BeautifulSoup) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
     for meta in soup.find_all("meta"):
-        prop = meta.get("property") or meta.get("name") or ""
+        prop    = meta.get("property") or meta.get("name") or ""
         content = meta.get("content") or ""
         if prop == "og:title" and not result.get("machine_name"):
             result["machine_name"] = content
@@ -365,26 +428,19 @@ def _extract_og_meta(soup: BeautifulSoup) -> Dict[str, Any]:
 def _extract_css_heuristics(soup: BeautifulSoup, base_url: str) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
 
-    # Title / machine name
-    for sel in [
-        "h1.product-title", "h1.machine-title", "h1.product-name",
-        ".product-title h1", ".machine-title", "[itemprop='name']",
-        "h1",
-    ]:
+    for sel in ["h1.product-title", "h1.machine-title", ".product-title h1",
+                ".machine-title", "[itemprop='name']", "h1"]:
         el = soup.select_one(sel)
         if el:
             result["machine_name"] = el.get_text(strip=True)
             break
 
-    # Price
-    for sel in [
-        "[itemprop='price']", ".price", ".product-price",
-        ".machine-price", '[class*="price"]',
-    ]:
+    for sel in ["[itemprop='price']", ".price", ".product-price",
+                ".machine-price", '[class*="price"]']:
         el = soup.select_one(sel)
         if el:
-            raw_price = el.get_text(strip=True)
-            m = re.search(r"[\d,\.]+", raw_price.replace(",", ""))
+            raw = el.get_text(strip=True)
+            m = re.search(r"[\d,\.]+", raw.replace(" ", ""))
             if m:
                 try:
                     result["price"] = float(m.group().replace(",", "."))
@@ -392,23 +448,16 @@ def _extract_css_heuristics(soup: BeautifulSoup, base_url: str) -> Dict[str, Any
                     pass
             break
 
-    # Description
-    for sel in [
-        "[itemprop='description']", ".product-description",
-        ".machine-description", ".description", "#description",
-    ]:
+    for sel in ["[itemprop='description']", ".product-description",
+                ".machine-description", ".description", "#description"]:
         el = soup.select_one(sel)
         if el:
             result["description"] = el.get_text(" ", strip=True)[:2000]
             break
 
-    # Images
     images: List[str] = []
-    for sel in [
-        "[itemprop='image']", ".product-image img",
-        ".machine-image img", ".gallery img", ".slider img",
-        '[class*="product-img"]', '[class*="main-image"]',
-    ]:
+    for sel in ["[itemprop='image']", ".product-image img", ".machine-image img",
+                ".gallery img", ".slider img", '[class*="product-img"]']:
         for img in soup.select(sel)[:5]:
             src = img.get("src") or img.get("data-src") or img.get("data-lazy")
             if src:
@@ -418,20 +467,18 @@ def _extract_css_heuristics(soup: BeautifulSoup, base_url: str) -> Dict[str, Any
     if images:
         result["images"] = images[:5]
 
-    # Specs table
     specs: Dict[str, str] = {}
-    for table in soup.select("table.specs, table.specifications, .spec-table, .attributes-table, table")[:3]:
+    for table in soup.select("table.specs, table.specifications, .spec-table, table")[:3]:
         for row in table.find_all("tr"):
             cells = row.find_all(["th", "td"])
             if len(cells) >= 2:
-                key   = cells[0].get_text(strip=True)
-                value = cells[1].get_text(strip=True)
-                if key and value and len(key) < 80:
-                    specs[key] = value
+                k = cells[0].get_text(strip=True)
+                v = cells[1].get_text(strip=True)
+                if k and v and len(k) < 80:
+                    specs[k] = v
     if specs:
         result["specifications"] = specs
 
-    # Brand from meta or common selectors
     for sel in ["[itemprop='brand']", ".brand", ".manufacturer", ".make"]:
         el = soup.select_one(sel)
         if el:
