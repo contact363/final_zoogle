@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
+from pathlib import Path
 from typing import Iterator
 
 import scrapy
@@ -126,8 +128,8 @@ class MachineSpider(BaseSpider):
             self._errors,
             reason,
         )
-        # Write result for task to read
-        result_file = f"/tmp/machine_count_{self.website_id}.txt"
+        # FIX 3: Write result using cross-platform temp dir (not hard-coded /tmp)
+        result_file = str(Path(tempfile.gettempdir()) / f"machine_count_{self.website_id}.txt")
         try:
             with open(result_file, "w") as f:
                 f.write(f"{self._machines_extracted},{self._errors}")

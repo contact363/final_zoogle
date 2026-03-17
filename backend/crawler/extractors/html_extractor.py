@@ -160,15 +160,15 @@ def find_category_urls(html: str, base_url: str) -> List[str]:
         pattern_counts[pat] += 1
         url_to_pattern[url] = pat
 
-    # Boost URLs whose pattern repeats frequently (structural listing signal)
+    # FIX 6: Boost URLs whose pattern repeats — threshold lowered from 5 → 2
     for url, score in list(all_links.items()):
         pat = url_to_pattern.get(url, "")
         freq = pattern_counts.get(pat, 1)
-        if freq >= 5:
+        if freq >= 2:  # was 5
             all_links[url] = score + freq * 2
 
-    # Filter: keep only URLs with score >= 3 (nav/product/pattern hit)
-    candidates = [(url, score) for url, score in all_links.items() if score >= 3]
+    # FIX 6: Filter: keep only URLs with score >= 2 (was 3)
+    candidates = [(url, score) for url, score in all_links.items() if score >= 2]
     candidates.sort(key=lambda x: x[1], reverse=True)
 
     # Deduplicate preserving order
@@ -262,14 +262,14 @@ def find_product_urls(html: str, base_url: str, product_link_pattern: str = "") 
         freq = pattern_counts[pat]
         if custom_re and custom_re.search(url):
             scores[url] = scores.get(url, 0) + 10
-        elif freq >= 3:
+        elif freq >= 2:  # FIX 6: was 3
             scores[url] = scores.get(url, 0) + freq
 
     # Filter and return
     seen: set = set()
     result: List[str] = []
     for url, score in sorted(scores.items(), key=lambda x: x[1], reverse=True):
-        if score < 3:
+        if score < 2:  # FIX 6: was 3
             continue
         clean = _clean_url(url)
         if clean not in seen and url != base_url:

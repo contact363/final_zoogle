@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,9 @@ def run_url_collection(
         f.write("\n".join(category_urls))
         urls_file = f.name
 
-    result_file = f"/tmp/url_count_{website_id}.txt"
+    # FIX 3: Use tempfile.gettempdir() — works on Windows AND Linux/Mac
+    _tmp = tempfile.gettempdir()
+    result_file = str(Path(_tmp) / f"url_count_{website_id}.txt")
     # Clean up previous result
     try:
         os.remove(result_file)
@@ -62,7 +65,7 @@ def run_url_collection(
         "-a", f"redis_url={redis_url}",
         "-a", f"product_link_pattern={product_link_pattern}",
         "-a", f"request_delay={request_delay}",
-        "--logfile", f"/tmp/url_collector_{website_id}.log",
+        "--logfile", str(Path(_tmp) / f"url_collector_{website_id}.log"),
         "--loglevel", "INFO",
     ]
 

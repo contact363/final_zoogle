@@ -15,7 +15,9 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import psycopg2
@@ -188,7 +190,9 @@ def run_machine_crawl(
     Launch the machine_spider subprocess to drain the Redis URL queue
     and store machines in PostgreSQL.
     """
-    stats_file = f"/tmp/pipeline_stats_{website_id}.json"
+    # FIX 3: Use tempfile.gettempdir() — works on Windows AND Linux/Mac
+    _tmp = tempfile.gettempdir()
+    stats_file = str(Path(_tmp) / f"pipeline_stats_{website_id}.json")
     try:
         os.remove(stats_file)
     except FileNotFoundError:
@@ -200,7 +204,7 @@ def run_machine_crawl(
         "-a", f"redis_url={redis_url}",
         "-a", f"request_delay={request_delay}",
         "-s", f"DATABASE_SYNC_URL={db_sync_url}",
-        "--logfile", f"/tmp/machine_spider_{website_id}.log",
+        "--logfile", str(Path(_tmp) / f"machine_spider_{website_id}.log"),
         "--loglevel", "INFO",
     ]
 

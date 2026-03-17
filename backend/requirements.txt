@@ -34,6 +34,10 @@ w3lib==2.2.1
 beautifulsoup4==4.12.3
 lxml==5.2.2
 
+# ── Playwright (JS rendering for React/Vue/Angular/Next.js sites) ─────────────
+# After pip install, run: playwright install chromium
+playwright==1.44.0
+
 # ── Image handling ────────────────────────────────────────────────────────────
 Pillow==10.4.0
 
