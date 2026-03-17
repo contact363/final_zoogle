@@ -103,6 +103,40 @@ _SKIP_API_HOSTS = re.compile(
     re.IGNORECASE,
 )
 
+# ── Last-error storage so callers can surface Playwright errors to UI ─────────
+_last_playwright_error: str = ""
+
+
+def get_last_error() -> str:
+    return _last_playwright_error
+
+
+def playwright_check() -> tuple:
+    """
+    Verify Playwright + Chromium are properly installed.
+    Returns (ok: bool, message: str).
+    Run this to diagnose why rendering fails.
+    """
+    if not _check_playwright():
+        return False, "playwright Python package not installed. Run: pip install playwright"
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            page.goto("about:blank")
+            title = page.title()
+            browser.close()
+        return True, f"Playwright OK — Chromium launched, got title={title!r}"
+    except Exception as exc:
+        msg = str(exc)
+        if "Executable doesn't exist" in msg or "executable" in msg.lower():
+            return False, (
+                f"Chromium not downloaded: {msg}\n"
+                "Fix: run  playwright install chromium"
+            )
+        return False, f"Playwright launch failed: {msg}"
+
 
 def _stealth_js() -> str:
     return """
@@ -184,9 +218,15 @@ def render_page(
 
         except PWTimeout:
             logger.warning("[Playwright] Timeout on %s (attempt %d)", url, attempt + 1)
-            wait_until = "domcontentloaded"   # retry faster
+            wait_until = "domcontentloaded"
         except Exception as exc:
+            global _last_playwright_error
+            _last_playwright_error = str(exc)
             logger.error("[Playwright] Error on %s (attempt %d): %s", url, attempt + 1, exc)
+            if "Executable doesn't exist" in str(exc) or "executable" in str(exc).lower():
+                logger.error(
+                    "[Playwright] Chromium not installed! Fix: playwright install chromium"
+                )
             if attempt >= retries:
                 break
 

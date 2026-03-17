@@ -233,10 +233,16 @@ def run_discovery(
         notes.append("JS-rendered + no API — running multi-strategy recovery")
         logger.info("[Detection] JS-rendered, no API — recovery for website_id=%d", website_id)
 
+        # Strategy 0: Next.js RSC — request server component payload directly (no browser)
+        rsc_result = _try_nextjs_rsc_pages(website_url, homepage_html, notes)
+        if rsc_result:
+            _add(rsc_result)
+
         # Strategy A: Playwright with XHR interception (captures API calls live)
-        xhr_result = _try_playwright_intercept(website_url, notes)
-        if xhr_result:
-            _add(xhr_result)
+        if not candidates:
+            xhr_result = _try_playwright_intercept(website_url, notes)
+            if xhr_result:
+                _add(xhr_result)
 
         # Strategy B: Playwright HTML render + category scan
         if not candidates:
@@ -743,17 +749,162 @@ def _render_with_playwright(url: str, notes: List[str]) -> str:
     Returns empty string if Playwright is not installed or rendering fails.
     """
     try:
-        from crawler.playwright_renderer import render_page
+        from crawler.playwright_renderer import render_page, get_last_error
         html = render_page(url, timeout_ms=30_000, scroll=True, retries=1)
         if html:
             notes.append(f"Playwright: rendered {len(html)} bytes from {url}")
             return html
-        notes.append("Playwright: render returned empty")
+        err = get_last_error()
+        if err:
+            notes.append(f"Playwright: render returned empty — {err}")
+            if "executable" in err.lower() or "doesn't exist" in err.lower():
+                notes.append("Playwright FIX: run  playwright install chromium  on server")
+        else:
+            notes.append("Playwright: render returned empty")
     except ImportError:
-        notes.append("Playwright: not installed (pip install playwright)")
+        notes.append("Playwright: not installed (pip install playwright && playwright install chromium)")
     except Exception as exc:
         notes.append(f"Playwright render error: {exc}")
     return ""
+
+
+# ── Next.js RSC (React Server Components) extraction ─────────────────────────
+# Next.js App Router sites respond to `RSC: 1` header with a streaming JSON
+# payload of server component data — no browser needed.
+# Format: self.__next_f.push([...]) lines; hrefs embedded as "href":"/path"
+
+_NEXTJS_SIGNALS = re.compile(
+    r'(?:_next/static|__NEXT_DATA__|next/dist|/_next/|"__nextjs)',
+    re.IGNORECASE,
+)
+
+_RSC_PATHS = [
+    "/",
+    "/products", "/machines", "/equipment", "/inventory",
+    "/catalog", "/catalogue", "/shop", "/listings", "/used",
+    "/usedmachines", "/usedmachinestocklist", "/stock", "/stocklist",
+    "/for-sale", "/sale", "/all-machines", "/all-equipment",
+    "/maschinen", "/produkte", "/macchine", "/maquinas",
+]
+
+_RSC_HEADERS = {
+    "User-Agent": REQUEST_HEADERS["User-Agent"],
+    "Accept": "text/x-component",
+    "Accept-Language": "en-US,en;q=0.9",
+    "RSC": "1",
+    "Next-Router-Prefetch": "1",
+    "Next-Url": "/",
+}
+
+_RSC_HREF_RE = re.compile(r'"href"\s*:\s*"(/[^"]{3,})"')
+_RSC_URL_RE  = re.compile(r'"(?:url|permalink|machine_url|product_url)"\s*:\s*"(https?://[^"]{8,})"')
+_RSC_SLUG_RE = re.compile(r'"slug"\s*:\s*"([a-z0-9][a-z0-9\-]{3,})"')
+
+
+def _try_nextjs_rsc_pages(
+    website_url: str,
+    homepage_html: str,
+    notes: List[str],
+) -> Optional[DiscoveryResult]:
+    """
+    For Next.js App Router sites: request pages with RSC:1 header to get
+    server component data without needing a browser.
+
+    This is the fix for sites like corelmachine.com where:
+     - HTML has lots of links (SSR-like) but product pages load data via JS
+     - Playwright fails (Chromium not installed) or captures 0 XHR
+     - RSC payload contains all product hrefs as server-rendered JSON fragments
+    """
+    # Only attempt if site looks like Next.js
+    if not homepage_html or not _NEXTJS_SIGNALS.search(homepage_html):
+        return None
+
+    notes.append("Next.js detected — trying RSC payload extraction")
+    logger.info("[Detection] Next.js RSC probe for %s", website_url)
+
+    base = website_url.rstrip("/")
+    product_urls: List[str] = []
+    category_urls: List[str] = []
+    paths_tried = 0
+
+    for path in _RSC_PATHS:
+        url = base + path
+        try:
+            r = requests.get(
+                url,
+                headers={**_RSC_HEADERS, "Next-Url": path},
+                timeout=12,
+                allow_redirects=True,
+            )
+            if r.status_code not in (200, 304):
+                continue
+
+            ct = r.headers.get("content-type", "")
+            # RSC response may be text/x-component or text/html with RSC payload
+            if "html" in ct and "x-component" not in ct:
+                # Not an RSC response on this path — try next
+                continue
+
+            text = r.text
+            paths_tried += 1
+
+            # Extract product hrefs from RSC stream
+            hrefs = _RSC_HREF_RE.findall(text)
+            full_urls = _RSC_URL_RE.findall(text)
+
+            for href in hrefs:
+                # Filter to likely product/machine detail pages
+                # (short slugs or contain common patterns)
+                lh = href.lower()
+                if any(seg in lh for seg in (
+                    "/product", "/machine", "/equipment", "/item",
+                    "/detail", "/listing", "/stock", "/used",
+                    "/inventory", "/maschine", "/macchine", "/maquina",
+                )):
+                    product_urls.append(base + href)
+                elif href.count("/") == 1 and len(href) > 5:
+                    # Root-level slug — could be a product or category
+                    category_urls.append(base + href)
+
+            for full_url in full_urls:
+                if _same_domain(full_url, base):
+                    product_urls.append(full_url)
+
+            if product_urls or full_urls:
+                notes.append(
+                    f"RSC {path}: {len(hrefs)} hrefs, "
+                    f"{len(product_urls)} product URLs extracted"
+                )
+                break
+
+        except Exception as exc:
+            logger.debug("[RSC] %s error: %s", url, exc)
+            continue
+
+    if not product_urls and not category_urls:
+        if paths_tried > 0:
+            notes.append(f"RSC: {paths_tried} paths returned RSC but no product hrefs found")
+        else:
+            notes.append("RSC: site has Next.js markers but did not respond to RSC:1 header")
+        return None
+
+    product_urls = list(dict.fromkeys(product_urls))[:2000]
+    category_urls = list(dict.fromkeys(category_urls))[:200]
+
+    if product_urls:
+        notes.append(f"RSC extraction: {len(product_urls)} product URLs")
+        return DiscoveryResult(
+            method="nextjs-rsc",
+            product_urls=product_urls,
+            estimated_count=len(product_urls),
+        )
+
+    notes.append(f"RSC extraction: {len(category_urls)} category URLs (no direct product URLs)")
+    return DiscoveryResult(
+        method="nextjs-rsc",
+        category_urls=category_urls,
+        estimated_count=0,
+    )
 
 
 def _probe_common_paths_playwright(website_url: str, notes: List[str]) -> Optional[DiscoveryResult]:
