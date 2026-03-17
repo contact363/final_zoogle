@@ -1,15 +1,21 @@
 """
-Phase 1 — Detection Engine
+Phase 1 — Detection Engine  (API-FIRST)
 
-Finds HOW to crawl a website (method + entry points).
-Does NOT estimate machine counts — that is the job of Phase 2.
+Detection order:
+  1. Training rules (pre-configured API or category URLs)
+  2. API detection  — Supabase / Shopify / WooCommerce / REST / HTML-source-scan / GraphQL
+     → If API found: return immediately, skip all HTML scanning
+  3. Embedded JSON  (window.__NEXT_DATA__, __NUXT__, __INITIAL_STATE__)
+  4. Sitemap
+  5. Category/nav scan  ]
+  6. Common entry paths  } HTML — only when no API/JSON found
+  7. Deep link scan      ]
 
-estimated_count is only set from REAL data:
-  • sitemap  → actual URL count from XML
-  • API      → sample count from first API page
-  • deep/common-paths → real product URLs found during scan
+JS-rendered sites (< 10 internal links on homepage) are detected early:
+  → API detection is prioritised even harder
+  → HTML fallbacks are skipped when site is JS-rendered
 
-For category/nav/html methods, estimated_count = 0.
+estimated_count is only set from REAL data (never fabricated).
 Phase 2 (URL collection) sets the authoritative count.
 
 GUARANTEE: run_discovery() always returns DiscoveryResult.
@@ -97,6 +103,31 @@ def _same_domain(url: str, base: str) -> bool:
         return False
 
 
+# ── JS-rendered site detection ───────────────────────────────────────────────
+
+_JS_FRAMEWORK_RE = re.compile(
+    r'(?:__NEXT_DATA__|__NUXT__|__INITIAL_STATE__|ng-version|data-reactroot'
+    r'|vue-app|_app\.js|_next/static|nuxt\.js)',
+    re.IGNORECASE,
+)
+
+
+def _is_js_rendered(html: str) -> bool:
+    """
+    True if this page is likely a JS-rendered SPA:
+      • Very few anchor links (< 10), OR
+      • Contains known JS framework markers.
+    An SPA will have no useful HTML links → must use API.
+    """
+    if not html:
+        return False
+    if _JS_FRAMEWORK_RE.search(html):
+        return True
+    # Count <a href> tags roughly (quick, no BeautifulSoup needed here)
+    link_count = html.lower().count("<a href")
+    return link_count < 10
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run_discovery(
@@ -105,7 +136,10 @@ def run_discovery(
     training_rules: Optional[dict] = None,
 ) -> DiscoveryResult:
     """
-    Detect how to crawl the website. Runs all methods, returns best entry point.
+    Detect how to crawl the website.  API-FIRST.
+
+    If an API is found, it is returned immediately — HTML scanning is skipped.
+    HTML fallbacks only run when no API or JSON source is detected.
 
     estimated_count is REAL (from sitemap/API/actual URL scans) or 0.
     Never fabricates a number. Phase 2 sets the authoritative count.
@@ -145,26 +179,36 @@ def run_discovery(
     except Exception as exc:
         notes.append(f"Homepage error: {exc}")
 
-    # ── Step 1: API auto-detection ─────────────────────────────────────────
+    js_rendered = _is_js_rendered(homepage_html)
+    if js_rendered:
+        notes.append("JS-rendered site detected — prioritising API detection")
+        logger.info("[Detection] JS-rendered site — skipping HTML-first paths")
+
+    # ── Step 1: API auto-detection (MANDATORY — runs first always) ─────────
     try:
         from crawler.extractors.api_extractor import detect_api
         api_result = detect_api(website_url, homepage_html)
         if api_result.found and api_result.config:
             notes.append(f"API detected: {api_result.config.api_type}")
-            # API sample count is REAL data
-            _add(DiscoveryResult(
+            logger.info("[API] detected: type=%s endpoint=%s sample=%d",
+                        api_result.config.api_type,
+                        api_result.config.endpoint,
+                        api_result.sample_count or 0)
+            # API found → return immediately, skip all HTML scanning
+            return DiscoveryResult(
                 method="api",
                 api_config=api_result.config,
                 estimated_count=api_result.sample_count or 0,
-                notes=list(notes),
-            ))
+                notes=notes,
+            )
         else:
             notes.append("API: none detected")
     except Exception as exc:
         notes.append(f"API detection error: {exc}")
         logger.warning("[Detection] API error: %s", exc)
 
-    # ── Step 2: Embedded JSON ──────────────────────────────────────────────
+    # ── Step 2: Embedded JSON (script-tag data stores) ─────────────────────
+    # Covers: window.__NEXT_DATA__, window.__NUXT__, window.__INITIAL_STATE__
     if homepage_html:
         try:
             r = _from_embedded_json(homepage_html, website_url, notes)
@@ -172,17 +216,27 @@ def run_discovery(
         except Exception as exc:
             notes.append(f"Embedded JSON error: {exc}")
 
+    # ── If JS-rendered and no API/JSON found: HTML scanning won't help ─────
+    if js_rendered and not candidates:
+        notes.append("JS-rendered + no API found — returning homepage as sole entry point")
+        logger.info("[Detection] JS-rendered with no API for website_id=%d", website_id)
+        return DiscoveryResult(
+            method="html-fallback",
+            category_urls=[website_url],
+            estimated_count=0,
+            notes=notes,
+        )
+
     # ── Step 3: Sitemap ────────────────────────────────────────────────────
     try:
         from crawler.extractors.sitemap_extractor import fetch_product_urls
         sitemap_urls = fetch_product_urls(website_url)
         if sitemap_urls:
             notes.append(f"Sitemap: {len(sitemap_urls)} real product URLs")
-            # Sitemap URLs are REAL — count is authoritative
             _add(DiscoveryResult(
                 method="sitemap",
                 product_urls=sitemap_urls,
-                estimated_count=len(sitemap_urls),   # real
+                estimated_count=len(sitemap_urls),
                 notes=list(notes),
             ))
         else:
@@ -191,7 +245,7 @@ def run_discovery(
         notes.append(f"Sitemap error: {exc}")
         logger.warning("[Detection] sitemap error: %s", exc)
 
-    # ── Step 4: Category/nav scan ──────────────────────────────────────────
+    # ── Step 4: Category/nav scan (HTML only) ──────────────────────────────
     if homepage_html:
         try:
             r = _from_category_scan(homepage_html, website_url, notes)
@@ -200,14 +254,14 @@ def run_discovery(
             notes.append(f"Category scan error: {exc}")
             logger.warning("[Detection] category scan error: %s", exc)
 
-    # ── Step 5: Common entry points probe ──────────────────────────────────
+    # ── Step 5: Common entry paths (HTML only) ─────────────────────────────
     try:
         r = _probe_common_paths(website_url, notes)
         _add(r)
     except Exception as exc:
         notes.append(f"Common paths error: {exc}")
 
-    # ── Step 6: Deep link scan (only if nothing found yet) ─────────────────
+    # ── Step 6: Deep link scan — only when nothing else found ──────────────
     if homepage_html and not candidates:
         try:
             r = _deep_link_scan(homepage_html, website_url, notes, max_depth=5)
@@ -218,7 +272,6 @@ def run_discovery(
 
     # ── Pick best candidate ────────────────────────────────────────────────
     if candidates:
-        # Priority: API > sitemap (real data) > anything with real URLs
         def _priority(c: DiscoveryResult) -> tuple:
             return (
                 bool(c.api_config),
@@ -234,13 +287,13 @@ def run_discovery(
         )
         return best
 
-    # ── Fallback — site reachable but no structure found ───────────────────
+    # ── Fallback ───────────────────────────────────────────────────────────
     notes.append("No structure detected — using homepage as fallback entry point")
     logger.info("[Detection] FALLBACK for website_id=%d", website_id)
     return DiscoveryResult(
         method="html-fallback",
         category_urls=[website_url],
-        estimated_count=0,   # unknown until Phase 2 runs
+        estimated_count=0,
         notes=notes,
     )
 

@@ -73,7 +73,7 @@ def run_api_crawl(
         batch = []
 
         for raw in fetch_all_machines(api_config):
-            item = normalize_api_item(raw, api_config.field_map)
+            item = normalize_api_item(raw, api_config.field_map, api_config.base_url)
             brand  = str(item.get("brand") or "")
             model  = str(item.get("model") or item.get("machine_name") or "")
             stock  = str(item.get("stock_number") or "")
