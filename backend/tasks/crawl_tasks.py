@@ -204,19 +204,17 @@ def crawl_website_task(self, website_id: int) -> dict:
         )
         return {"status": "error", "error": discovery.error}
 
-    log(f"[Phase1] OK method={discovery.method} estimated={discovery.estimated_count}")
-    _update_website(
-        website_id,
-        discovery_status="done",
-        discovered_count=discovery.estimated_count,
-    )
+    log(f"[Phase1] OK method={discovery.method} real_count={discovery.estimated_count}")
+    # Do NOT set discovered_count here — Phase 2 will set it from actual URLs.
+    # Only update discovery_status so the UI shows the method is known.
+    _update_website(website_id, discovery_status="done")
 
     # ══════════════════════════════════════════════════════════════════════════
     # API FAST PATH — direct API extraction, no Scrapy needed
     # ══════════════════════════════════════════════════════════════════════════
     if discovery.api_config:
         log(f"[Phase2/3] API path ({discovery.api_config.api_type}) — skipping Scrapy")
-        _update_website(website_id, url_collection_status="done", urls_collected=0)
+        _update_website(website_id, url_collection_status="running")
 
         from crawler.pipeline.phase3_machine_crawl import run_api_crawl
         try:
@@ -232,12 +230,17 @@ def crawl_website_task(self, website_id: int) -> dict:
             _finish_crawl_log(log_id, "error", error_details=error, log_output="\n".join(log_lines))
             return {"status": "error", "error": error}
 
+        # Real count = machines extracted from API
+        real_count = result.machines_new + result.machines_updated
         log(
-            f"[Phase3/API] new={result.machines_new} "
-            f"updated={result.machines_updated} skipped={result.machines_skipped}"
+            f"[Phase3/API] new={result.machines_new} updated={result.machines_updated} "
+            f"skipped={result.machines_skipped} — real_count={real_count}"
         )
         _update_website(
             website_id,
+            url_collection_status="done",
+            urls_collected=real_count,
+            discovered_count=real_count,   # real, from actual API data
             crawl_status="success",
             last_crawled_at=datetime.now(timezone.utc),
         )
@@ -260,16 +263,19 @@ def crawl_website_task(self, website_id: int) -> dict:
     # SITEMAP FAST PATH — product URLs known, skip Phase 2 spider
     # ══════════════════════════════════════════════════════════════════════════
     if discovery.product_urls:
-        log(f"[Phase2] Sitemap — loading {len(discovery.product_urls)} URLs into queue")
+        # Sitemap fast path — product URLs are already known (real count)
+        log(f"[Phase2] Sitemap — loading {len(discovery.product_urls)} real URLs into queue")
         from crawler.queue.url_queue import URLQueue
         q = URLQueue(settings.REDIS_URL, website_id)
         q.clear()
         pushed = q.push_many(discovery.product_urls)
         log(f"[Phase2] Pushed {pushed} URLs to Redis")
+        # discovered_count = real URL count from sitemap
         _update_website(
             website_id,
             url_collection_status="done",
             urls_collected=pushed,
+            discovered_count=pushed,   # real
         )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -300,11 +306,14 @@ def crawl_website_task(self, website_id: int) -> dict:
             _finish_crawl_log(log_id, "error", error_details=error, log_output="\n".join(log_lines))
             return {"status": "error", "error": error}
 
-        log(f"[Phase2] Collected {urls_collected} product URLs")
+        log(f"[Phase2] Collected {urls_collected} real product URLs")
+
+        # discovered_count = urls_collected (real — Phase 2 is the source of truth)
         _update_website(
             website_id,
             url_collection_status="done",
             urls_collected=urls_collected,
+            discovered_count=urls_collected,   # real, not estimated
         )
 
         if urls_collected == 0:
@@ -424,9 +433,10 @@ def crawl_all_websites_task() -> dict:
 
 def run_discovery_direct(website_id: int) -> dict:
     """
-    Run Phase 1 discovery in the current thread (no Celery).
+    Run Phase 1 (detection) + Phase 2 (URL collection) in the current thread.
     Called by POST /api/admin/websites/{id}/discover.
 
+    discovered_count = REAL URL count from Phase 2, not an estimate.
     Always creates a Crawl Log entry, never raises.
     """
     import uuid
@@ -443,48 +453,100 @@ def run_discovery_direct(website_id: int) -> dict:
         if not website:
             return {"status": "error", "error": "Website not found"}
 
-        # Create crawl log entry IMMEDIATELY so it shows up in UI
         log_id = _create_crawl_log(website_id, task_id, log_type="discovery")
-        log(f"[Discovery] Starting website_id={website_id} url={website.get('url')}")
-
         website_url = (website.get("url") or "").strip()
+        log(f"[Discovery] Starting website_id={website_id} url={website_url}")
+
         training_rules = _get_training_rules(website_id)
+        _update_website(website_id, discovery_status="running", url_collection_status="running")
 
-        _update_website(website_id, discovery_status="running")
-
+        # ── Phase 1: detect how to crawl ──────────────────────────────────
         from crawler.pipeline.phase1_discovery import run_discovery
-        discovery = run_discovery(
+        detection = run_discovery(
             website_id=website_id,
             website_url=website_url,
             training_rules=dict(training_rules) if training_rules else None,
         )
+        log(f"[Discovery] Detection: method={detection.method}")
+        if detection.notes:
+            log("  notes: " + "; ".join(detection.notes[-5:]))
+        _update_website(website_id, discovery_status="done")
 
-        log(f"[Discovery] method={discovery.method} estimated={discovery.estimated_count}")
-        if discovery.notes:
-            log("[Discovery] notes: " + "; ".join(discovery.notes))
+        urls_collected = 0
 
+        # ── API fast path ──────────────────────────────────────────────────
+        if detection.api_config:
+            log(f"[Discovery] API path ({detection.api_config.api_type})")
+            # For API, run a quick count probe (don't do full crawl here)
+            try:
+                from crawler.extractors.api_extractor import _fetch_page, _session
+                sess = _session()
+                sample = _fetch_page(detection.api_config, 0, sess)
+                urls_collected = detection.api_config.page_size if len(sample) == detection.api_config.page_size else len(sample)
+                log(f"[Discovery] API sample: {urls_collected} items on first page")
+            except Exception as exc:
+                log(f"[Discovery] API sample error: {exc}")
+                urls_collected = detection.estimated_count
+
+        # ── Sitemap fast path ──────────────────────────────────────────────
+        elif detection.product_urls:
+            from crawler.queue.url_queue import URLQueue
+            q = URLQueue(settings.REDIS_URL, website_id)
+            q.clear()
+            urls_collected = q.push_many(detection.product_urls)
+            log(f"[Discovery] Sitemap: {urls_collected} real URLs loaded")
+
+        # ── HTML/category path — run Phase 2 URL collection ───────────────
+        else:
+            delay   = float((training_rules or {}).get("request_delay") or 1.0)
+            pattern = str((training_rules or {}).get("product_link_pattern") or "")
+            log(f"[Discovery] Phase 2 URL collection on {len(detection.category_urls)} entry points")
+            from crawler.pipeline.phase2_url_collection import run_url_collection
+            try:
+                urls_collected = run_url_collection(
+                    website_id=website_id,
+                    category_urls=detection.category_urls,
+                    redis_url=settings.REDIS_URL,
+                    backend_dir=BACKEND_DIR,
+                    product_link_pattern=pattern,
+                    request_delay=delay,
+                )
+            except Exception as exc:
+                log(f"[Discovery] URL collection error: {exc}")
+                urls_collected = 0
+
+        log(f"[Discovery] Real URL count: {urls_collected}")
+
+        # Mismatch warning
+        if detection.estimated_count > 0 and abs(urls_collected - detection.estimated_count) > detection.estimated_count * 0.5:
+            log(
+                f"[Discovery] WARNING: detection estimated {detection.estimated_count} "
+                f"but Phase 2 found {urls_collected} — using real count"
+            )
+
+        # discovered_count = real URL count (Phase 2 is source of truth)
         _update_website(
             website_id,
-            discovery_status="done",
-            discovered_count=discovery.estimated_count,
+            url_collection_status="done",
+            urls_collected=urls_collected,
+            discovered_count=urls_collected,   # real, not estimated
         )
         _finish_crawl_log(
             log_id, "success",
-            machines_new=0,
-            machines_updated=0,
-            machines_skipped=0,
+            machines_new=urls_collected,
             log_output="\n".join(log_lines),
         )
         return {
             "status": "success",
-            "method": discovery.method,
-            "estimated_count": discovery.estimated_count,
+            "method": detection.method,
+            "urls_collected": urls_collected,
+            "discovered_count": urls_collected,
         }
 
     except Exception as exc:
-        logger.exception("[run_discovery_direct] unhandled error for website_id=%d: %s", website_id, exc)
+        logger.exception("[run_discovery_direct] error for website_id=%d: %s", website_id, exc)
         try:
-            _update_website(website_id, discovery_status="error")
+            _update_website(website_id, discovery_status="error", url_collection_status="error")
             if log_id:
                 _finish_crawl_log(log_id, "error", error_details=str(exc), log_output="\n".join(log_lines))
         except Exception:
@@ -533,57 +595,55 @@ def run_url_collection_direct(website_id: int) -> dict:
             training_rules=dict(training_rules) if training_rules else None,
         )
 
-        log(f"[URLCollection] Discovery: method={discovery.method} estimated={discovery.estimated_count}")
-        _update_website(
-            website_id,
-            discovery_status="done",
-            discovered_count=discovery.estimated_count,
-        )
+        log(f"[URLCollection] Detection: method={discovery.method}")
+        # Do NOT set discovered_count here — Phase 2 will set the real count
+        _update_website(website_id, discovery_status="done")
 
         urls_collected = 0
 
-        # Sitemap fast path — product URLs already known
+        urls_collected = 0
+
+        # Sitemap fast path — real URLs already known
         if discovery.product_urls:
             from crawler.queue.url_queue import URLQueue
             q = URLQueue(settings.REDIS_URL, website_id)
             q.clear()
             urls_collected = q.push_many(discovery.product_urls)
-            log(f"[URLCollection] Sitemap: pushed {urls_collected} URLs to Redis")
-            _update_website(website_id, url_collection_status="done", urls_collected=urls_collected)
-            _finish_crawl_log(
-                log_id, "success",
-                machines_new=urls_collected,
-                log_output="\n".join(log_lines),
+            log(f"[URLCollection] Sitemap: {urls_collected} real URLs loaded")
+
+        # API fast path — URL count from API sample
+        elif discovery.api_config:
+            log(f"[URLCollection] API path ({discovery.api_config.api_type})")
+            try:
+                from crawler.extractors.api_extractor import _fetch_page, _session
+                sample = _fetch_page(discovery.api_config, 0, _session())
+                urls_collected = discovery.api_config.page_size if len(sample) == discovery.api_config.page_size else len(sample)
+            except Exception as exc:
+                log(f"[URLCollection] API sample error: {exc}")
+                urls_collected = 0
+
+        # HTML/category — Scrapy url_collector
+        else:
+            delay   = float((training_rules or {}).get("request_delay") or 1.0)
+            pattern = str((training_rules or {}).get("product_link_pattern") or "")
+            log(f"[URLCollection] Crawling {len(discovery.category_urls)} category pages")
+            from crawler.pipeline.phase2_url_collection import run_url_collection
+            urls_collected = run_url_collection(
+                website_id=website_id,
+                category_urls=discovery.category_urls,
+                redis_url=settings.REDIS_URL,
+                backend_dir=BACKEND_DIR,
+                product_link_pattern=pattern,
+                request_delay=delay,
             )
-            return {"status": "success", "method": "sitemap", "urls_collected": urls_collected}
 
-        # API fast path
-        if discovery.api_config:
-            log(f"[URLCollection] API path ({discovery.api_config.api_type}) — URLs fetched at crawl time")
-            _update_website(website_id, url_collection_status="done", urls_collected=0)
-            _finish_crawl_log(log_id, "success", log_output="\n".join(log_lines))
-            return {"status": "success", "method": "api", "urls_collected": 0}
-
-        # HTML/category path — Scrapy url_collector
-        delay   = float((training_rules or {}).get("request_delay") or 1.0)
-        pattern = str((training_rules or {}).get("product_link_pattern") or "")
-
-        log(f"[URLCollection] Crawling {len(discovery.category_urls)} category pages")
-        from crawler.pipeline.phase2_url_collection import run_url_collection
-        urls_collected = run_url_collection(
-            website_id=website_id,
-            category_urls=discovery.category_urls,
-            redis_url=settings.REDIS_URL,
-            backend_dir=BACKEND_DIR,
-            product_link_pattern=pattern,
-            request_delay=delay,
-        )
-
-        log(f"[URLCollection] Collected {urls_collected} product URLs")
+        log(f"[URLCollection] Real URLs: {urls_collected}")
+        # discovered_count = urls_collected (real, authoritative)
         _update_website(
             website_id,
             url_collection_status="done",
             urls_collected=urls_collected,
+            discovered_count=urls_collected,   # real count
         )
         _finish_crawl_log(
             log_id, "success",
@@ -594,6 +654,7 @@ def run_url_collection_direct(website_id: int) -> dict:
             "status": "success",
             "method": discovery.method,
             "urls_collected": urls_collected,
+            "discovered_count": urls_collected,
         }
 
     except Exception as exc:
