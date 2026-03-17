@@ -216,47 +216,49 @@ def run_discovery(
         except Exception as exc:
             notes.append(f"Embedded JSON error: {exc}")
 
-    # ── If JS-rendered and no API/JSON found: try Playwright rendering ─────
-    # Previous code just gave up here — now we render with Playwright and
-    # re-run ALL discovery steps on the fully-rendered HTML.
+    # ── If JS-rendered and no API/JSON found: multi-strategy recovery ────────
     if js_rendered and not candidates:
-        notes.append("JS-rendered + no API — attempting Playwright rendering")
-        logger.info("[Detection] JS-rendered, no API — trying Playwright for website_id=%d", website_id)
+        notes.append("JS-rendered + no API — running multi-strategy recovery")
+        logger.info("[Detection] JS-rendered, no API — recovery for website_id=%d", website_id)
 
-        rendered_html = _render_with_playwright(website_url, notes)
+        # Strategy A: Playwright with XHR interception (captures API calls live)
+        xhr_result = _try_playwright_intercept(website_url, notes)
+        if xhr_result:
+            _add(xhr_result)
 
-        if rendered_html and rendered_html != homepage_html:
-            # Re-check embedded JSON in rendered HTML
+        # Strategy B: Playwright HTML render + category scan
+        if not candidates:
+            rendered_html = _render_with_playwright(website_url, notes)
+            if rendered_html:
+                try:
+                    r = _from_embedded_json(rendered_html, website_url, notes)
+                    _add(r)
+                except Exception:
+                    pass
+                if not candidates:
+                    try:
+                        r = _from_category_scan(rendered_html, website_url, notes)
+                        _add(r)
+                    except Exception:
+                        pass
+
+        # Strategy C: Brute-force API probe — try 50+ common endpoints without needing HTML
+        if not candidates:
+            r = _brute_force_api_probe(website_url, notes)
+            _add(r)
+
+        # Strategy D: Playwright probes common paths
+        if not candidates:
             try:
-                r = _from_embedded_json(rendered_html, website_url, notes)
+                r = _probe_common_paths_playwright(website_url, notes)
                 _add(r)
             except Exception as exc:
-                notes.append(f"Playwright embedded JSON error: {exc}")
+                notes.append(f"Playwright common paths error: {exc}")
 
-            # Category scan on rendered HTML
-            if not candidates:
-                try:
-                    r = _from_category_scan(rendered_html, website_url, notes)
-                    _add(r)
-                except Exception as exc:
-                    notes.append(f"Playwright category scan error: {exc}")
-
-            # Common paths — render each with Playwright too
-            if not candidates:
-                try:
-                    r = _probe_common_paths_playwright(website_url, notes)
-                    _add(r)
-                except Exception as exc:
-                    notes.append(f"Playwright common paths error: {exc}")
-
-        # If Playwright found candidates, fall through to normal "pick best" logic.
-        # If still nothing, signal the task layer to use the full lightweight_crawler.
+        # All strategies exhausted → route to lightweight_crawler which handles everything
         if not candidates:
-            notes.append("Playwright found no structure — routing to lightweight_crawler")
-            logger.info(
-                "[Detection] All discovery failed for website_id=%d — playwright-fallback",
-                website_id,
-            )
+            notes.append("All recovery strategies exhausted — routing to lightweight_crawler")
+            logger.info("[Detection] playwright-fallback for website_id=%d", website_id)
             return DiscoveryResult(
                 method="playwright-fallback",
                 category_urls=[website_url],
@@ -519,6 +521,209 @@ def _deep_link_scan(
 
 
 # ── Playwright helpers ────────────────────────────────────────────────────────
+
+def _try_playwright_intercept(website_url: str, notes: List[str]) -> Optional[DiscoveryResult]:
+    """
+    Use Playwright XHR interception to capture live API calls during page load.
+    This works even when the HTML is completely empty (React/Vue root div only).
+    """
+    try:
+        from crawler.playwright_renderer import render_and_intercept
+        from crawler.extractors.html_extractor import find_category_urls, find_product_urls
+
+        # Visit homepage + common product pages to maximise XHR capture
+        extra = ["/products", "/machines", "/equipment", "/inventory",
+                 "/catalog", "/shop", "/listings", "/used"]
+        html, api_responses = render_and_intercept(
+            website_url, timeout_ms=30_000, extra_paths=extra
+        )
+
+        product_urls: List[str] = []
+        category_urls: List[str] = []
+
+        # Walk captured API responses for product data
+        for resp in api_responses:
+            data = resp["data"]
+            # Check if it's a product list
+            if isinstance(data, list) and len(data) >= 2:
+                keys = set()
+                for item in data[:3]:
+                    if isinstance(item, dict):
+                        keys.update(k.lower() for k in item.keys())
+                product_keys = {"brand","model","price","name","title","sku","mpn",
+                                "machine_name","stock_number","manufacturer","url","href"}
+                if keys & product_keys:
+                    # Extract URLs from items
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        for key in ("url","link","href","permalink","product_url"):
+                            v = item.get(key)
+                            if isinstance(v, str) and v.startswith("http"):
+                                product_urls.append(v)
+                                break
+                    if product_urls:
+                        notes.append(
+                            f"Playwright XHR: found {len(data)} items in {resp['url']}"
+                        )
+                        break
+            # Check wrapped list
+            elif isinstance(data, dict):
+                for key in ("data","results","items","products","machines",
+                            "listings","equipment","records","hits","entries"):
+                    val = data.get(key)
+                    if isinstance(val, list) and len(val) >= 2:
+                        for item in val:
+                            if not isinstance(item, dict):
+                                continue
+                            for ukey in ("url","link","href","permalink","product_url"):
+                                v = item.get(ukey)
+                                if isinstance(v, str) and v.startswith("http"):
+                                    product_urls.append(v)
+                                    break
+                        if product_urls:
+                            notes.append(
+                                f"Playwright XHR: found {len(val)} items "
+                                f"(key={key}) in {resp['url']}"
+                            )
+                            break
+
+        # HTML category scan on rendered page
+        if html and not product_urls:
+            category_urls = find_category_urls(html, website_url)
+            if not category_urls:
+                product_urls = find_product_urls(html, website_url)
+
+        if product_urls:
+            notes.append(f"Playwright XHR result: {len(product_urls)} product URLs")
+            return DiscoveryResult(
+                method="playwright-xhr",
+                product_urls=list(dict.fromkeys(product_urls))[:2000],
+                estimated_count=len(product_urls),
+            )
+        if category_urls:
+            notes.append(f"Playwright XHR result: {len(category_urls)} category URLs")
+            return DiscoveryResult(
+                method="playwright-category",
+                category_urls=category_urls,
+                estimated_count=0,
+            )
+        notes.append(
+            f"Playwright XHR: {len(api_responses)} responses captured "
+            f"but no product data found"
+        )
+
+    except ImportError:
+        notes.append("Playwright: not installed — skipping XHR interception")
+    except Exception as exc:
+        notes.append(f"Playwright XHR error: {exc}")
+        logger.warning("[Detection] Playwright XHR error: %s", exc)
+
+    return None
+
+
+# Known API paths to probe on any site (REST, Shopify, WooCommerce, etc.)
+_BRUTE_FORCE_API_PATHS = [
+    "/products.json", "/products.json?limit=250",
+    "/wp-json/wc/v3/products", "/wp-json/wc/v3/products?per_page=100",
+    "/api/products", "/api/v1/products", "/api/v2/products",
+    "/api/machines", "/api/equipment", "/api/inventory",
+    "/api/listings", "/api/catalog", "/api/items",
+    "/api/v1/machines", "/api/v2/machines",
+    "/api/products/list", "/api/machine/list",
+    "/rest/v1/products", "/rest/products",
+    "/graphql",  # will POST introspection
+    "/.netlify/functions/products",
+    "/api/search?q=&type=product",
+    "/search/suggest.json?q=machine&resources[type]=product",
+    "/collections.json",
+    "/collections/all/products.json",
+    "/en/api/products", "/en/api/machines",
+    "/api/public/products", "/api/public/machines",
+    "/api/catalog/products", "/api/catalog/machines",
+    "/api/stock", "/api/stock/list",
+    "/api/vehicles", "/api/fleet",
+    "/json/products", "/json/machines",
+    "/data/products.json", "/data/machines.json",
+    "/feeds/products.json",
+]
+
+
+def _brute_force_api_probe(website_url: str, notes: List[str]) -> Optional[DiscoveryResult]:
+    """
+    Try every known API path without needing to see it in page source.
+    Works for sites that don't expose their API URLs in HTML.
+    """
+    product_urls: List[str] = []
+    found_endpoint = ""
+
+    for path in _BRUTE_FORCE_API_PATHS:
+        url = website_url.rstrip("/") + path
+        try:
+            r = _get(url, timeout=8)
+            if not r or r.status_code != 200:
+                continue
+            ct = r.headers.get("content-type", "")
+            if "json" not in ct:
+                continue
+            try:
+                data = r.json()
+            except Exception:
+                continue
+
+            # Flatten to list
+            items = None
+            if isinstance(data, list) and data:
+                items = data
+            elif isinstance(data, dict):
+                for k in ("data","results","items","products","machines",
+                          "listings","equipment","records","hits","entries"):
+                    v = data.get(k)
+                    if isinstance(v, list) and v:
+                        items = v
+                        break
+
+            if not items or not isinstance(items[0], dict):
+                continue
+
+            # Extract URLs
+            for item in items:
+                for ukey in ("url","link","href","permalink","product_url","machine_url"):
+                    v = item.get(ukey)
+                    if isinstance(v, str) and v.startswith("/"):
+                        v = website_url.rstrip("/") + v
+                    if isinstance(v, str) and v.startswith("http"):
+                        product_urls.append(v)
+                        break
+
+            if product_urls:
+                found_endpoint = path
+                notes.append(
+                    f"Brute-force API: {path} → {len(items)} items, "
+                    f"{len(product_urls)} URLs"
+                )
+                break
+            elif items:
+                # Found data but no URL field — return as category entry point
+                notes.append(f"Brute-force API: {path} → {len(items)} items (no URL field)")
+                return DiscoveryResult(
+                    method="api-brute",
+                    category_urls=[website_url],
+                    estimated_count=len(items),
+                )
+        except Exception:
+            continue
+
+    if product_urls:
+        return DiscoveryResult(
+            method="api-brute",
+            product_urls=list(dict.fromkeys(product_urls))[:2000],
+            estimated_count=len(product_urls),
+        )
+
+    notes.append(f"Brute-force API: none of {len(_BRUTE_FORCE_API_PATHS)} paths returned data")
+    return None
+
 
 def _render_with_playwright(url: str, notes: List[str]) -> str:
     """

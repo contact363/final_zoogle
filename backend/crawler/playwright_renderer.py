@@ -1,82 +1,54 @@
 """
-Playwright Page Renderer
-========================
-Renders JavaScript-heavy pages (React, Vue, Angular, Next.js, Nuxt, etc.)
-to fully-resolved HTML that BeautifulSoup can parse.
+Playwright Page Renderer + Network Interceptor
+================================================
+Two modes:
 
-Features:
-  • Sync Playwright API — drop-in, no async required
-  • Stealth fingerprint — realistic viewport, UA, locale, timezone
-  • Lazy-load trigger — scrolls page to force all content into DOM
-  • Network idle wait — waits until XHR/fetch traffic settles
-  • Auto-retry — one retry on timeout or crash
-  • Graceful fallback — if Playwright not installed, falls back to requests
-  • JS-render detection — _needs_playwright(html) tells callers when to use it
+  render_page(url)
+    → Returns fully-rendered HTML (React/Vue/Angular/Next.js)
+
+  render_and_intercept(url)
+    → Returns (html, captured_api_responses)
+    → Captures ALL XHR/fetch JSON responses during page load
+    → Works even when HTML shell is empty (most SPAs)
+    → This is the key fix for sites like corelmachine.com
 
 Install:
-    pip install playwright playwright-stealth
-    playwright install chromium
-
-Usage:
-    from crawler.playwright_renderer import render_page, needs_playwright
-
-    html = render_page("https://example.com/product/123")
-    if not html:
-        # fallback to requests
-        ...
+    pip install playwright
+    playwright install chromium      ← REQUIRED after pip install
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 # ── JS framework / SPA markers ────────────────────────────────────────────────
 
 _JS_MARKERS_RE = re.compile(
-    r"""
-    __NEXT_DATA__        |   # Next.js
-    __NUXT__             |   # Nuxt
-    __INITIAL_STATE__    |   # many SPAs
-    data-reactroot       |   # React
-    ng-version           |   # Angular
-    _app\.js             |   # Next.js bundle
-    _next/static         |   # Next.js static
-    nuxt\.js             |   # Nuxt bundle
-    vue-app              |   # Vue
-    window\.__data__     |   # generic SPA store
-    <div\s+id="root"\s*>\s*</div>  |  # empty React root
-    <div\s+id="app"\s*>\s*</div>      # empty Vue root
-    """,
-    re.IGNORECASE | re.VERBOSE,
+    r"__NEXT_DATA__|__NUXT__|__INITIAL_STATE__|data-reactroot|ng-version"
+    r"|_app\.js|_next/static|nuxt\.js|vue-app|window\.__data__"
+    r'|<div\s+id="root"\s*>\s*</div>|<div\s+id="app"\s*>\s*</div>',
+    re.IGNORECASE,
 )
 
-_MIN_LINKS_THRESHOLD = 8   # fewer <a href> than this → likely SPA
+_MIN_LINKS_THRESHOLD = 8
 
 
 def needs_playwright(html: str) -> bool:
-    """
-    Return True if the raw HTML looks like a JS-rendered SPA that needs
-    Playwright to produce useful content.
-
-    Criteria (any one is enough):
-      • Contains known JS-framework markers
-      • Has fewer than _MIN_LINKS_THRESHOLD <a href> anchors (empty shell)
-    """
     if not html:
         return True
     if _JS_MARKERS_RE.search(html):
         return True
-    link_count = html.lower().count("<a href")
-    return link_count < _MIN_LINKS_THRESHOLD
+    return html.lower().count("<a href") < _MIN_LINKS_THRESHOLD
 
 
-# ── Playwright availability check ─────────────────────────────────────────────
+# ── Availability check ─────────────────────────────────────────────────────────
 
-_PLAYWRIGHT_AVAILABLE: Optional[bool] = None   # None = not checked yet
+_PLAYWRIGHT_AVAILABLE: Optional[bool] = None
 
 
 def _check_playwright() -> bool:
@@ -85,17 +57,16 @@ def _check_playwright() -> bool:
         try:
             from playwright.sync_api import sync_playwright  # noqa: F401
             _PLAYWRIGHT_AVAILABLE = True
+            logger.info("[Playwright] Library available")
         except ImportError:
             _PLAYWRIGHT_AVAILABLE = False
             logger.warning(
-                "Playwright not installed — JS pages will fall back to raw HTML. "
-                "Install: pip install playwright && playwright install chromium"
+                "[Playwright] NOT installed. Run: pip install playwright && playwright install chromium"
             )
     return _PLAYWRIGHT_AVAILABLE
 
 
-# ── Stealth launch args ───────────────────────────────────────────────────────
-# These args make Chromium look like a real user browser to anti-bot systems.
+# ── Launch config ─────────────────────────────────────────────────────────────
 
 _LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -118,64 +89,48 @@ _USER_AGENT = (
 
 _VIEWPORT = {"width": 1920, "height": 1080}
 
-# Resource types to block — speeds up render by skipping unnecessary assets
-_BLOCK_RESOURCES = {"font", "media"}   # keep: document, script, xhr, fetch, image, stylesheet
+# Skip these resource types to speed up render
+_BLOCK_RESOURCES = {"font", "media"}
+
+# API response content types to capture
+_JSON_CONTENT_TYPES = ("application/json", "text/json", "application/ld+json")
+
+# Skip these API URLs (analytics, CDN, etc.)
+_SKIP_API_HOSTS = re.compile(
+    r"google-analytics|googletagmanager|facebook\.net|hotjar|"
+    r"sentry\.io|bugsnag|amplitude|segment\.io|mixpanel|"
+    r"fonts\.googleapis|cloudflare|cdn\.",
+    re.IGNORECASE,
+)
 
 
-def _apply_stealth(page) -> None:
-    """
-    Inject JS to mask Playwright/Chromium automation signals.
-    Covers: navigator.webdriver, chrome object, permissions API, plugins.
-    """
-    page.add_init_script("""
-        // Hide webdriver
+def _stealth_js() -> str:
+    return """
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-
-        // Fake chrome object
-        window.chrome = {
-            runtime: {},
-            loadTimes: function(){},
-            csi: function(){},
-            app: {}
-        };
-
-        // Fake plugins (real browsers have plugins)
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5],
-        });
-
-        // Fake languages
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en'],
-        });
-
-        // Permissions API spoof
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (params) =>
-            params.name === 'notifications'
-                ? Promise.resolve({ state: Notification.permission })
-                : originalQuery(params);
-    """)
-
-
-def _scroll_to_bottom(page, pause: float = 0.4, max_scrolls: int = 12) -> None:
+        window.chrome = {runtime:{}, loadTimes:function(){}, csi:function(){}, app:{}};
+        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+        const _pq = window.navigator.permissions.query;
+        window.navigator.permissions.query = (p) =>
+            p.name === 'notifications'
+                ? Promise.resolve({state: Notification.permission})
+                : _pq(p);
     """
-    Scroll the page incrementally to trigger lazy-loaded content.
-    Stops when no new height is added (page bottom reached).
-    """
-    last_height = page.evaluate("document.body.scrollHeight")
+
+
+def _scroll_to_bottom(page, pause: float = 0.3, max_scrolls: int = 10) -> None:
+    last = page.evaluate("document.body.scrollHeight")
     for _ in range(max_scrolls):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         time.sleep(pause)
-        new_height = page.evaluate("document.body.scrollHeight")
-        if new_height == last_height:
+        new = page.evaluate("document.body.scrollHeight")
+        if new == last:
             break
-        last_height = new_height
-    # Scroll back to top so above-the-fold content is visible
+        last = new
     page.evaluate("window.scrollTo(0, 0)")
 
 
-# ── Main render function ───────────────────────────────────────────────────────
+# ── Core render function ───────────────────────────────────────────────────────
 
 def render_page(
     url: str,
@@ -187,18 +142,8 @@ def render_page(
     retries: int = 1,
 ) -> Optional[str]:
     """
-    Render a URL with Playwright Chromium and return the fully-resolved HTML.
-
-    Args:
-        url         — page to render
-        timeout_ms  — navigation timeout in milliseconds (default 30s)
-        wait_until  — "networkidle" (default) | "domcontentloaded" | "load"
-        scroll      — whether to scroll to trigger lazy content (default True)
-        headless    — run browser headless (default True)
-        retries     — number of automatic retries on timeout/crash (default 1)
-
-    Returns:
-        Rendered HTML string, or None if Playwright is unavailable / fails.
+    Render URL with Playwright Chromium. Returns HTML or None on failure.
+    Logs the actual error so you know exactly why it failed.
     """
     if not _check_playwright():
         return None
@@ -208,41 +153,25 @@ def render_page(
     for attempt in range(retries + 1):
         try:
             with sync_playwright() as pw:
-                browser = pw.chromium.launch(
-                    headless=headless,
-                    args=_LAUNCH_ARGS,
-                )
-                context = browser.new_context(
+                browser = pw.chromium.launch(headless=headless, args=_LAUNCH_ARGS)
+                ctx = browser.new_context(
                     user_agent=_USER_AGENT,
                     viewport=_VIEWPORT,
                     locale="en-US",
                     timezone_id="America/New_York",
-                    # Accept cookies / storage
-                    accept_downloads=False,
                     ignore_https_errors=True,
                 )
+                ctx.route(
+                    "**/*",
+                    lambda r: r.abort() if r.request.resource_type in _BLOCK_RESOURCES
+                    else r.continue_(),
+                )
+                page = ctx.new_page()
+                page.add_init_script(_stealth_js())
+                page.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
 
-                # Block unnecessary resource types to speed up render
-                def _route_handler(route):
-                    if route.request.resource_type in _BLOCK_RESOURCES:
-                        route.abort()
-                    else:
-                        route.continue_()
-
-                context.route("**/*", _route_handler)
-                page = context.new_page()
-                _apply_stealth(page)
-
-                # Extra realistic headers
-                page.set_extra_http_headers({
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept": (
-                        "text/html,application/xhtml+xml,"
-                        "application/xml;q=0.9,image/webp,*/*;q=0.8"
-                    ),
-                })
-
-                logger.info("[Playwright] Rendering %s (attempt %d)", url, attempt + 1)
+                logger.info("[Playwright] Rendering %s (attempt %d, wait=%s)",
+                            url, attempt + 1, wait_until)
                 page.goto(url, timeout=timeout_ms, wait_until=wait_until)
 
                 if scroll:
@@ -250,29 +179,133 @@ def render_page(
 
                 html = page.content()
                 browser.close()
-
-                logger.info(
-                    "[Playwright] Done — %d bytes of HTML from %s", len(html), url
-                )
+                logger.info("[Playwright] Success — %d bytes from %s", len(html), url)
                 return html
 
         except PWTimeout:
-            logger.warning(
-                "[Playwright] Timeout on %s (attempt %d/%d)", url, attempt + 1, retries + 1
-            )
-            if attempt < retries:
-                # Retry with faster wait strategy
-                wait_until = "domcontentloaded"
+            logger.warning("[Playwright] Timeout on %s (attempt %d)", url, attempt + 1)
+            wait_until = "domcontentloaded"   # retry faster
         except Exception as exc:
-            logger.warning(
-                "[Playwright] Error on %s (attempt %d/%d): %s",
-                url, attempt + 1, retries + 1, exc,
-            )
+            logger.error("[Playwright] Error on %s (attempt %d): %s", url, attempt + 1, exc)
             if attempt >= retries:
                 break
 
-    logger.error("[Playwright] All attempts failed for %s", url)
     return None
+
+
+# ── Network interception — the KEY fix for blank SPAs ─────────────────────────
+
+def render_and_intercept(
+    url: str,
+    *,
+    timeout_ms: int = 30_000,
+    extra_paths: Optional[List[str]] = None,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Render a page AND capture all XHR/fetch JSON responses.
+
+    This is the core fix for sites like corelmachine.com:
+    - The HTML shell may be completely empty (React root div only)
+    - BUT the browser makes many API calls to load product data
+    - We intercept those responses and extract machine data from them
+
+    Returns:
+        (html, api_responses)
+        html          — fully rendered page HTML
+        api_responses — list of {"url": ..., "data": ...} for each JSON response
+    """
+    if not _check_playwright():
+        logger.warning("[Playwright] Not available — returning empty results")
+        return "", []
+
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+    captured: List[Dict[str, Any]] = []
+    html = ""
+
+    def _on_response(response) -> None:
+        """Capture JSON responses from API calls."""
+        try:
+            if _SKIP_API_HOSTS.search(response.url):
+                return
+            ct = response.headers.get("content-type", "")
+            if not any(jct in ct for jct in _JSON_CONTENT_TYPES):
+                return
+            if response.status < 200 or response.status >= 300:
+                return
+            body = response.json()
+            if body and isinstance(body, (dict, list)):
+                captured.append({"url": response.url, "data": body})
+                logger.debug("[Playwright/XHR] Captured %s (%s)",
+                             response.url, type(body).__name__)
+        except Exception:
+            pass   # ignore parse failures silently
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+            ctx = browser.new_context(
+                user_agent=_USER_AGENT,
+                viewport=_VIEWPORT,
+                locale="en-US",
+                timezone_id="America/New_York",
+                ignore_https_errors=True,
+            )
+            # Block only fonts/media; allow scripts, XHR, fetch
+            ctx.route(
+                "**/*",
+                lambda r: r.abort() if r.request.resource_type in _BLOCK_RESOURCES
+                else r.continue_(),
+            )
+            page = ctx.new_page()
+            page.add_init_script(_stealth_js())
+            page.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
+
+            # Attach response listener BEFORE navigation
+            page.on("response", _on_response)
+
+            logger.info("[Playwright/XHR] Loading %s", url)
+            try:
+                page.goto(url, timeout=timeout_ms, wait_until="networkidle")
+            except PWTimeout:
+                logger.warning("[Playwright/XHR] Timeout on %s — using domcontentloaded", url)
+                try:
+                    page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+                    page.wait_for_timeout(3000)   # give JS 3s to fire XHR calls
+                except Exception:
+                    pass
+
+            # Scroll to trigger lazy-loaded API calls
+            _scroll_to_bottom(page)
+            # Extra wait after scroll to let triggered XHR complete
+            page.wait_for_timeout(2000)
+
+            html = page.content()
+
+            # Also visit extra paths to capture product-listing API calls
+            if extra_paths:
+                from urllib.parse import urlparse
+                base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+                for path in extra_paths[:5]:
+                    try:
+                        page.goto(base + path, timeout=15_000,
+                                  wait_until="domcontentloaded")
+                        page.wait_for_timeout(2000)
+                        _scroll_to_bottom(page, max_scrolls=4)
+                        page.wait_for_timeout(1500)
+                    except Exception:
+                        pass
+
+            browser.close()
+
+    except Exception as exc:
+        logger.error("[Playwright/XHR] Fatal error on %s: %s", url, exc)
+
+    logger.info(
+        "[Playwright/XHR] Done — html=%d bytes, captured=%d API responses",
+        len(html), len(captured),
+    )
+    return html, captured
 
 
 def render_if_needed(
@@ -282,31 +315,11 @@ def render_if_needed(
     force: bool = False,
     timeout_ms: int = 30_000,
 ) -> str:
-    """
-    Return Playwright-rendered HTML only when necessary.
-
-    If `static_html` already has enough content (not a JS SPA), returns it
-    as-is. Otherwise renders with Playwright.
-
-    Args:
-        url         — the page URL (for Playwright navigation)
-        static_html — raw HTML already fetched via requests
-        force       — skip detection, always use Playwright
-        timeout_ms  — Playwright navigation timeout
-
-    Returns:
-        Best available HTML string (may be the original static_html if
-        Playwright is unavailable or not needed).
-    """
     if not force and not needs_playwright(static_html):
         return static_html
-
     logger.info("[Playwright] JS rendering needed for %s", url)
     rendered = render_page(url, timeout_ms=timeout_ms)
     if rendered:
         return rendered
-
-    logger.warning(
-        "[Playwright] Render failed — falling back to static HTML for %s", url
-    )
+    logger.warning("[Playwright] Render failed — falling back to static HTML for %s", url)
     return static_html

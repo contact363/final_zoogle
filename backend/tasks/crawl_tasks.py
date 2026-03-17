@@ -213,7 +213,8 @@ def crawl_website_task(self, website_id: int) -> dict:
     # PLAYWRIGHT FAST PATH — JS-rendered site, no API found, use lightweight_crawler
     # Handles React/Vue/Angular/Next.js/Nuxt sites that Scrapy cannot parse.
     # ══════════════════════════════════════════════════════════════════════════
-    if discovery.method == "playwright-fallback":
+    if discovery.method in ("playwright-fallback", "playwright-xhr",
+                            "playwright-category", "api-brute"):
         log(f"[Phase2/3] Playwright fallback — skipping Scrapy, using lightweight_crawler")
         _update_website(website_id, url_collection_status="running")
 
@@ -254,7 +255,7 @@ def crawl_website_task(self, website_id: int) -> dict:
         )
         return {
             "status": "success",
-            "method": "playwright-fallback",
+            "method": discovery.method,
             "machines_new": result.machines_new,
             "machines_updated": result.machines_updated,
         }
@@ -566,8 +567,9 @@ def run_discovery_direct(website_id: int) -> dict:
 
         urls_collected = 0
 
-        # ── Playwright fallback — JS site, no API, skip Scrapy entirely ────
-        if detection.method == "playwright-fallback":
+        # ── Playwright / brute-force — JS site, skip Scrapy entirely ─────────
+        if detection.method in ("playwright-fallback", "playwright-xhr",
+                                "playwright-category", "api-brute"):
             log("[Discovery] JS-rendered site with no API — Playwright full crawl")
             _update_website(website_id, url_collection_status="running")
             from crawler.pipeline.phase3_machine_crawl import run_lightweight_crawl
