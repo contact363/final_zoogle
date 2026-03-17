@@ -414,3 +414,168 @@ def crawl_all_websites_task() -> dict:
         "dispatched": len(website_ids),
         "interval_seconds": round(interval_seconds),
     }
+
+
+# ── Direct runners (no Celery — called from background threads in admin.py) ───
+#
+# These are the functions imported by the FastAPI router when Celery is not
+# available or when the admin triggers discovery/collection/crawl directly.
+# They MUST NOT raise — all exceptions are caught and written to the DB.
+
+def run_discovery_direct(website_id: int) -> dict:
+    """
+    Run Phase 1 discovery in the current thread (no Celery).
+    Called by POST /api/admin/websites/{id}/discover.
+
+    Always writes result to DB and never raises.
+    Returns dict with status and method.
+    """
+    try:
+        website = _get_website(website_id)
+        if not website:
+            _update_website(website_id, discovery_status="error")
+            return {"status": "error", "error": "Website not found"}
+
+        website_url = (website.get("url") or "").strip()
+        training_rules = _get_training_rules(website_id)
+
+        _update_website(website_id, discovery_status="running")
+
+        from crawler.pipeline.phase1_discovery import run_discovery
+
+        discovery = run_discovery(
+            website_id=website_id,
+            website_url=website_url,
+            training_rules=dict(training_rules) if training_rules else None,
+        )
+
+        # Always succeeds — update DB with result
+        _update_website(
+            website_id,
+            discovery_status="done",
+            discovered_count=discovery.estimated_count,
+        )
+
+        logger.info(
+            "[run_discovery_direct] website_id=%d method=%s estimated=%d",
+            website_id, discovery.method, discovery.estimated_count,
+        )
+        return {
+            "status": "success",
+            "method": discovery.method,
+            "estimated_count": discovery.estimated_count,
+        }
+
+    except Exception as exc:
+        logger.exception("[run_discovery_direct] unhandled error for website_id=%d: %s", website_id, exc)
+        try:
+            _update_website(website_id, discovery_status="error")
+        except Exception:
+            pass
+        return {"status": "error", "error": str(exc)}
+
+
+def run_url_collection_direct(website_id: int) -> dict:
+    """
+    Run Phase 1 + Phase 2 in the current thread (no Celery).
+    Called by POST /api/admin/websites/{id}/collect-urls.
+
+    Discovers the site, then collects product URLs into Redis.
+    Always writes result to DB and never raises.
+    """
+    try:
+        website = _get_website(website_id)
+        if not website:
+            return {"status": "error", "error": "Website not found"}
+
+        website_url = (website.get("url") or "").strip()
+        training_rules = _get_training_rules(website_id)
+
+        _update_website(
+            website_id,
+            discovery_status="running",
+            url_collection_status="running",
+        )
+
+        from crawler.pipeline.phase1_discovery import run_discovery
+        discovery = run_discovery(
+            website_id=website_id,
+            website_url=website_url,
+            training_rules=dict(training_rules) if training_rules else None,
+        )
+
+        _update_website(
+            website_id,
+            discovery_status="done",
+            discovered_count=discovery.estimated_count,
+        )
+
+        # Sitemap fast path — product URLs already known
+        if discovery.product_urls:
+            from crawler.queue.url_queue import URLQueue
+            q = URLQueue(settings.REDIS_URL, website_id)
+            q.clear()
+            pushed = q.push_many(discovery.product_urls)
+            _update_website(
+                website_id,
+                url_collection_status="done",
+                urls_collected=pushed,
+            )
+            return {"status": "success", "method": "sitemap", "urls_collected": pushed}
+
+        # API fast path — no URL collection needed
+        if discovery.api_config:
+            _update_website(website_id, url_collection_status="done", urls_collected=0)
+            return {"status": "success", "method": "api", "urls_collected": 0}
+
+        # HTML/category path — run Scrapy url_collector
+        delay   = float((training_rules or {}).get("request_delay") or 1.0)
+        pattern = str((training_rules or {}).get("product_link_pattern") or "")
+
+        from crawler.pipeline.phase2_url_collection import run_url_collection
+        urls_collected = run_url_collection(
+            website_id=website_id,
+            category_urls=discovery.category_urls,
+            redis_url=settings.REDIS_URL,
+            backend_dir=BACKEND_DIR,
+            product_link_pattern=pattern,
+            request_delay=delay,
+        )
+
+        _update_website(
+            website_id,
+            url_collection_status="done",
+            urls_collected=urls_collected,
+        )
+        return {
+            "status": "success",
+            "method": discovery.method,
+            "urls_collected": urls_collected,
+        }
+
+    except Exception as exc:
+        logger.exception("[run_url_collection_direct] error for website_id=%d: %s", website_id, exc)
+        try:
+            _update_website(website_id, url_collection_status="error")
+        except Exception:
+            pass
+        return {"status": "error", "error": str(exc)}
+
+
+def run_crawl_direct(website_id: int) -> dict:
+    """
+    Run the full 3-phase crawl in the current thread (no Celery).
+    Called by POST /api/admin/crawl/start/{id} as fallback when Celery is down.
+
+    Wraps crawl_website_task logic directly — never raises.
+    """
+    try:
+        # Reuse the Celery task body directly (it already handles all exceptions)
+        return crawl_website_task(website_id)
+    except Exception as exc:
+        logger.exception("[run_crawl_direct] unhandled error for website_id=%d: %s", website_id, exc)
+        try:
+            _update_website(website_id, crawl_status="error")
+        except Exception:
+            pass
+        return {"status": "error", "error": str(exc)}
