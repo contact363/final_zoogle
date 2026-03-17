@@ -168,10 +168,21 @@ def _detect_woocommerce(base_url: str, session: requests.Session) -> Optional[AP
 # ── Generic REST JSON detection ───────────────────────────────────────────────
 
 _REST_CANDIDATES = [
-    "/api/products", "/api/machines", "/api/items",
-    "/api/v1/products", "/api/v1/machines",
+    # Common product/machine paths
+    "/api/products", "/api/machines", "/api/items", "/api/equipment",
+    "/api/listings", "/api/inventory", "/api/catalog",
+    "/api/v1/products", "/api/v1/machines", "/api/v1/items",
     "/api/v2/products", "/api/v2/machines",
-    "/products.json", "/machines.json",
+    "/api/v3/products",
+    # JSON endpoints
+    "/products.json", "/machines.json", "/items.json", "/catalog.json",
+    "/listings.json", "/equipment.json", "/inventory.json",
+    # WP REST without auth
+    "/wp-json/wp/v2/product", "/wp-json/wc/v3/products",
+    # Next.js / Nuxt data routes
+    "/_next/data/products", "/api/data/products",
+    # Generic REST with filters
+    "/api/search?type=product", "/api/search?category=machine",
 ]
 
 

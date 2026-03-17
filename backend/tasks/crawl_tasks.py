@@ -75,16 +75,16 @@ def _update_website(website_id: int, **fields) -> None:
         conn.close()
 
 
-def _create_crawl_log(website_id: int, task_id: str) -> int:
+def _create_crawl_log(website_id: int, task_id: str, log_type: str = "crawl") -> int:
     conn = _db()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO crawl_logs (website_id, task_id, status, started_at)
-                VALUES (%s, %s, 'running', %s) RETURNING id
+                INSERT INTO crawl_logs (website_id, task_id, log_type, status, started_at)
+                VALUES (%s, %s, %s, 'running', %s) RETURNING id
                 """,
-                (website_id, task_id, datetime.now(timezone.utc)),
+                (website_id, task_id, log_type, datetime.now(timezone.utc)),
             )
             log_id = cur.fetchone()[0]
         conn.commit()
@@ -427,14 +427,25 @@ def run_discovery_direct(website_id: int) -> dict:
     Run Phase 1 discovery in the current thread (no Celery).
     Called by POST /api/admin/websites/{id}/discover.
 
-    Always writes result to DB and never raises.
-    Returns dict with status and method.
+    Always creates a Crawl Log entry, never raises.
     """
+    import uuid
+    task_id = f"discovery-{website_id}-{uuid.uuid4().hex[:8]}"
+    log_lines: list[str] = []
+
+    def log(msg: str) -> None:
+        logger.info(msg)
+        log_lines.append(msg)
+
+    log_id = None
     try:
         website = _get_website(website_id)
         if not website:
-            _update_website(website_id, discovery_status="error")
             return {"status": "error", "error": "Website not found"}
+
+        # Create crawl log entry IMMEDIATELY so it shows up in UI
+        log_id = _create_crawl_log(website_id, task_id, log_type="discovery")
+        log(f"[Discovery] Starting website_id={website_id} url={website.get('url')}")
 
         website_url = (website.get("url") or "").strip()
         training_rules = _get_training_rules(website_id)
@@ -442,23 +453,27 @@ def run_discovery_direct(website_id: int) -> dict:
         _update_website(website_id, discovery_status="running")
 
         from crawler.pipeline.phase1_discovery import run_discovery
-
         discovery = run_discovery(
             website_id=website_id,
             website_url=website_url,
             training_rules=dict(training_rules) if training_rules else None,
         )
 
-        # Always succeeds — update DB with result
+        log(f"[Discovery] method={discovery.method} estimated={discovery.estimated_count}")
+        if discovery.notes:
+            log("[Discovery] notes: " + "; ".join(discovery.notes))
+
         _update_website(
             website_id,
             discovery_status="done",
             discovered_count=discovery.estimated_count,
         )
-
-        logger.info(
-            "[run_discovery_direct] website_id=%d method=%s estimated=%d",
-            website_id, discovery.method, discovery.estimated_count,
+        _finish_crawl_log(
+            log_id, "success",
+            machines_new=0,
+            machines_updated=0,
+            machines_skipped=0,
+            log_output="\n".join(log_lines),
         )
         return {
             "status": "success",
@@ -470,6 +485,8 @@ def run_discovery_direct(website_id: int) -> dict:
         logger.exception("[run_discovery_direct] unhandled error for website_id=%d: %s", website_id, exc)
         try:
             _update_website(website_id, discovery_status="error")
+            if log_id:
+                _finish_crawl_log(log_id, "error", error_details=str(exc), log_output="\n".join(log_lines))
         except Exception:
             pass
         return {"status": "error", "error": str(exc)}
@@ -480,13 +497,25 @@ def run_url_collection_direct(website_id: int) -> dict:
     Run Phase 1 + Phase 2 in the current thread (no Celery).
     Called by POST /api/admin/websites/{id}/collect-urls.
 
-    Discovers the site, then collects product URLs into Redis.
-    Always writes result to DB and never raises.
+    Always creates a Crawl Log entry, never raises.
     """
+    import uuid
+    task_id = f"url-collect-{website_id}-{uuid.uuid4().hex[:8]}"
+    log_lines: list[str] = []
+
+    def log(msg: str) -> None:
+        logger.info(msg)
+        log_lines.append(msg)
+
+    log_id = None
     try:
         website = _get_website(website_id)
         if not website:
             return {"status": "error", "error": "Website not found"}
+
+        # Create log entry immediately
+        log_id = _create_crawl_log(website_id, task_id, log_type="url_collection")
+        log(f"[URLCollection] Starting website_id={website_id} url={website.get('url')}")
 
         website_url = (website.get("url") or "").strip()
         training_rules = _get_training_rules(website_id)
@@ -504,34 +533,42 @@ def run_url_collection_direct(website_id: int) -> dict:
             training_rules=dict(training_rules) if training_rules else None,
         )
 
+        log(f"[URLCollection] Discovery: method={discovery.method} estimated={discovery.estimated_count}")
         _update_website(
             website_id,
             discovery_status="done",
             discovered_count=discovery.estimated_count,
         )
 
+        urls_collected = 0
+
         # Sitemap fast path — product URLs already known
         if discovery.product_urls:
             from crawler.queue.url_queue import URLQueue
             q = URLQueue(settings.REDIS_URL, website_id)
             q.clear()
-            pushed = q.push_many(discovery.product_urls)
-            _update_website(
-                website_id,
-                url_collection_status="done",
-                urls_collected=pushed,
+            urls_collected = q.push_many(discovery.product_urls)
+            log(f"[URLCollection] Sitemap: pushed {urls_collected} URLs to Redis")
+            _update_website(website_id, url_collection_status="done", urls_collected=urls_collected)
+            _finish_crawl_log(
+                log_id, "success",
+                machines_new=urls_collected,
+                log_output="\n".join(log_lines),
             )
-            return {"status": "success", "method": "sitemap", "urls_collected": pushed}
+            return {"status": "success", "method": "sitemap", "urls_collected": urls_collected}
 
-        # API fast path — no URL collection needed
+        # API fast path
         if discovery.api_config:
+            log(f"[URLCollection] API path ({discovery.api_config.api_type}) — URLs fetched at crawl time")
             _update_website(website_id, url_collection_status="done", urls_collected=0)
+            _finish_crawl_log(log_id, "success", log_output="\n".join(log_lines))
             return {"status": "success", "method": "api", "urls_collected": 0}
 
-        # HTML/category path — run Scrapy url_collector
+        # HTML/category path — Scrapy url_collector
         delay   = float((training_rules or {}).get("request_delay") or 1.0)
         pattern = str((training_rules or {}).get("product_link_pattern") or "")
 
+        log(f"[URLCollection] Crawling {len(discovery.category_urls)} category pages")
         from crawler.pipeline.phase2_url_collection import run_url_collection
         urls_collected = run_url_collection(
             website_id=website_id,
@@ -542,10 +579,16 @@ def run_url_collection_direct(website_id: int) -> dict:
             request_delay=delay,
         )
 
+        log(f"[URLCollection] Collected {urls_collected} product URLs")
         _update_website(
             website_id,
             url_collection_status="done",
             urls_collected=urls_collected,
+        )
+        _finish_crawl_log(
+            log_id, "success",
+            machines_new=urls_collected,
+            log_output="\n".join(log_lines),
         )
         return {
             "status": "success",
@@ -557,6 +600,8 @@ def run_url_collection_direct(website_id: int) -> dict:
         logger.exception("[run_url_collection_direct] error for website_id=%d: %s", website_id, exc)
         try:
             _update_website(website_id, url_collection_status="error")
+            if log_id:
+                _finish_crawl_log(log_id, "error", error_details=str(exc), log_output="\n".join(log_lines))
         except Exception:
             pass
         return {"status": "error", "error": str(exc)}
