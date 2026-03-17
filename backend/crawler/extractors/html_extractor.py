@@ -16,7 +16,13 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse, urlencode, parse_qs, urlunparse
 
-from bs4 import BeautifulSoup
+try:
+    from bs4 import BeautifulSoup
+except ImportError as _bs4_err:
+    raise ImportError(
+        "BeautifulSoup not installed — HTML parsing unavailable. "
+        "Run: pip install beautifulsoup4 lxml"
+    ) from _bs4_err
 
 logger = logging.getLogger(__name__)
 
