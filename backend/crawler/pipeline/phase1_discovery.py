@@ -216,16 +216,53 @@ def run_discovery(
         except Exception as exc:
             notes.append(f"Embedded JSON error: {exc}")
 
-    # ── If JS-rendered and no API/JSON found: HTML scanning won't help ─────
+    # ── If JS-rendered and no API/JSON found: try Playwright rendering ─────
+    # Previous code just gave up here — now we render with Playwright and
+    # re-run ALL discovery steps on the fully-rendered HTML.
     if js_rendered and not candidates:
-        notes.append("JS-rendered + no API found — returning homepage as sole entry point")
-        logger.info("[Detection] JS-rendered with no API for website_id=%d", website_id)
-        return DiscoveryResult(
-            method="html-fallback",
-            category_urls=[website_url],
-            estimated_count=0,
-            notes=notes,
-        )
+        notes.append("JS-rendered + no API — attempting Playwright rendering")
+        logger.info("[Detection] JS-rendered, no API — trying Playwright for website_id=%d", website_id)
+
+        rendered_html = _render_with_playwright(website_url, notes)
+
+        if rendered_html and rendered_html != homepage_html:
+            # Re-check embedded JSON in rendered HTML
+            try:
+                r = _from_embedded_json(rendered_html, website_url, notes)
+                _add(r)
+            except Exception as exc:
+                notes.append(f"Playwright embedded JSON error: {exc}")
+
+            # Category scan on rendered HTML
+            if not candidates:
+                try:
+                    r = _from_category_scan(rendered_html, website_url, notes)
+                    _add(r)
+                except Exception as exc:
+                    notes.append(f"Playwright category scan error: {exc}")
+
+            # Common paths — render each with Playwright too
+            if not candidates:
+                try:
+                    r = _probe_common_paths_playwright(website_url, notes)
+                    _add(r)
+                except Exception as exc:
+                    notes.append(f"Playwright common paths error: {exc}")
+
+        # If Playwright found candidates, fall through to normal "pick best" logic.
+        # If still nothing, signal the task layer to use the full lightweight_crawler.
+        if not candidates:
+            notes.append("Playwright found no structure — routing to lightweight_crawler")
+            logger.info(
+                "[Detection] All discovery failed for website_id=%d — playwright-fallback",
+                website_id,
+            )
+            return DiscoveryResult(
+                method="playwright-fallback",
+                category_urls=[website_url],
+                estimated_count=0,
+                notes=notes,
+            )
 
     # ── Step 3: Sitemap ────────────────────────────────────────────────────
     try:
@@ -478,4 +515,73 @@ def _deep_link_scan(
         method="deep-html",
         category_urls=listing_pages or [website_url],
         estimated_count=real_count,   # real URLs found during scan
+    )
+
+
+# ── Playwright helpers ────────────────────────────────────────────────────────
+
+def _render_with_playwright(url: str, notes: List[str]) -> str:
+    """
+    Render a URL with Playwright and return fully-resolved HTML.
+    Returns empty string if Playwright is not installed or rendering fails.
+    """
+    try:
+        from crawler.playwright_renderer import render_page
+        html = render_page(url, timeout_ms=30_000, scroll=True, retries=1)
+        if html:
+            notes.append(f"Playwright: rendered {len(html)} bytes from {url}")
+            return html
+        notes.append("Playwright: render returned empty")
+    except ImportError:
+        notes.append("Playwright: not installed (pip install playwright)")
+    except Exception as exc:
+        notes.append(f"Playwright render error: {exc}")
+    return ""
+
+
+def _probe_common_paths_playwright(website_url: str, notes: List[str]) -> Optional[DiscoveryResult]:
+    """
+    Probe common entry paths using Playwright rendering.
+    Called only when the site is JS-rendered and requests-based probing failed.
+    """
+    from crawler.extractors.html_extractor import find_product_urls, find_category_urls
+
+    listing_pages: List[str] = []
+    real_product_urls: set = set()
+
+    try:
+        from crawler.playwright_renderer import render_page
+    except ImportError:
+        notes.append("Playwright: not installed — skipping common path probe")
+        return None
+
+    for path in COMMON_ENTRY_PATHS[:12]:   # limit to avoid spending too long
+        url = website_url.rstrip("/") + path
+        try:
+            html = render_page(url, timeout_ms=20_000, scroll=False, retries=0)
+            if not html:
+                continue
+            products = find_product_urls(html, url)
+            cats     = find_category_urls(html, url)
+            if products or cats:
+                listing_pages.append(url)
+                real_product_urls.update(products)
+                notes.append(
+                    f"Playwright path {path}: {len(products)} products, "
+                    f"{len(cats)} categories"
+                )
+            if len(listing_pages) >= 5:
+                break
+        except Exception as exc:
+            notes.append(f"Playwright path {path} error: {exc}")
+            continue
+
+    if not listing_pages:
+        notes.append("Playwright common paths: nothing found")
+        return None
+
+    return DiscoveryResult(
+        method="playwright-category",
+        category_urls=listing_pages,
+        estimated_count=len(real_product_urls),
     )

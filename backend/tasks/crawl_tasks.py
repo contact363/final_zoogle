@@ -210,6 +210,56 @@ def crawl_website_task(self, website_id: int) -> dict:
     _update_website(website_id, discovery_status="done")
 
     # ══════════════════════════════════════════════════════════════════════════
+    # PLAYWRIGHT FAST PATH — JS-rendered site, no API found, use lightweight_crawler
+    # Handles React/Vue/Angular/Next.js/Nuxt sites that Scrapy cannot parse.
+    # ══════════════════════════════════════════════════════════════════════════
+    if discovery.method == "playwright-fallback":
+        log(f"[Phase2/3] Playwright fallback — skipping Scrapy, using lightweight_crawler")
+        _update_website(website_id, url_collection_status="running")
+
+        from crawler.pipeline.phase3_machine_crawl import run_lightweight_crawl
+        try:
+            result = run_lightweight_crawl(
+                website_id=website_id,
+                website_url=website_url,
+                db_sync_url=settings.DATABASE_SYNC_URL,
+                max_requests=500,
+                request_delay=float((training_rules or {}).get("request_delay") or 0.5),
+            )
+        except Exception as exc:
+            error = f"Playwright crawl crashed: {exc}"
+            log(f"[Phase3/PW] ERROR: {error}")
+            _update_website(website_id, crawl_status="error")
+            _finish_crawl_log(log_id, "error", error_details=error, log_output="\n".join(log_lines))
+            return {"status": "error", "error": error}
+
+        real_count = result.machines_new + result.machines_updated
+        log(f"[Phase3/PW] new={result.machines_new} updated={result.machines_updated} "
+            f"skipped={result.machines_skipped} — real_count={real_count}")
+        _update_website(
+            website_id,
+            url_collection_status="done",
+            urls_collected=real_count,
+            discovered_count=real_count,
+            crawl_status="success",
+            last_crawled_at=datetime.now(timezone.utc),
+        )
+        _finish_crawl_log(
+            log_id, "success",
+            machines_new=result.machines_new,
+            machines_updated=result.machines_updated,
+            machines_skipped=result.machines_skipped,
+            errors_count=result.errors,
+            log_output="\n".join(log_lines),
+        )
+        return {
+            "status": "success",
+            "method": "playwright-fallback",
+            "machines_new": result.machines_new,
+            "machines_updated": result.machines_updated,
+        }
+
+    # ══════════════════════════════════════════════════════════════════════════
     # API FAST PATH — direct API extraction, no Scrapy needed
     # ══════════════════════════════════════════════════════════════════════════
     if discovery.api_config:
@@ -317,14 +367,56 @@ def crawl_website_task(self, website_id: int) -> dict:
         )
 
         if urls_collected == 0:
-            log("[Phase2] No URLs collected — aborting")
-            _update_website(website_id, crawl_status="error")
-            _finish_crawl_log(
-                log_id, "error",
-                error_details="No product URLs found",
-                log_output="\n".join(log_lines),
-            )
-            return {"status": "error", "error": "No product URLs found"}
+            # Safety net: Scrapy found nothing — try Playwright-based crawler
+            log("[Phase2] No URLs collected — trying Playwright fallback")
+            from crawler.pipeline.phase3_machine_crawl import run_lightweight_crawl
+            try:
+                pw_result = run_lightweight_crawl(
+                    website_id=website_id,
+                    website_url=website_url,
+                    db_sync_url=settings.DATABASE_SYNC_URL,
+                    max_requests=500,
+                    request_delay=delay,
+                )
+            except Exception as exc:
+                log(f"[Phase2/PW] Playwright fallback error: {exc}")
+                pw_result = None
+
+            if pw_result and (pw_result.machines_new + pw_result.machines_updated) > 0:
+                real_count = pw_result.machines_new + pw_result.machines_updated
+                log(f"[Phase2/PW] Playwright rescued: new={pw_result.machines_new} "
+                    f"updated={pw_result.machines_updated}")
+                _update_website(
+                    website_id,
+                    url_collection_status="done",
+                    urls_collected=real_count,
+                    discovered_count=real_count,
+                    crawl_status="success",
+                    last_crawled_at=datetime.now(timezone.utc),
+                )
+                _finish_crawl_log(
+                    log_id, "success",
+                    machines_new=pw_result.machines_new,
+                    machines_updated=pw_result.machines_updated,
+                    machines_skipped=pw_result.machines_skipped,
+                    errors_count=pw_result.errors,
+                    log_output="\n".join(log_lines),
+                )
+                return {
+                    "status": "success",
+                    "method": "playwright-rescue",
+                    "machines_new": pw_result.machines_new,
+                    "machines_updated": pw_result.machines_updated,
+                }
+            else:
+                log("[Phase2] Playwright fallback also found 0 — aborting")
+                _update_website(website_id, crawl_status="error")
+                _finish_crawl_log(
+                    log_id, "error",
+                    error_details="No product URLs found (Scrapy + Playwright both failed)",
+                    log_output="\n".join(log_lines),
+                )
+                return {"status": "error", "error": "No product URLs found"}
 
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 3 — MACHINE CRAWLING
@@ -474,10 +566,29 @@ def run_discovery_direct(website_id: int) -> dict:
 
         urls_collected = 0
 
+        # ── Playwright fallback — JS site, no API, skip Scrapy entirely ────
+        if detection.method == "playwright-fallback":
+            log("[Discovery] JS-rendered site with no API — Playwright full crawl")
+            _update_website(website_id, url_collection_status="running")
+            from crawler.pipeline.phase3_machine_crawl import run_lightweight_crawl
+            try:
+                pw_result = run_lightweight_crawl(
+                    website_id=website_id,
+                    website_url=website_url,
+                    db_sync_url=settings.DATABASE_SYNC_URL,
+                    max_requests=500,
+                    request_delay=float((training_rules or {}).get("request_delay") or 0.5),
+                )
+                urls_collected = pw_result.machines_new + pw_result.machines_updated
+                log(f"[Discovery] Playwright crawl: new={pw_result.machines_new} "
+                    f"updated={pw_result.machines_updated}")
+            except Exception as exc:
+                log(f"[Discovery] Playwright crawl error: {exc}")
+                urls_collected = 0
+
         # ── API fast path ──────────────────────────────────────────────────
-        if detection.api_config:
+        elif detection.api_config:
             log(f"[Discovery] API path ({detection.api_config.api_type})")
-            # For API, run a quick count probe (don't do full crawl here)
             try:
                 from crawler.extractors.api_extractor import _fetch_page, _session
                 sess = _session()
@@ -515,6 +626,25 @@ def run_discovery_direct(website_id: int) -> dict:
                 log(f"[Discovery] URL collection error: {exc}")
                 urls_collected = 0
 
+            # Safety net: Scrapy found nothing — try Playwright
+            if urls_collected == 0:
+                log("[Discovery] Scrapy found 0 URLs — trying Playwright fallback")
+                from crawler.pipeline.phase3_machine_crawl import run_lightweight_crawl
+                try:
+                    pw_result = run_lightweight_crawl(
+                        website_id=website_id,
+                        website_url=website_url,
+                        db_sync_url=settings.DATABASE_SYNC_URL,
+                        max_requests=500,
+                        request_delay=delay,
+                    )
+                    urls_collected = pw_result.machines_new + pw_result.machines_updated
+                    log(f"[Discovery] Playwright rescue: new={pw_result.machines_new} "
+                        f"updated={pw_result.machines_updated}")
+                except Exception as exc:
+                    log(f"[Discovery] Playwright rescue error: {exc}")
+                    urls_collected = 0
+
         log(f"[Discovery] Real URL count: {urls_collected}")
 
         # Mismatch warning
@@ -529,7 +659,7 @@ def run_discovery_direct(website_id: int) -> dict:
             website_id,
             url_collection_status="done",
             urls_collected=urls_collected,
-            discovered_count=urls_collected,   # real, not estimated
+            discovered_count=urls_collected,
         )
         _finish_crawl_log(
             log_id, "success",
