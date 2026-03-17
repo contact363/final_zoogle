@@ -39,9 +39,9 @@ _MIN_LINKS_THRESHOLD = 8
 
 
 def needs_playwright(html: str) -> bool:
+    # SSR sites (Next.js SSR, Nuxt SSR) have lots of links even though they
+    # contain _next/static etc. Use link count as the real discriminator.
     if not html:
-        return True
-    if _JS_MARKERS_RE.search(html):
         return True
     return html.lower().count("<a href") < _MIN_LINKS_THRESHOLD
 

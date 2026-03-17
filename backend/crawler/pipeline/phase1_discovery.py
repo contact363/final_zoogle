@@ -114,18 +114,30 @@ _JS_FRAMEWORK_RE = re.compile(
 
 def _is_js_rendered(html: str) -> bool:
     """
-    True if this page is likely a JS-rendered SPA:
-      • Very few anchor links (< 10), OR
-      • Contains known JS framework markers.
-    An SPA will have no useful HTML links → must use API.
+    True ONLY if the page is a CLIENT-SIDE-RENDERED SPA shell.
+
+    KEY DISTINCTION:
+      SSR sites (Next.js SSR, Nuxt SSR, Angular Universal) — fully rendered
+      server-side — their HTML contains 30-200+ links and ALL product content.
+      They happen to have _next/static, __nuxt etc. in the HTML, but that
+      does NOT mean they need JS to render. BeautifulSoup can parse them fine.
+
+      CSR sites (Create React App, Vue CLI, plain SPA) — send a minimal HTML
+      shell with just <div id="root"></div> and load everything via JS.
+      These genuinely need Playwright.
+
+    RULE: use LINK COUNT as the primary discriminator.
+      >= 15 links in initial HTML → content is already rendered → NOT a SPA
+      <  15 links                 → likely a blank SPA shell → IS JS-rendered
     """
     if not html:
-        return False
-    if _JS_FRAMEWORK_RE.search(html):
         return True
-    # Count <a href> tags roughly (quick, no BeautifulSoup needed here)
+    # Link count is the reliable signal — SSR pages have many links, SPAs have few
     link_count = html.lower().count("<a href")
-    return link_count < 10
+    if link_count >= 15:
+        return False   # fully rendered (SSR), even if it uses Next.js/Nuxt/Vue
+    # Very few links AND looks like a blank SPA shell
+    return True
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
